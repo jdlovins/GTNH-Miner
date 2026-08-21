@@ -2983,13 +2983,34 @@ config.rodsPerLoad = 64
 -- tips is a large unattended resource commitment. Lower those pars, or drop them
 -- to false in user_config.lua, if you would rather approve those crafts by hand.
 --
--- Default is 4x a full load (config.tipsPerLoad = 64), so there is buffer for
--- four module loads before anything can stall on the kits < 64 dispatch floor.
+-- Levels are scaled to what each material costs to make rather than held flat.
+-- A flat number is wrong at both ends: four loads of Steel is nothing on a
+-- mature base, while the same figure in Transcendent Metal is an enormous
+-- unattended craft. Values are in items and config.tipsPerLoad is 64, so divide
+-- by 64 for loads. Keep every value at or above 64 or a module can stall on the
+-- kits < 64 dispatch floor while nominally sitting at par.
 --
 -- If the network has no crafting pattern for a listed item, the node reports it
 -- as "nopattern" and it shows up red on both dashboards -- a missing pattern is
 -- meant to be loud, since the failure it replaces (a module that silently never
 -- loads) is the hardest thing in this system to diagnose.
+config.drillPar = {
+  -- Cheap tiers: deep buffers. 4096 is 64 loads.
+  steel             = { tips = 4096, rods = 4096 },
+  titanium          = { tips = 2048, rods = 2048 },
+  tungstensteel     = { tips = 2048, rods = 2048 },
+  -- Mid tiers.
+  naquadah          = { tips = 1024, rods = 1024 },
+  naquadahAlloy     = { tips = 1024, rods = 1024 },
+  neutronium        = { tips =  512, rods =  512 },
+  -- Tiers 11-14 (MK-XI UIV and up). Held at 4 loads deliberately: these are the
+  -- ones where an unattended craft is genuinely expensive, and par is only
+  -- published once you own a drone that uses them anyway.
+  cosmicNeutronium  = { tips =  256, rods =  256 },
+  infinity          = { tips =  256, rods =  256 },
+  transcendentMetal = { tips =  256, rods =  256 },
+}
+
 -- How many drill crafts the hw node may have in flight at once.
 --
 -- Match this to your AE2 crafting CPUs in the staging network. AE2 cancels a
@@ -3002,19 +3023,6 @@ config.rodsPerLoad = 64
 -- surplus requests are rejected on arrival and show as REJECTED. Setting it
 -- lower only makes restocking slower, so when in doubt round down.
 config.drillCraftSlots = 2
-
-config.drillPar = {
-  steel         = { tips = 256, rods = 256 },
-  titanium      = { tips = 256, rods = 256 },
-  tungstensteel = { tips = 256, rods = 256 },
-  naquadah      = { tips = 256, rods = 256 },
-  naquadahAlloy = { tips = 256, rods = 256 },
-  neutronium    = { tips = 256, rods = 256 },
-  -- Tiers 11-14 (MK-XI UIV and up). Expensive -- see the cost note above.
-  cosmicNeutronium  = { tips = 256, rods = 256 },
-  infinity          = { tips = 256, rods = 256 },
-  transcendentMetal = { tips = 256, rods = 256 },
-}
 
 -- ---------------------------------------------------------------------------
 -- LOGGING (see logger.lua)

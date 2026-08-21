@@ -421,6 +421,11 @@ Three files, three writers, one writer each. They never overwrite each other.
   may run at once; set it to your AE2 crafting CPU count. Rounding down only
   slows restocking, whereas setting it too high produces rejected requests.
 
+  Shipped par is scaled to material cost rather than flat — 4096 (64 loads) for
+  Steel down to 256 (4 loads) for the top three tiers — because a flat number is
+  simultaneously too shallow for cheap tiers and too aggressive for expensive
+  ones.
+
 The editor only persists mappings that are genuinely yours, compared against
 `config.shippedDustTargets` — the snapshot taken before the overlay is applied.
 Writing all of them back would freeze the shipped table and mask every future
