@@ -990,9 +990,19 @@ local function drawHWPanel()
     row = row + 1
     if amt > 0 then anyPlasma = true end
   end
+  -- Clear these two rows unconditionally, not just when we write to them.
+  --
+  -- This row holds the waiting/blocked line only while plasma is absent, and the
+  -- row after it is a spacer. The rest of this panel gets away with clear-as-you
+  -- -write because every row is written every frame; these two are not. On the
+  -- frame plasma first appears the branch below stops running, so whatever it
+  -- wrote last frame is never wiped -- and the tail wipe only reaches rows below
+  -- the cursor. That is how "[ waiting for fluid telemetry... ]" survives on
+  -- screen long after fluid telemetry is green and plasma is in stock.
+  if row <= H then clear(row) end
   if not anyPlasma then
     if row > H then return end
-    clear(row); term.setCursor(P3 + 1, row)
+    term.setCursor(P3 + 1, row)
     if brokerState.lastFluidSyncTime == 0 then
       gpu.setForeground(0xFFAA00); io.write("  [ waiting for fluid telemetry... ]")
     else
@@ -1000,6 +1010,7 @@ local function drawHWPanel()
     end
     row = row + 1
   end
+  if row <= H then clear(row) end
   row = row + 1
 
   clear(row); term.setCursor(P3 + 1, row)
