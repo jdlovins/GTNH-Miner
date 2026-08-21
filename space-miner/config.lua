@@ -2959,6 +2959,19 @@ config.ports = {
 -- Accounts for ore processing pipeline delay (ore → ore factory → dust storage).
 config.pipelineCheckDelay = 30
 
+-- How many modules may work the same asteroid at once.
+--
+--   nil     automatic (default): half the modules plus one while SEVERAL
+--           asteroids are wanted, and no limit at all when only one is -- the
+--           cap divides the fleet between competing needs, and with a single
+--           target there is nothing to divide and nothing to protect.
+--   <n>     pin it to n modules.
+--   "all"   never limit; one asteroid may take the whole fleet.
+--
+-- Raise or pin this only if you want a specific split. Lowering it idles
+-- modules, which only helps when you are deliberately reserving capacity.
+config.asteroidCap = nil
+
 -- How many drill tips and rods to stock per module load, in ITEMS.
 --
 -- These are totals across the input bus, not per slot. A slot holds one stack

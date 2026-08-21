@@ -666,7 +666,18 @@ end
 -- majority but never starve every other need. Scales with total module count, so
 -- it stays correct if this broker grows back into a multi-job-node fleet (up to
 -- 24 modules across multiple space elevators, like v1.0).
-local function asteroidCap()
+--
+-- Except when there is nothing to starve. The cap exists to divide the fleet
+-- between COMPETING needs; with a single asteroid wanted it has no other need to
+-- protect and only idles modules for nothing. Five modules and one target meant
+-- three mined and two sat there permanently.
+--
+-- config.asteroidCap overrides: a number pins it, "all" removes it entirely.
+local function asteroidCap(needCount)
+  local c = config.asteroidCap
+  if c == "all" then return #modules end
+  if type(c) == "number" and c > 0 then return math.min(c, #modules) end
+  if (needCount or 0) <= 1 then return #modules end
   return math.floor(#modules / 2) + 1 -- 6 modules -> 4, 24 -> 13
 end
 
@@ -794,8 +805,9 @@ local function dispatchBatch()
   -- modules dispatched just above), count up as we go, and never exceed the cap.
   -- This is what frees module slots for lower-tier needs (e.g. Uranium-Plutonium)
   -- instead of one asteroid eating them all.
-  local cap            = asteroidCap()
+  local cap            = asteroidCap(#needs)
   local astCount       = activeAsteroidCounts()
+  brokerState.cap      = cap   -- surfaced on the hardware panel
 
   for _, droneKey in ipairs(config.droneKeyOrder) do
     if (avail[droneKey] or 0) > 0 then
@@ -1056,7 +1068,10 @@ local function drawHWPanel()
 
   clear(row); term.setCursor(P3 + 1, row)
   gpu.setForeground(0x666666)
-  io.write("  PRIORITY: " .. brokerState.priorityMode:upper() .. "   CAP: " .. asteroidCap() .. "/asteroid")
+  -- Show the cap dispatch actually used, not a fresh guess: it depends on how
+  -- many asteroids are currently wanted, which this panel does not recompute.
+  io.write("  PRIORITY: " .. brokerState.priorityMode:upper() ..
+           "   CAP: " .. (brokerState.cap or asteroidCap(0)) .. "/asteroid")
   row = row + 1
 
   clear(row); term.setCursor(P3 + 1, row)
