@@ -475,8 +475,21 @@ while true do
     data        = payload
   }))
 
-  -- Listen for Ctrl+C or HW_QUERY requests (non-blocking, 10s timeout)
-  local ev = { event.pull(10, "key_down", "modem_message") }
+  -- Listen for Ctrl+C or broker commands (10s timeout).
+  --
+  -- No name filter. event.pull(timeout, name, ...) matches `name` against the
+  -- SIGNAL NAME and every argument after it against the signal's PARAMETERS --
+  -- it is not an either/or list. The old call here was
+  --   event.pull(10, "key_down", "modem_message")
+  -- which asks for a key_down whose first parameter is the string
+  -- "modem_message", and therefore never matched anything. This node could not
+  -- receive a modem message at all, which is why HW_QUERY never worked and why
+  -- Ctrl+C did not quit. dust_telem.lua:212 has it right with a single filter.
+  --
+  -- Pulling everything (like broker-mk3.lua does) keeps both branches working.
+  -- Unrelated signals just wake the loop early, which is harmless: the body is
+  -- idempotent and every rate limit here is wall-clock, not per-iteration.
+  local ev = { event.pull(10) }
   if ev[1] == "key_down" and ev[3] == 3 then -- Ctrl+C
     term.clear()
     os.exit()
