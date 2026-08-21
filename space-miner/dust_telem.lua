@@ -13,6 +13,8 @@
 local component     = require("component")
 local serialization = require("serialization")
 local term          = require("term")
+local event         = require("event")
+local computer      = require("computer")
 
 local config = dofile("/home/config.lua")
 
@@ -45,11 +47,70 @@ local nodeName = "MEDINA-DustRelay"
 
 modem.setStrength(400)
 gpu.setResolution(80, 25)
+modem.open(config.ports.command)   -- inbound: broker -> this node (watchlist)
 
--- Build threshold lookup from config.conditions (itemName → amountToMaintain)
-local thresholds = {}
-for _, cond in ipairs(config.conditions) do
-  thresholds[cond.itemName] = cond.amountToMaintain
+-- ---------------------------------------------------------------------------
+-- WATCHLIST
+-- What to scan and what each target is. This node cannot dump an entire ME
+-- network into one modem packet, so it filters against this list.
+--
+-- The list is the BROKER's config.conditions, pushed over the command port. It
+-- used to be read from this machine's own copy of config.lua, which meant
+-- editing what to mine in two places -- and when they drifted, the broker
+-- displayed a permanent 0% for every item this node was not scanning.
+--
+-- Resolution order:
+--   1. whatever the broker last sent (authoritative)
+--   2. the cached copy of that, so a restart here survives a broker outage
+--   3. this machine's config.conditions, so a standalone node still works
+-- ---------------------------------------------------------------------------
+local WATCHLIST_CACHE = "/home/dust_watchlist.lua"
+
+local thresholds  = {}
+local listSource  = "local config"
+local listCount   = 0
+
+local function applyWatchlist(list, source)
+  thresholds = list
+  listSource = source
+  listCount  = 0
+  for _ in pairs(list) do listCount = listCount + 1 end
+end
+
+local function saveWatchlist(list)
+  local f = io.open(WATCHLIST_CACHE, "w")
+  if not f then return end
+  f:write("return {\n")
+  for name, threshold in pairs(list) do
+    f:write(string.format("  [%q] = %d,\n", name, threshold))
+  end
+  f:write("}\n")
+  f:close()
+end
+
+do
+  local ok, cached = pcall(dofile, WATCHLIST_CACHE)
+  if ok and type(cached) == "table" and next(cached) then
+    applyWatchlist(cached, "cache")
+  else
+    local fallback = {}
+    for _, cond in ipairs(config.conditions) do
+      fallback[cond.itemName] = cond.amountToMaintain
+    end
+    applyWatchlist(fallback, "local config")
+  end
+end
+
+-- Accept a watchlist push from the broker. Cached so the next restart does not
+-- have to wait for the broker to come back before it can scan anything.
+local function handleMessage(_, _, _, _, _, rawMsg)
+  local ok, msg = pcall(serialization.unserialize, rawMsg)
+  if not ok or type(msg) ~= "table" then return end
+  if msg.protocol ~= "MEDINA_COMMAND" then return end
+  if msg.payloadType ~= "DUST_WATCHLIST" or type(msg.data) ~= "table" then return end
+  if not next(msg.data) then return end   -- never let an empty list blind us
+  applyWatchlist(msg.data, "broker")
+  saveWatchlist(msg.data)
 end
 
 local function scanDustStock()
@@ -117,6 +178,8 @@ local function updateDashboard(sorted)
     end
   end
   gpu.setForeground(0x555555)
+  term.setCursor(2, 4)
+  io.write(string.format("watchlist: %-13s (%d items)   ", listSource, listCount))
   term.setCursor(55, 2)
   io.write("LAST_SYNC: " .. os.date("%X"))
 end
@@ -128,9 +191,11 @@ while true do
   local sorted = buildSortedList(stocks)
   updateDashboard(sorted)
 
+  -- Stock only: the broker holds the thresholds it sent us, and echoing them
+  -- back just gave a stale node a way to overwrite live policy.
   local payload = {}
-  for name, threshold in pairs(thresholds) do
-    payload[name] = { stock=stocks[name] or 0, threshold=threshold }
+  for name in pairs(thresholds) do
+    payload[name] = { stock = stocks[name] or 0 }
   end
 
   modem.broadcast(config.ports.telemetry, serialization.serialize({
@@ -140,5 +205,11 @@ while true do
     data        = payload
   }))
 
-  os.sleep(10)  -- Update every 10 seconds, not pipeline delay
+  -- Wait out the scan interval in short hops so a watchlist push is picked up
+  -- promptly instead of up to 10s late.
+  local nextScan = computer.uptime() + 10
+  while computer.uptime() < nextScan do
+    local ev = { event.pull(0.5, "modem_message") }
+    if ev[1] == "modem_message" then handleMessage(table.unpack(ev)) end
+  end
 end

@@ -761,8 +761,14 @@ local function processMessage(evType, _, _, _, _, rawMsg)
   if msg.protocol ~= "MEDINA_TELEMETRY" or not msg.data then return end
 
   if msg.payloadType == "DUST_UPDATE" then
+    -- Stock only. Thresholds are policy and policy lives here, in
+    -- config.conditions -- see broadcastWatchlist(). A node running a stale
+    -- config used to be able to overwrite our threshold with its own, and any
+    -- item it sent got injected into brokerState.dust whether we track it or
+    -- not. Now an untracked name is simply ignored.
     for name, entry in pairs(msg.data) do
-      brokerState.dust[name] = { stock = entry.stock or 0, threshold = entry.threshold or 0 }
+      local d = brokerState.dust[name]
+      if d then d.stock = entry.stock or 0 end
     end
     brokerState.lastDustSyncTime = os.time()
     brokerState.lastDustSync = os.date("%X")
@@ -1110,12 +1116,48 @@ end
 local UI_INTERVAL = 0.25 -- seconds between full UI repaints
 local lastUIDraw  = 0
 
+-- ---------------------------------------------------------------------------
+-- DUST WATCHLIST
+-- The dust node cannot scan an ME network of thousands of item types and fit the
+-- result in one modem packet, so it needs a list to filter against. That list
+-- used to be its own copy of config.conditions, which meant editing what to mine
+-- in two files -- and if they drifted, the broker showed a permanent 0% for
+-- anything the node was not scanning.
+--
+-- So the broker pushes it. config.conditions is now the single source of truth.
+-- Thresholds ride along so the node's own dashboard can still show fill %.
+-- Sent on startup and re-sent periodically, so a node that boots later (or
+-- restarts) picks it up without having to ask.
+-- ---------------------------------------------------------------------------
+local WATCHLIST_INTERVAL = 30   -- seconds between re-broadcasts
+local lastWatchlistSend  = 0
+
+local function broadcastWatchlist()
+  local list = {}
+  for _, cond in ipairs(config.conditions) do
+    list[cond.itemName] = cond.amountToMaintain
+  end
+  modem.broadcast(config.ports.command, serial.serialize({
+    protocol    = "MEDINA_COMMAND",
+    sender      = nodeId,
+    payloadType = "DUST_WATCHLIST",
+    data        = list,
+  }))
+end
+
 while true do
   -- 1. Service one inbound message. Very short timeout: returns immediately if a
   --    message is waiting, otherwise yields the CPU for ~10ms and comes back so
   --    the scheduler keeps ticking fast.
   local ev = { event.pull(0.01, "modem_message") }
   if ev[1] == "modem_message" then processMessage(table.unpack(ev)) end
+
+  -- 1b. Re-publish the dust watchlist on its own slow cadence.
+  local nowW = computer.uptime()
+  if nowW - lastWatchlistSend >= WATCHLIST_INTERVAL then
+    broadcastWatchlist()
+    lastWatchlistSend = nowW
+  end
 
   -- 2. Advance every in-flight load task. This is the hot path — runs every
   --    iteration so concurrent loads progress as fast as the hardware allows.
