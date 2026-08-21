@@ -35,8 +35,9 @@ end
 if not me then
   error("Missing ME Interface (attach one via an Adapter to read network stock).")
 end
-if type(me.getItemsInNetwork) ~= "function" then
-  error("ME Interface cannot query the network - check it is joined to the dust subnet.")
+-- Proxy methods are callable tables here, not functions, so probe by calling.
+if me.getItemsInNetwork == nil or not pcall(me.getItemsInNetwork) then
+  error("ME device cannot query the network - check it is joined to the dust subnet.")
 end
 
 local gpu      = component.gpu
