@@ -1739,40 +1739,85 @@ end
 local X_MARK, X_NAME = 2, 6
 local X_A, X_B, X_C = 44, 56, 68
 
-local function edDraw()
-  gpu.setBackground(0x000000)
+-- ---------------------------------------------------------------------------
+-- EDITOR PAINTER
+--
+-- edDraw cost ~625 component calls per repaint: a term.setCursor plus an
+-- io.write for every field, a setForeground before most of them, and a
+-- full-width fill on every one of the ~44 list rows -- all repeated whether or
+-- not anything on that row had changed.
+--
+-- In OpenComputers each of those is a direct call against a per-tick budget, so
+-- one repaint spanned several game ticks. With modules loading it competed with
+-- the loader's transposer and ME calls for the same budget, which is why the
+-- editor felt worst exactly when the miner was busy.
+--
+-- Three changes:
+--   1. gpu.set instead of term.setCursor + io.write -- one call rather than
+--      two, and it skips the OpenOS term layer's cursor bookkeeping.
+--   2. Colour changes are guarded, so consecutive fields sharing a colour cost
+--      one setForeground between them instead of one each.
+--   3. Rows are cached by content signature. Moving the selection repaints the
+--      two rows that actually changed, not the whole list.
+-- ---------------------------------------------------------------------------
+local edCache = {}
+local edFG, edBG
 
-  gpu.fill(1, 1, W, 1, " ")
-  gpu.setForeground(0x00FF00)
-  term.setCursor(2, 1)
-  if ed.mode == "asteroids" then
-    io.write("CONDITION EDITOR  /  asteroids")
-  elseif ed.mode == "detail" then
-    io.write("CONDITION EDITOR  /  " .. tostring(ed.asteroid))
-  else
-    io.write("CONDITION EDITOR  /  all tracked items")
+-- Call whenever something else has painted over the screen (drawUI, boot). The
+-- cache describes what is physically on screen, so if that assumption breaks
+-- the cache has to go with it.
+local function edInvalidate()
+  edCache = {}
+  edFG, edBG = nil, nil
+end
+
+-- cells = { {x, s, fg}, ... }, painted left to right over a cleared row.
+local function edPaint(y, bg, cells)
+  local sig = tostring(bg)
+  for i = 1, #cells do
+    local c = cells[i]
+    sig = sig .. "\1" .. c[1] .. "\2" .. c[3] .. "\2" .. c[2]
   end
+  if edCache[y] == sig then return end
+  edCache[y] = sig
 
-  gpu.fill(1, 2, W, 1, " ")
-  gpu.setForeground(0x888888)
-  term.setCursor(2, 2)
+  if edBG ~= bg then gpu.setBackground(bg); edBG = bg end
+  gpu.fill(1, y, W, 1, " ")
+  for i = 1, #cells do
+    local c = cells[i]
+    if edFG ~= c[3] then gpu.setForeground(c[3]); edFG = c[3] end
+    gpu.set(c[1], y, c[2])
+  end
+end
+
+local function edDraw()
+  local title
+  if ed.mode == "asteroids" then
+    title = "CONDITION EDITOR  /  asteroids"
+  elseif ed.mode == "detail" then
+    title = "CONDITION EDITOR  /  " .. tostring(ed.asteroid)
+  else
+    title = "CONDITION EDITOR  /  all tracked items"
+  end
+  edPaint(1, 0x000000, { { 2, title, 0x00FF00 } })
+
   local n = 0
   for _ in pairs(ed.enabled) do n = n + 1 end
-  io.write(string.format("%d tracked  |  enter=open  space=toggle  t=target  a=add  /=find  s=save  esc=back%s",
-    n, ed.filter and ("  |  filter: " .. ed.filter) or ""))
+  edPaint(2, 0x000000, { { 2, string.format(
+    "%d tracked  |  enter=open  space=toggle  t=target  a=add  /=find  s=save  esc=back%s",
+    n, ed.filter and ("  |  filter: " .. ed.filter) or ""), 0x888888 } })
 
-  gpu.fill(1, 4, W, 1, " ")
-  gpu.setForeground(0x888888)
   if ed.mode == "asteroids" then
-    term.setCursor(X_NAME, 4); io.write("ASTEROID")
-    term.setCursor(X_A, 4); io.write("MODULE")
-    term.setCursor(X_B, 4); io.write("DRONES")
-    term.setCursor(X_C, 4); io.write("TRACKED")
+    edPaint(4, 0x000000, {
+      { X_NAME, "ASTEROID", 0x888888 }, { X_A, "MODULE", 0x888888 },
+      { X_B, "DRONES", 0x888888 },      { X_C, "TRACKED", 0x888888 },
+    })
   else
-    term.setCursor(X_NAME, 4); io.write("ITEM")
-    term.setCursor(X_A, 4); io.write("TARGET")
-    term.setCursor(X_B, 4); io.write("HAVE")
-    term.setCursor(X_C, 4); io.write(ed.mode == "detail" and "VIA" or "ASTEROID")
+    edPaint(4, 0x000000, {
+      { X_NAME, "ITEM", 0x888888 },  { X_A, "TARGET", 0x888888 },
+      { X_B, "HAVE", 0x888888 },
+      { X_C, ed.mode == "detail" and "VIA" or "ASTEROID", 0x888888 },
+    })
   end
 
   for r = 0, edRows() - 1 do
@@ -1780,94 +1825,79 @@ local function edDraw()
     local idx = ed.scroll + r + 1
     local row = ed.rows[idx]
 
-    gpu.setBackground((idx == ed.sel and row and row.kind ~= "header" and row.kind ~= "note")
-                      and 0x222222 or 0x000000)
-    gpu.fill(1, y, W, 1, " ")
+    local bg = (idx == ed.sel and row and row.kind ~= "header" and row.kind ~= "note")
+               and 0x222222 or 0x000000
+    local cells = {}
 
     if row then
       if row.kind == "header" then
-        gpu.setForeground(0x00AAFF)
-        term.setCursor(2, y); io.write("-- " .. row.text)
+        cells[1] = { 2, "-- " .. row.text, 0x00AAFF }
 
       elseif row.kind == "note" then
-        gpu.setForeground(0x555555)
-        term.setCursor(6, y); io.write(row.text)
+        cells[1] = { 6, row.text, 0x555555 }
 
       elseif row.kind == "asteroid" then
-        gpu.setForeground(row.tracked > 0 and 0x00FFFF or 0x777777)
-        term.setCursor(X_NAME, y); io.write(row.name:sub(1, X_A - X_NAME - 1))
-        gpu.setForeground(0x888888)
-        term.setCursor(X_A, y); io.write("MK-" .. tostring(row.tier))
-        term.setCursor(X_B, y); io.write(row.drones)
-        gpu.setForeground(row.tracked > 0 and 0x00FF00 or 0x555555)
-        term.setCursor(X_C, y); io.write(tostring(row.tracked))
+        cells[#cells+1] = { X_NAME, row.name:sub(1, X_A - X_NAME - 1),
+                            row.tracked > 0 and 0x00FFFF or 0x777777 }
+        cells[#cells+1] = { X_A, "MK-" .. tostring(row.tier), 0x888888 }
+        cells[#cells+1] = { X_B, row.drones, 0x888888 }
+        cells[#cells+1] = { X_C, tostring(row.tracked),
+                            row.tracked > 0 and 0x00FF00 or 0x555555 }
         if not row.direct then
-          gpu.setForeground(0xFFAA00)
-          term.setCursor(X_C + 6, y); io.write("no derived outputs")
+          cells[#cells+1] = { X_C + 6, "no derived outputs", 0xFFAA00 }
         end
 
       else -- item
         local item = row.item
         local on   = ed.enabled[item]
-        gpu.setForeground(on and 0x00FFFF or 0x555555)
-        term.setCursor(X_MARK, y); io.write(on and "[x]" or "[ ]")
-        term.setCursor(X_NAME, y)
-        io.write(((row.direct == false and ed.mode == "detail") and "~ " or "  ")
-                 .. item:sub(1, X_A - X_NAME - 3))
-
-        term.setCursor(X_A, y)
-        io.write(on and formatQty(ed.threshold[item] or DEFAULT_TARGET) or "-")
+        local fg   = on and 0x00FFFF or 0x555555
+        cells[#cells+1] = { X_MARK, on and "[x]" or "[ ]", fg }
+        cells[#cells+1] = { X_NAME,
+          ((row.direct == false and ed.mode == "detail") and "~ " or "  ")
+          .. item:sub(1, X_A - X_NAME - 3), fg }
+        cells[#cells+1] = { X_A,
+          on and formatQty(ed.threshold[item] or DEFAULT_TARGET) or "-", fg }
 
         local d    = brokerState.dust[item]
         local have = d and d.stock or 0
         local tgt  = ed.threshold[item] or DEFAULT_TARGET
-        gpu.setForeground(have >= tgt and 0x00FF00 or (have > 0 and 0xFFAA00 or 0x555555))
-        term.setCursor(X_B, y); io.write(formatQty(have))
+        cells[#cells+1] = { X_B, formatQty(have),
+          have >= tgt and 0x00FF00 or (have > 0 and 0xFFAA00 or 0x555555) }
 
         if ed.mode == "detail" then
-          gpu.setForeground(0x666666)
-          term.setCursor(X_C, y)
-          io.write(tostring(row.source or "hand-typed"):sub(1, W - X_C))
+          cells[#cells+1] = { X_C, tostring(row.source or "hand-typed"):sub(1, W - X_C),
+                              0x666666 }
         else
           local t = ed.targets[item]
           if t then
-            gpu.setForeground(0x888888)
-            term.setCursor(X_C, y); io.write(tostring(t.asteroid):sub(1, W - X_C))
+            cells[#cells+1] = { X_C, tostring(t.asteroid):sub(1, W - X_C), 0x888888 }
           else
-            gpu.setForeground(0xFF4444)
-            term.setCursor(X_C, y); io.write("NOT MINEABLE")
+            cells[#cells+1] = { X_C, "NOT MINEABLE", 0xFF4444 }
           end
         end
       end
-      gpu.setBackground(0x000000)
     end
+
+    edPaint(y, bg, cells)
   end
 
   edLayoutButtons()
-  local by = H - 1
-  gpu.setBackground(0x000000)
-  gpu.fill(1, by, W, 1, " ")
+  local by    = H - 1
+  local cells = {}
   for _, b in ipairs(edButtons) do
-    gpu.setBackground(0x333333); gpu.setForeground(0xFFFFFF)
-    term.setCursor(b.x1, by); io.write(b.label)
+    cells[#cells+1] = { b.x1, b.label, 0xFFFFFF }
   end
-  gpu.setBackground(0x000000)
-  gpu.setForeground(0x888888)
   local pos = string.format("%d-%d/%d", math.min(ed.scroll + 1, #ed.rows),
     math.min(ed.scroll + edRows(), #ed.rows), #ed.rows)
-  term.setCursor(W - #pos - 1, by); io.write(pos)
+  cells[#cells+1] = { W - #pos - 1, pos, 0x888888 }
+  edPaint(by, 0x000000, cells)
 
-  gpu.fill(1, H, W, 1, " ")
-  term.setCursor(2, H)
   if ed.input then
-    gpu.setForeground(0xFFAA00)
-    io.write(ed.input.label .. " " .. ed.input.buffer .. "_")
+    edPaint(H, 0x000000, { { 2, ed.input.label .. " " .. ed.input.buffer .. "_", 0xFFAA00 } })
   elseif ed.filtering then
-    gpu.setForeground(0xFFAA00)
-    io.write("/" .. (ed.filter or "") .. "_    enter=keep  esc=clear")
+    edPaint(H, 0x000000, { { 2, "/" .. (ed.filter or "") .. "_    enter=keep  esc=clear", 0xFFAA00 } })
   else
-    gpu.setForeground(ed.msgColor)
-    io.write(ed.msg:sub(1, W - 2))
+    edPaint(H, 0x000000, { { 2, ed.msg:sub(1, W - 2), ed.msgColor } })
   end
 end
 
@@ -1878,6 +1908,9 @@ end
 local function edAction(a)
   if a == "close" then
     ed.open = false
+    -- Same reason as on open: the panels are about to overwrite these rows, so
+    -- the cache must not claim they still hold editor content.
+    edInvalidate()
     drawStaticFrame()
   elseif a == "back" then
     if ed.mode == "detail" then
@@ -2151,7 +2184,11 @@ while true do
   local ev = { event.pull(0.01) }
   if ev[1] == "modem_message" then
     processMessage(table.unpack(ev))
-    if ed.open then ed.dirty = true end   -- HAVE values may have moved
+    -- Only DUST_UPDATE can move anything the editor shows (the HAVE column).
+    -- HW_UPDATE and FLUID_UPDATE used to force a full repaint too, several times
+    -- a minute, for a screen whose contents they cannot affect. Even for dust,
+    -- do not repaint here: the 2s tick below already refreshes it, and stock
+    -- figures do not need sub-second latency. Keypresses still repaint at once.
 
   elseif ed.open then
     -- The editor owns input while it is up, but ONLY input. Execution still
@@ -2170,6 +2207,9 @@ while true do
 
   elseif ev[1] == "key_down" and ev[3] == 101 then   -- "e" opens the editor
     ed.open = true
+    -- drawUI has been painting over this screen; the row cache describes what
+    -- was there before, so it is now a lie. Drop it.
+    edInvalidate()
     edBuild()
     edSay("click a row to toggle, click its target to cycle -- mining continues")
     ed.dirty = true
