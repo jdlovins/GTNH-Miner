@@ -158,8 +158,16 @@ for _, key in ipairs(config.droneKeyOrder) do brokerState.drones[key] = 0 end
 for _, key in ipairs(drillKeyOrder) do brokerState.drills[key] = { kits = 0, tips = 0, rods = 0 } end
 
 -- UI layout (three panels).
-local W, H = gpu and gpu.maxResolution() or 120, 50
-if gpu then gpu.setResolution(W, H) end
+-- Precedence trap: `local W, H = gpu and gpu.maxResolution() or 120, 50` binds
+-- as `W = (gpu and gpu.maxResolution() or 120), H = 50`, so the screen's real
+-- height was never read -- H was pinned at 50 whatever the hardware said. On
+-- anything shorter the list drew off the bottom of the screen.
+local W, H = 120, 50
+if gpu then
+  local mw, mh = gpu.maxResolution()
+  W, H = mw or W, mh or H
+  gpu.setResolution(W, H)
+end
 local P1 = 1
 local P2 = math.floor(W / 3) + 1
 local P3 = math.floor(W * 2 / 3) + 1
@@ -1766,12 +1774,51 @@ local edFG, edBG
 -- Call whenever something else has painted over the screen (drawUI, boot). The
 -- cache describes what is physically on screen, so if that assumption breaks
 -- the cache has to go with it.
+local edLastScroll, edLastMode
+
 local function edInvalidate()
   edCache = {}
   edFG, edBG = nil, nil
+  edLastScroll, edLastMode = nil, nil
 end
 
--- cells = { {x, s, fg}, ... }, painted left to right over a cleared row.
+-- Scrolling is the cache's worst case: every visible row shows different
+-- content, so every signature misses and the whole list repaints -- the full
+-- cold-paint cost, on every keypress once the selection reaches the window edge.
+--
+-- But a scroll is a SHIFT, not new content. gpu.copy moves the whole block in a
+-- single call, leaving only the newly exposed rows to paint.
+--
+-- The cache is shifted to match, and stays truthful precisely because copy
+-- really does move what the cache claims is there. A row whose new content
+-- happens to equal the shifted content is then correctly skipped; one that
+-- differs -- the selection highlight, usually -- is correctly repainted by the
+-- signature check.
+local function edScrollBlock()
+  local first, rows = edFirst(), edRows()
+  local prev, mode = edLastScroll, edLastMode
+  edLastScroll, edLastMode = ed.scroll, ed.mode
+  if not prev or mode ~= ed.mode then return end
+
+  local d = ed.scroll - prev
+  if d == 0 or math.abs(d) >= rows then return end
+
+  -- Source row is further down the list when scrolling down, the top of the
+  -- window when scrolling up. Either way the block moves by -d.
+  gpu.copy(1, (d > 0) and (first + d) or first, W, rows - math.abs(d), 0, -d)
+
+  local moved = {}
+  for y, sig in pairs(edCache) do
+    if y >= first and y < first + rows then
+      local ny = y - d
+      if ny >= first and ny < first + rows then moved[ny] = sig end
+    else
+      moved[y] = sig   -- header and footer rows sit outside the copied block
+    end
+  end
+  edCache = moved
+end
+
 local function edPaint(y, bg, cells)
   local sig = tostring(bg)
   for i = 1, #cells do
@@ -1819,6 +1866,8 @@ local function edDraw()
       { X_C, ed.mode == "detail" and "VIA" or "ASTEROID", 0x888888 },
     })
   end
+
+  edScrollBlock()
 
   for r = 0, edRows() - 1 do
     local y   = edFirst() + r
