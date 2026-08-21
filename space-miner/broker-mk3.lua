@@ -205,7 +205,15 @@ local function pollLoad(mod)
       tostring(s.arrivePolls)))
     mod.status = "RUNNING"
     mod.job.startTime = os.time()
-    mod.adapter.setParameters(mod.conf.distanceParam, 0, mod.job.distance)
+    -- NOTE: this used to call
+    --   mod.adapter.setParameters(mod.conf.distanceParam, 0, mod.job.distance)
+    -- to push the chosen asteroid distance into the module. GT no longer exposes
+    -- setParameters on the machine's OC interface, so the call died with
+    -- "attempt to call a nil value (field 'setParameters')". Distance must now be
+    -- set on the module by hand.
+    --
+    -- job.distance is still computed by getOptimalDistance() and shown on the
+    -- dashboard, but it is ADVISORY ONLY now -- nothing applies it.
     mod.adapter.setWorkAllowed(true)
   else
     mod.status = "ERROR"
