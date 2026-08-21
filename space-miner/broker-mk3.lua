@@ -2160,15 +2160,31 @@ local lastUIDraw  = 0
 -- QUIESCE_GRACE, so a wedged module cannot lock you out of the editor.
 -- ---------------------------------------------------------------------------
 local QUIESCE_SECONDS = 10   -- countdown before the editor opens
-local QUIESCE_GRACE   = 20   -- extra wait for in-flight loads, then open anyway
+-- Extra wait for in-flight work once the countdown ends, then open regardless.
+-- Generous on purpose: a three-item load confirms each fingerprint by read-back
+-- and waits on ME delivery (ARRIVE_TIMEOUT alone is 15s per item), so a healthy
+-- load on a laggy server can easily outlast a short grace -- and opening early
+-- lands you in exactly the contention this feature exists to avoid.
+local QUIESCE_GRACE   = 60
 
 local edPending = nil        -- { openAt, hardAt } while counting down
 local edPendingShown = nil   -- last text painted, so we only repaint on change
 
-local function modulesLoading()
+-- How many modules are still doing component-heavy work.
+--
+-- DONE counts as well as LOADING: that state returns leftover tips and rods to
+-- the ME network through the transposer, which contends for the call budget
+-- just as much as a load does. Only counting LOADING let the editor open while
+-- a module was mid-return.
+--
+-- Pinned restock tasks are deliberately NOT counted. They respawn every
+-- PIN_RESTOCK_INTERVAL for as long as a pinned module runs, so waiting on them
+-- would never finish -- the grace below would expire every single time and the
+-- wait would be theatre.
+local function modulesBusy()
   local n = 0
   for _, mod in ipairs(modules) do
-    if mod.status == "LOADING" then n = n + 1 end
+    if mod.status == "LOADING" or mod.status == "DONE" then n = n + 1 end
   end
   return n
 end
@@ -2356,14 +2372,22 @@ while true do
   -- Countdown, and the handover into the editor.
   if edPending then
     local up = computer.uptime()
-    if up >= edPending.openAt and (modulesLoading() == 0 or up >= edPending.hardAt) then
+    local busy = modulesBusy()
+    if up >= edPending.openAt and (busy == 0 or up >= edPending.hardAt) then
       edPending, edPendingShown = nil, nil
       ed.open = true
       -- drawUI has been painting over this screen; the row cache describes what
       -- was there before, so it is now a lie. Drop it.
       edInvalidate()
       edBuild()
-      edSay("new jobs paused while this is open -- esc to resume mining")
+      if busy > 0 then
+        -- Opened on the grace rather than because the broker went quiet. Say so:
+        -- otherwise it looks like the wait did not work, and it explains why the
+        -- editor may feel sluggish for the next few seconds.
+        edSay(busy .. " module(s) still working -- editor may lag briefly", 0xFFAA00)
+      else
+        edSay("new jobs paused while this is open -- esc to resume mining")
+      end
       ed.dirty = true
     end
   end
@@ -2415,14 +2439,14 @@ while true do
     end
     if edPending then
       local left = math.max(0, math.ceil(edPending.openAt - up))
-      local n    = modulesLoading()
+      local n    = modulesBusy()
       local l1, l2
       if left > 0 then
         l1 = "OPENING EDIT MENU IN " .. left
-        l2 = (n > 0) and ("new jobs paused -- " .. n .. " load(s) finishing")
+        l2 = (n > 0) and ("new jobs paused -- " .. n .. " module(s) finishing")
                       or "new jobs paused -- broker going idle"
       else
-        l1 = "WAITING FOR " .. n .. " LOAD(S) TO FINISH"
+        l1 = "WAITING FOR " .. n .. " MODULE(S) TO FINISH"
         l2 = "opens anyway in " .. math.max(0, math.ceil(edPending.hardAt - up)) .. "s"
       end
       local shown = l1 .. "|" .. l2
