@@ -2712,7 +2712,7 @@ config.asteroidOutputs = {
 config.dustTargets = {
   -- === TOP TIER — MK-III EXCLUSIVES (UIV+ DRONE REQUIRED) ===
   ["Ichorium Dust"]           = { asteroid = "Ichorium", priority = 1 },
-  ["Draconic Core Dust"]      = { asteroid = "Draconic Core", priority = 1 },
+  ["Draconic Core"]             = { asteroid = "Draconic Core", priority = 1 },   -- was: Draconic Core Dust -> Draconic Core
   ["Raw Tengam Dust"]         = { asteroid = "Tengam", priority = 1 },
   -- "PlatLine Dust" was listed here as an item. It is not one: it is the
   -- asteroid's own name. platlinePureAsteroid uses OrePrefixes.dust over
@@ -2732,21 +2732,21 @@ config.dustTargets = {
   ["Bedrockium Dust"]         = { asteroid = "Cosmic", priority = 4 },
   ["Black Plutonium Dust"]    = { asteroid = "Cosmic", priority = 5 },
   ["Infinity Catalyst Dust"]  = { asteroid = "Infinity Catalyst", priority = 1 },
-  ["Staballoy Dust"]          = { asteroid = "Everglades", priority = 1 },
-  ["Kleinite Dust"]           = { asteroid = "Draconic", priority = 3 },
+  --  ["Staballoy Dust"] = { asteroid = "Everglades", priority = 1 },
+  --  ["Kleinite Dust"] = { asteroid = "Draconic", priority = 3 },
 
   -- === RARE EARTH & LANTHANIDE PROCESSING LINE ===
   ["Trinium Dust"]            = { asteroid = "Lanthanum", priority = 1 },
   ["Lanthanum Dust"]          = { asteroid = "Lanthanum", priority = 2 },
-  ["Cerium Dust"]             = { asteroid = "Aluminium-LanthLine", priority = 3 },
-  ["Praseodymium Dust"]       = { asteroid = "Lanthanum", priority = 3 },
+  --  ["Cerium Dust"] = { asteroid = "Aluminium-LanthLine", priority = 3 },
+  --  ["Praseodymium Dust"] = { asteroid = "Lanthanum", priority = 3 },
   ["Neodymium Dust"]          = { asteroid = "Aluminium-LanthLine", priority = 4 },
-  ["Promethium Dust"]         = { asteroid = "Lanthanum", priority = 4 },
+  --  ["Promethium Dust"] = { asteroid = "Lanthanum", priority = 4 },
   ["Samarium Dust"]           = { asteroid = "Holmium/Samarium", priority = 1 },
   ["Europium Dust"]           = { asteroid = "Europium", priority = 3 },
-  ["Gadolinium Dust"]         = { asteroid = "Everglades", priority = 5 },
-  ["Terbium Dust"]            = { asteroid = "Everglades", priority = 6 },
-  ["Dysprosium Dust"]         = { asteroid = "Holmium/Samarium", priority = 3 },
+  --  ["Gadolinium Dust"] = { asteroid = "Everglades", priority = 5 },
+  --  ["Terbium Dust"] = { asteroid = "Everglades", priority = 6 },
+  --  ["Dysprosium Dust"] = { asteroid = "Holmium/Samarium", priority = 3 },
   ["Holmium Dust"]            = { asteroid = "Holmium/Samarium", priority = 2 },
   ["Erbium Dust"]             = { asteroid = "Holmium/Samarium", priority = 4 },
   ["Thulium Dust"]            = { asteroid = "Holmium/Samarium", priority = 5 },
@@ -2754,12 +2754,12 @@ config.dustTargets = {
   ["Lutetium Dust"]           = { asteroid = "Lutetium", priority = 1 },
 
   -- === RARE EARTH INTERMEDIATE PRODUCTS ===
-  ["Rare Earth I Dust"]       = { asteroid = "Aluminium-LanthLine", priority = 2 },
-  ["Rare Earth II Dust"]      = { asteroid = "Holmium/Samarium", priority = 2 },
-  ["Rare Earth III Dust"]     = { asteroid = "Everglades", priority = 3 },
-  ["Rare Earth I Ore"]        = { asteroid = "Aluminium-LanthLine", priority = 2 },
-  ["Rare Earth II Ore"]       = { asteroid = "Holmium/Samarium", priority = 2 },
-  ["Rare Earth III Ore"]      = { asteroid = "Everglades", priority = 3 },
+  ["Rare Earth (I) Dust"]       = { asteroid = "Everglades", priority = 2 },   -- was: Rare Earth I Dust -> Aluminium-LanthLine
+  ["Rare Earth (II) Dust"]      = { asteroid = "Everglades", priority = 2 },   -- was: Rare Earth II Dust -> Holmium/Samarium
+  ["Rare Earth (III) Dust"]     = { asteroid = "Everglades", priority = 3 },   -- was: Rare Earth III Dust -> Everglades
+  ["Rare Earth (I) Ore"]        = { asteroid = "Everglades", priority = 2 },   -- was: Rare Earth I Ore -> Aluminium-LanthLine
+  ["Rare Earth (II) Ore"]       = { asteroid = "Everglades", priority = 2 },   -- was: Rare Earth II Ore -> Holmium/Samarium
+  ["Rare Earth (III) Ore"]      = { asteroid = "Everglades", priority = 3 },   -- was: Rare Earth III Ore -> Everglades
 
   -- === METALLIC RESOURCES — STANDARD PROCESSING ORES ===
   ["Adamantium Dust"]         = { asteroid = "Adamantium", priority = 1 },
@@ -2783,37 +2783,37 @@ config.dustTargets = {
   ["Lead Dust"]               = { asteroid = "Lead", priority = 1 },
   ["Tin Dust"]                = { asteroid = "Tin", priority = 1 },
   ["Zinc Dust"]               = { asteroid = "Copper", priority = 2 },
-  ["Invar Dust"]              = { asteroid = "Nickel", priority = 2 },
+  --  ["Invar Dust"] = { asteroid = "Nickel", priority = 2 },
   ["Platinum Ore"]            = { asteroid = "PlatLine Ore", priority = 1 },
   ["Palladium Dust"]          = { asteroid = "PlatLine Ore", priority = 2 },
   ["Osmium Dust"]             = { asteroid = "PlatLine Ore", priority = 3 },
   ["Tiberium Dust"]           = { asteroid = "Holmium/Samarium", priority = 4 },
   ["Iridium Dust"]            = { asteroid = "PlatLine Ore", priority = 4 },
-  ["Galena Dust"]             = { asteroid = "Lead", priority = 4 },
+  --  ["Galena Dust"] = { asteroid = "Lead", priority = 4 },
   ["Sphalerite Dust"]         = { asteroid = "Copper", priority = 3 },
   ["Pyrite Dust"]             = { asteroid = "Iron", priority = 2 },
   ["Bauxite Ore"]             = { asteroid = "Aluminium", priority = 2 },
   ["Monazite Ore"]            = { asteroid = "Aluminium-LanthLine", priority = 1 },
   ["Bastnasite Ore"]          = { asteroid = "Aluminium-LanthLine", priority = 2 },
-  ["Soldering Alloy Dust"]    = { asteroid = "Lead", priority = 2 },
-  ["Battery Alloy Dust"]      = { asteroid = "Lead", priority = 3 },
+  --  ["Soldering Alloy Dust"] = { asteroid = "Lead", priority = 2 },
+  --  ["Battery Alloy Dust"] = { asteroid = "Lead", priority = 3 },
 
   -- === INDUSTRIAL MATERIALS, THAUMCRAFT & GEM ORES ===
-  ["Clay Block"]              = { asteroid = "Clay", priority = 1 },
+  ["Clay"]                      = { asteroid = "Clay", priority = 1 },   -- was: Clay Block -> Clay
   ["Magnesium Dust"]          = { asteroid = "Magnesium", priority = 1 },
   ["Niobium Dust"]            = { asteroid = "Niobium", priority = 1 },
   ["Phosphate Dust"]          = { asteroid = "Phosphate", priority = 1 },
-  ["Quartz Dust"]             = { asteroid = "Quartz", priority = 1 },
+  --  ["Quartz Dust"] = { asteroid = "Quartz", priority = 1 },
   ["Salt"]                    = { asteroid = "Salt", priority = 1 },
   ["Saltpeter Dust"]          = { asteroid = "Salt", priority = 2 },
-  ["Silicon Dust"]            = { asteroid = "Silicon", priority = 1 },
+  --  ["Silicon Dust"] = { asteroid = "Silicon", priority = 1 },
   ["Thaumium Dust"]           = { asteroid = "Thaumium Dusts", priority = 1 },
   ["Tungsten Dust"]           = { asteroid = "Tungsten-Titanium", priority = 1 },
   ["Manganese Dust"]          = { asteroid = "Tungsten-Titanium", priority = 2 },
   ["Titanium Dust"]           = { asteroid = "Tungsten-Titanium", priority = 3 },
   ["Coal Dust"]               = { asteroid = "Coal", priority = 10 },
   ["Graphite Dust"]           = { asteroid = "Coal", priority = 10 },
-  ["Graphene Dust"]           = { asteroid = "Coal", priority = 10 },
+  --  ["Graphene Dust"] = { asteroid = "Coal", priority = 10 },
   ["Diamond"]                 = { asteroid = "Gem Ores", priority = 1 },
   ["Nether Star"]             = { asteroid = "Gem Ores", priority = 2 },
   ["Diamond Dust"]            = { asteroid = "Gem Ores", priority = 3 },
@@ -2832,9 +2832,24 @@ config.dustTargets = {
   ["Uranium 238 Dust"]        = { asteroid = "Uranium-Plutonium", priority = 1 },
   ["Plutonium 239 Dust"]      = { asteroid = "Uranium-Plutonium", priority = 3 },
   ["Thorium Dust"]            = { asteroid = "Uranium-Plutonium", priority = 4 },
-  ["Naquadah Dust"]           = { asteroid = "Naquadah", priority = 1 },
-  ["Enriched Naquadah Dust"]  = { asteroid = "Naquadah", priority = 2 },
-  ["Naquadria Dust"]          = { asteroid = "Naquadah", priority = 3 }
+  --  ["Naquadah Dust"] = { asteroid = "Naquadah", priority = 1 },
+  --  ["Enriched Naquadah Dust"] = { asteroid = "Naquadah", priority = 2 },
+  --  ["Naquadria Dust"] = { asteroid = "Naquadah", priority = 3 },
+  -- === UNVERIFIED, DISABLED ===
+  -- The commented entries above were in the shipped config but the game never
+  -- produced them: asteroiddump walked every asteroid and every ore-processing
+  -- recipe and saw none of these labels, on any asteroid.
+  --
+  -- They are not necessarily wrong. Alloys (Invar, Battery Alloy, Soldering
+  -- Alloy, Graphene, Staballoy, Kleinite) and the rare-earth chemical line
+  -- (Cerium, Praseodymium, Promethium, Dysprosium, Gadolinium, Terbium) sit
+  -- past the ore-processing graph the mod walks, so their absence proves
+  -- nothing either way. What it does mean is that nobody has confirmed the
+  -- labels, and a wrong label fails silently as a permanent 0%.
+  --
+  -- If you actually produce one of these, add it in the editor (press E, open
+  -- its asteroid, press A) and check the spelling with verify_items first. It
+  -- will be written to user_config.lua, which this file never overwrites.
 }
 
 --------------------------------------------------------------------------------
