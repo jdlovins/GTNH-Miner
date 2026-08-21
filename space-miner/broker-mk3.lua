@@ -1147,6 +1147,368 @@ end
 --   - messages: serviced with a tiny event.pull timeout so we spin fast
 --   - UI redraw: ~4x/second (humans don't need more; GPU calls are expensive)
 --   - dispatch: every DISPATCH_INTERVAL
+-- =============================================================================
+-- CONDITION EDITOR  (press E on the dashboard)
+--
+-- Runs as a UI MODE, not a modal dialog. The main loop keeps calling
+-- sched.tick() and stepModules() the whole time this is open, so loads in
+-- flight are unaffected. A blocking prompt here could stall a load past
+-- ARRIVE_TIMEOUT and fail it.
+--
+-- That constraint shapes the input design: there is no typed-number entry.
+-- Targets cycle through a preset ladder, and the filter is incremental (press
+-- / then type). Every keystroke is just another event through the same loop.
+--
+-- The menu is config.dustTargets, because a condition only dispatches if
+-- dustTargets has an entry for that exact itemName -- that is how the broker
+-- finds which asteroid to mine. Conditions without one are listed last, marked
+-- NOT MINEABLE, and preserved on save rather than silently dropped.
+-- =============================================================================
+
+local EDITOR_CONFIG_PATH = "/home/config.lua"
+local QUOTE              = string.char(34)
+local TARGET_LADDER      = { 1000000, 2000000, 5000000, 10000000, 25000000, 50000000, 100000000 }
+
+local edRequestWatchlist = false   -- set on save; main loop re-broadcasts
+
+local ed = {
+  open = false, items = {}, view = {}, enabled = {}, threshold = {},
+  sel = 1, scroll = 0, filter = nil, filtering = false,
+  msg = "", msgColor = 0x888888,
+}
+
+local function edSay(m, c) ed.msg = m; ed.msgColor = c or 0x888888 end
+
+local function edRows()  return H - 6 end     -- rows 5 .. H-2 hold the list
+local function edFirst() return 5 end
+
+local function edRebuildView()
+  ed.view = {}
+  for i, it in ipairs(ed.items) do
+    if not ed.filter or ed.filter == ""
+       or it.name:lower():find(ed.filter, 1, true)
+       or (it.asteroid or ""):lower():find(ed.filter, 1, true) then
+      ed.view[#ed.view + 1] = i
+    end
+  end
+  if ed.sel > #ed.view then ed.sel = #ed.view end
+  if ed.sel < 1 then ed.sel = 1 end
+  local maxScroll = math.max(0, #ed.view - edRows())
+  if ed.scroll > maxScroll then ed.scroll = maxScroll end
+  if ed.scroll < 0 then ed.scroll = 0 end
+end
+
+local function edFollow()
+  if ed.sel < ed.scroll + 1 then ed.scroll = ed.sel - 1 end
+  if ed.sel > ed.scroll + edRows() then ed.scroll = ed.sel - edRows() end
+  if ed.scroll < 0 then ed.scroll = 0 end
+end
+
+local function edBuild()
+  ed.enabled, ed.threshold, ed.items = {}, {}, {}
+  for _, cond in ipairs(config.conditions) do
+    ed.enabled[cond.itemName]   = true
+    ed.threshold[cond.itemName] = cond.amountToMaintain
+  end
+  for name, entry in pairs(config.dustTargets) do
+    ed.items[#ed.items + 1] = {
+      name = name, asteroid = entry.asteroid, priority = entry.priority or 99,
+      mineable = true, known = config.asteroids[entry.asteroid] ~= nil,
+    }
+  end
+  for _, cond in ipairs(config.conditions) do
+    if not config.dustTargets[cond.itemName] then
+      ed.items[#ed.items + 1] = { name = cond.itemName, priority = 999,
+                                  mineable = false, known = false }
+    end
+  end
+  table.sort(ed.items, function(a, b)
+    if a.mineable ~= b.mineable then return a.mineable end
+    if a.priority ~= b.priority then return a.priority < b.priority end
+    return a.name < b.name
+  end)
+  ed.sel, ed.scroll, ed.filter, ed.filtering = 1, 0, nil, false
+  edRebuildView()
+end
+
+local function edCount()
+  local n = 0
+  for _ in pairs(ed.enabled) do n = n + 1 end
+  return n
+end
+
+local function edCycleTarget(idx)
+  local it  = ed.items[idx]
+  local cur = ed.threshold[it.name] or 0
+  local nxt = TARGET_LADDER[1]
+  for _, v in ipairs(TARGET_LADDER) do
+    if v > cur then nxt = v break end
+  end
+  ed.threshold[it.name] = nxt
+  ed.enabled[it.name]   = true
+  edSay(it.name .. " target " .. formatQty(nxt), 0x00FF00)
+end
+
+local function edToggle(idx)
+  local it = ed.items[idx]
+  if ed.enabled[it.name] then
+    ed.enabled[it.name] = nil
+    edSay("disabled " .. it.name)
+  else
+    ed.enabled[it.name]   = true
+    ed.threshold[it.name] = ed.threshold[it.name] or 5000000
+    if it.mineable then
+      edSay("enabled " .. it.name .. " at " .. formatQty(ed.threshold[it.name]), 0x00FF00)
+    else
+      edSay("enabled " .. it.name .. " -- no dustTargets entry, it will NEVER mine", 0xFF4444)
+    end
+  end
+end
+
+-- Write config.conditions back, then apply it in-process: no restart needed.
+local function edSave()
+  local f = io.open(EDITOR_CONFIG_PATH, "r")
+  if not f then edSay("cannot read config.lua", 0xFF4444) return end
+  local src = f:read("*a"); f:close()
+
+  local head = src:find("config%.conditions%s*=%s*{")
+  local tail = head and src:find("\n}", head)
+  if not head or not tail then
+    edSay("could not locate config.conditions in the file", 0xFF4444) return
+  end
+
+  local out = { "config.conditions = {",
+    "  -- Managed by the broker condition editor (press E).",
+    "  -- Commented entries are disabled, not deleted." }
+  local lastP, inertHdr = nil, false
+  for _, it in ipairs(ed.items) do
+    if it.mineable then
+      if it.priority ~= lastP then
+        out[#out + 1] = string.format("  -- ---- priority %d ----", it.priority)
+        lastP = it.priority
+      end
+    elseif not inertHdr then
+      out[#out + 1] = "  -- ---- no dustTargets entry: these display but never dispatch ----"
+      inertHdr = true
+    end
+    local body = string.format("{ itemName = %-32s amountToMaintain = qty(%s%s%s) },",
+      QUOTE .. it.name .. QUOTE .. ",",
+      QUOTE, formatQty(ed.threshold[it.name] or 5000000), QUOTE)
+    out[#out + 1] = (ed.enabled[it.name] and "  " or "  --  ") .. body
+  end
+  out[#out + 1] = "}"
+
+  local w = io.open(EDITOR_CONFIG_PATH, "w")
+  if not w then edSay("cannot write config.lua", 0xFF4444) return end
+  w:write(src:sub(1, head - 1) .. table.concat(out, "\n") .. src:sub(tail + 2))
+  w:close()
+
+  -- Apply live. Rebuilding the table in memory beats re-reading the file, which
+  -- every other subsystem already holds references into.
+  local fresh = {}
+  for _, it in ipairs(ed.items) do
+    if ed.enabled[it.name] then
+      fresh[#fresh + 1] = { itemName = it.name,
+                            amountToMaintain = ed.threshold[it.name] or 5000000 }
+    end
+  end
+  config.conditions = fresh
+
+  local newDust = {}
+  for _, cond in ipairs(config.conditions) do
+    local prev = brokerState.dust[cond.itemName]
+    newDust[cond.itemName] = { stock = prev and prev.stock or 0,
+                               threshold = cond.amountToMaintain }
+  end
+  brokerState.dust   = newDust
+  dustScroll         = 0
+  edRequestWatchlist = true
+
+  edSay("saved " .. #fresh .. " conditions and applied them live", 0x00FF00)
+end
+
+local edButtons = {}
+do
+  local defs = { { "SAVE", "save" }, { "ALL", "all" }, { "NONE", "none" },
+                 { "FIND", "find" }, { "CLOSE", "close" } }
+  local x = 2
+  for _, d in ipairs(defs) do
+    local label = " " .. d[1] .. " "
+    edButtons[#edButtons + 1] = { x1 = x, x2 = x + #label - 1, label = label, action = d[2] }
+    x = x + #label + 2
+  end
+end
+
+local EX_MARK, EX_NAME = 2, 6
+local EX_TGT, EX_HAVE, EX_AST = 44, 55, 68
+
+local function edDraw()
+  gpu.setBackground(0x000000)
+  gpu.fill(1, 1, W, H, " ")
+
+  gpu.setForeground(0x00FF00)
+  term.setCursor(2, 1); io.write("CONDITION EDITOR")
+  gpu.setForeground(0x888888)
+  term.setCursor(2, 2)
+  io.write(string.format("%d mineable  |  %d enabled  |  click target to cycle  |  modules keep running",
+    #ed.items, edCount()))
+
+  gpu.setForeground(0x888888)
+  term.setCursor(EX_NAME, 4); io.write("ITEM")
+  term.setCursor(EX_TGT, 4);  io.write("TARGET")
+  term.setCursor(EX_HAVE, 4); io.write("HAVE")
+  term.setCursor(EX_AST, 4);  io.write("ASTEROID")
+
+  for r = 0, edRows() - 1 do
+    local y   = edFirst() + r
+    local idx = ed.view[ed.scroll + r + 1]
+    if idx then
+      local it = ed.items[idx]
+      local on = ed.enabled[it.name]
+      if ed.scroll + r + 1 == ed.sel then
+        gpu.setBackground(0x222222); gpu.fill(1, y, W, 1, " ")
+      end
+      gpu.setForeground(on and 0x00FFFF or 0x555555)
+      term.setCursor(EX_MARK, y); io.write(on and "[x]" or "[ ]")
+      term.setCursor(EX_NAME, y); io.write(it.name:sub(1, EX_TGT - EX_NAME - 1))
+      term.setCursor(EX_TGT, y)
+      io.write(on and formatQty(ed.threshold[it.name] or 5000000) or "-")
+
+      local d    = brokerState.dust[it.name]
+      local have = d and d.stock or 0
+      local tgt  = ed.threshold[it.name] or 5000000
+      gpu.setForeground(have >= tgt and 0x00FF00 or (have > 0 and 0xFFAA00 or 0x555555))
+      term.setCursor(EX_HAVE, y); io.write(formatQty(have))
+
+      if not it.mineable then
+        gpu.setForeground(0xFF4444); term.setCursor(EX_AST, y); io.write("NOT MINEABLE")
+      else
+        gpu.setForeground(it.known and (on and 0x888888 or 0x555555) or 0xFFAA00)
+        term.setCursor(EX_AST, y); io.write(tostring(it.asteroid):sub(1, W - EX_AST))
+      end
+      gpu.setBackground(0x000000)
+    end
+  end
+
+  local by = H - 1
+  for _, b in ipairs(edButtons) do
+    gpu.setBackground(0x333333); gpu.setForeground(0xFFFFFF)
+    term.setCursor(b.x1, by); io.write(b.label)
+  end
+  gpu.setBackground(0x000000)
+  gpu.setForeground(0x888888)
+  local pos = string.format("%d-%d/%d", math.min(ed.scroll + 1, #ed.view),
+    math.min(ed.scroll + edRows(), #ed.view), #ed.view)
+  term.setCursor(W - #pos - 1, by); io.write(pos)
+
+  term.setCursor(2, H)
+  if ed.filtering then
+    gpu.setForeground(0xFFAA00)
+    io.write("/" .. (ed.filter or "") .. "_    enter=keep  esc=clear")
+  else
+    gpu.setForeground(ed.msgColor)
+    io.write(ed.msg:sub(1, W - 2))
+  end
+end
+
+local function edAction(a)
+  if a == "close" then
+    ed.open = false
+    drawStaticFrame()
+  elseif a == "save" then
+    edSave()
+  elseif a == "all" then
+    for _, it in ipairs(ed.items) do
+      if it.mineable then
+        ed.enabled[it.name]   = true
+        ed.threshold[it.name] = ed.threshold[it.name] or 5000000
+      end
+    end
+    edSay("enabled everything mineable", 0x00FF00)
+  elseif a == "none" then
+    ed.enabled = {}
+    edSay("disabled everything")
+  elseif a == "find" then
+    ed.filtering = true
+    ed.filter = ""
+    edRebuildView()
+  end
+end
+
+-- Returns true if the event was consumed by the editor.
+local function edHandle(ev)
+  local kind = ev[1]
+
+  if kind == "touch" then
+    local x, y = ev[3], ev[4]
+    if y == H - 1 then
+      for _, b in ipairs(edButtons) do
+        if x >= b.x1 and x <= b.x2 then edAction(b.action) return true end
+      end
+      return true
+    end
+    if y >= edFirst() and y < edFirst() + edRows() then
+      local pos = ed.scroll + (y - edFirst()) + 1
+      local idx = ed.view[pos]
+      if idx then
+        ed.sel = pos
+        if x >= EX_TGT and x < EX_HAVE then edCycleTarget(idx) else edToggle(idx) end
+      end
+    end
+    return true
+
+  elseif kind == "scroll" then
+    local dir = ev[5]
+    ed.scroll = ed.scroll - (dir or 0) * 3
+    local maxScroll = math.max(0, #ed.view - edRows())
+    if ed.scroll > maxScroll then ed.scroll = maxScroll end
+    if ed.scroll < 0 then ed.scroll = 0 end
+    return true
+
+  elseif kind == "key_down" then
+    local ch, code = ev[3], ev[4]
+
+    -- Incremental filter mode swallows printable keys.
+    if ed.filtering then
+      if code == 28 then                      -- enter
+        ed.filtering = false
+        edSay("filter: " .. (ed.filter or ""))
+      elseif code == 1 then                   -- esc
+        ed.filtering = false; ed.filter = nil
+        edRebuildView(); edSay("filter cleared")
+      elseif code == 14 then                  -- backspace
+        ed.filter = (ed.filter or ""):sub(1, -2)
+        edRebuildView()
+      elseif ch and ch >= 32 and ch < 127 then
+        ed.filter = (ed.filter or "") .. string.char(ch):lower()
+        edRebuildView()
+      end
+      return true
+    end
+
+    if     code == 200 then ed.sel = math.max(1, ed.sel - 1); edFollow()
+    elseif code == 208 then ed.sel = math.min(#ed.view, ed.sel + 1); edFollow()
+    elseif code == 201 then ed.sel = math.max(1, ed.sel - edRows()); edFollow()
+    elseif code == 209 then ed.sel = math.min(#ed.view, ed.sel + edRows()); edFollow()
+    elseif code == 199 then ed.sel = 1; edFollow()
+    elseif code == 207 then ed.sel = #ed.view; edFollow()
+    elseif code == 1   then edAction("close")
+    elseif ch == 32 then
+      local idx = ed.view[ed.sel]; if idx then edToggle(idx) end
+    elseif ch == 116 then
+      local idx = ed.view[ed.sel]; if idx then edCycleTarget(idx) end
+    elseif ch == 47  then edAction("find")
+    elseif ch == 115 then edAction("save")
+    elseif ch == 97  then edAction("all")
+    elseif ch == 110 then edAction("none")
+    elseif ch == 113 then edAction("close")
+    end
+    return true
+  end
+
+  return false
+end
+
 local UI_INTERVAL = 0.25 -- seconds between full UI repaints
 local lastUIDraw  = 0
 
@@ -1188,6 +1550,14 @@ while true do
   local ev = { event.pull(0.01) }
   if ev[1] == "modem_message" then
     processMessage(table.unpack(ev))
+
+  elseif ed.open then
+    -- The editor owns input while it is up, but ONLY input. Execution still
+    -- falls through to sched.tick() and stepModules() below, so loads in flight
+    -- keep progressing while someone edits. That is the whole reason this is a
+    -- UI mode rather than a separate blocking program.
+    if edHandle(ev) then lastUIDraw = 0 end
+
   elseif ev[1] == "scroll" then
     -- ev = { "scroll", screenAddr, x, y, direction, player }
     local sx, dir = ev[3], ev[5]
@@ -1195,6 +1565,20 @@ while true do
       dustScroll = dustScroll - dir * 2   -- clamped in drawDustPanel
       lastUIDraw = 0                      -- repaint now, do not wait for the tick
     end
+
+  elseif ev[1] == "key_down" and ev[3] == 101 then   -- "e" opens the editor
+    ed.open = true
+    edBuild()
+    edSay("click a row to toggle, click its target to cycle -- mining continues")
+    lastUIDraw = 0
+  end
+
+  -- A save inside the editor rewrites config.conditions and applies it live, so
+  -- push the new watchlist immediately rather than waiting out the 30s cadence.
+  if edRequestWatchlist then
+    broadcastWatchlist()
+    lastWatchlistSend  = computer.uptime()
+    edRequestWatchlist = false
   end
 
   -- 1b. Re-publish the dust watchlist on its own slow cadence.
@@ -1232,7 +1616,7 @@ while true do
   --    frees the loop to tick the scheduler hundreds of times per second.
   local up = computer.uptime()
   if up - lastUIDraw >= UI_INTERVAL then
-    drawUI()
+    if ed.open then edDraw() else drawUI() end
     lastUIDraw = up
   end
 end
