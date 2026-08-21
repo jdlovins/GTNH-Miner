@@ -2936,8 +2936,18 @@ config.conditions = {
 --------------------------------------------------------------------------------
 config.ports = {
   telemetry = 2026, -- inbound to broker: telem nodes + job nodes → broker
-  command   = 2027  -- outbound from broker: broker → job nodes
+  command   = 2027, -- outbound from broker: broker → job nodes
+  hardware  = 2025  -- outbound from broker: broker → hw telem node
 }
+-- Why the hardware node gets its own port instead of listening on `command`:
+-- the DUST_WATCHLIST broadcast carries every tracked dust item, and the hw node
+-- is the most memory-constrained machine in the fleet (it does not even load
+-- this file). Sharing a port would make it unserialize that packet every 30s
+-- only to discard it. 2025 was already opened by hw_telem for a query protocol
+-- that never got a client, so this costs nothing new.
+--
+-- NOTE: hw_telem.lua hardcodes 2025 -- it does not load this file. Changing the
+-- number here without changing it there silently stops drill auto-crafting.
 
 -- Seconds to wait after a job run before re-checking dust levels.
 -- Accounts for ore processing pipeline delay (ore → ore factory → dust storage).
@@ -2948,6 +2958,34 @@ config.pipelineCheckDelay = 30
 -- this many kits are available in stock.
 config.tipsPerLoad = 64
 config.rodsPerLoad = 64
+
+-- Par levels for drill consumables. The broker publishes this table to the hw
+-- telem node (DRILL_PAR on config.ports.hardware); the node compares it against
+-- its own live ME scan and auto-crafts anything below par.
+--
+-- Only materials listed here are ever ordered. This is deliberately an explicit
+-- list rather than something derived from droneDrillMap: derivation would have
+-- us queueing Transcendent Metal drill tips for a tier that has no
+-- drillRegistry entry and cannot be dispatched anyway.
+--
+-- Default is 4x a full load (config.tipsPerLoad = 64), so there is buffer for
+-- four module loads before anything can stall on the kits < 64 dispatch floor.
+--
+-- If the network has no crafting pattern for a listed item, the node reports it
+-- as "nopattern" and it shows up red on both dashboards -- a missing pattern is
+-- meant to be loud, since the failure it replaces (a module that silently never
+-- loads) is the hardest thing in this system to diagnose.
+config.drillPar = {
+  steel         = { tips = 256, rods = 256 },
+  titanium      = { tips = 256, rods = 256 },
+  tungstensteel = { tips = 256, rods = 256 },
+  naquadah      = { tips = 256, rods = 256 },
+  naquadahAlloy = { tips = 256, rods = 256 },
+  neutronium    = { tips = 256, rods = 256 },
+  -- cosmicNeutronium / infinity / transcendentMetal have no drillRegistry entry
+  -- yet (see the TODO above it), so dispatch skips them. Add them here once
+  -- they are registered.
+}
 
 -- ---------------------------------------------------------------------------
 -- LOGGING (see logger.lua)
@@ -2989,6 +3027,10 @@ config.logging = {
 --   dustTargets  MERGED over the shipped table, so new mappings you add are
 --                added and existing ones can be corrected, while everything you
 --                have not touched keeps following updates to this file.
+--   drillPar     MERGED per material, same reasoning: a par you tuned for one
+--                drill wins, while the materials you never touched keep
+--                following the shipped defaults. Set a material to false to
+--                stop ordering it entirely.
 --------------------------------------------------------------------------------
 
 -- Snapshot before merging so the editor can tell which entries are genuinely
@@ -3010,6 +3052,18 @@ do
     end
     if type(user.conditions) == "table" and #user.conditions > 0 then
       config.conditions = user.conditions
+    end
+    if type(user.drillPar) == "table" then
+      for key, p in pairs(user.drillPar) do
+        -- `false` is how you switch a shipped material off. Writing nil into a
+        -- table you are iterating elsewhere is fine here, but false would leak
+        -- through to the broadcast as a non-table, so drop the key outright.
+        if p == false then
+          config.drillPar[key] = nil
+        elseif type(p) == "table" then
+          config.drillPar[key] = { tips = p.tips, rods = p.rods }
+        end
+      end
     end
   end
 end

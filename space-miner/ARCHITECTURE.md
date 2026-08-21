@@ -167,7 +167,13 @@ MEDINA (Modular Extraction and Dispatch Intelligence Network Array) is a wireles
 
 **Network:**
 - **Outbound (Port 2026):** Broadcasts HW_UPDATE payload every 10 seconds
-- Payload: drone counts (by tier key) and drill kit counts (tips ∩ rods by material)
+- Payload: drone counts (by tier key), drill kit counts (tips ∩ rods by material), and any outstanding restock orders
+- **Inbound (Port 2025):** Receives DRILL_PAR from the broker — the par levels this node crafts back up to
+
+Note the 10s cadence is nominal. The loop's `event.pull(10, ...)` returns early on
+any modem traffic on an open port, and the other telem nodes broadcast on 2026
+continuously, so iterations are frequent and irregular. Anything in this node that
+needs to be rate-limited uses `computer.uptime()`, never a loop counter.
 
 **Inventory Scanning:**
 - Calls `me_controller.getItemsInNetwork()` for all items
@@ -181,6 +187,14 @@ MEDINA (Modular Extraction and Dispatch Intelligence Network Array) is a wireles
 - Right column: Drill kit availability (9 materials, magenta when available)
 - Masking: Drills only displayed if any drone is in stock
 - Updates every 10 seconds
+
+**Auto-Crafting (par restock):**
+- The broker publishes `config.drillPar` as ME labels (DRILL_PAR, port 2025); this node diffs par against its own live scan and calls `me.getCraftables{label=...}` / `craftable.request(n)` for the shortfall
+- Policy (what "enough" means) lives on the broker; execution lives here, because this node holds the ME controller proxy and the freshest counts
+- An in-flight craft is tracked so the deficit — which stays positive until the craft lands — cannot cause a re-order every cycle
+- After a craft completes, the label is held until a scan observes the stock actually move (with a 120s backstop), so a stale snapshot cannot cause a double-order
+- A label with no crafting pattern is reported as `nopattern` and shown red on both dashboards, and re-probed at most once a minute
+- With no DRILL_PAR received (broker down, or `config.drillPar` empty) this node orders nothing and behaves exactly as it did before
 
 **Role in Dispatch:**
 - Broker uses these counts directly to decide whether `selectDrone()` can find an available drone
@@ -254,7 +268,7 @@ MEDINA (Modular Extraction and Dispatch Intelligence Network Array) is a wireles
 |-----------|---------|------|-----------|-----------|
 | **Broker MK3** | Central controller, UI, dispatch, drives local modules | 2026 in (2027 out only for optional remote nodes) | — | Receives telemetry; loads/runs its own modules |
 | **Dust Telem** | Monitors dust storage levels | 2026 in | 120s | → Broker |
-| **HW Telem** | Scans drone/drill kit inventory | 2026 in | 10s | → Broker |
+| **HW Telem** | Scans drone/drill kit inventory, auto-crafts drill consumables to par | 2026 out, 2025 in | 10s (nominal) | → Broker, ← DRILL_PAR |
 | **Fluid Telem** | Reads plasma tank levels | 2026 in | 10s | → Broker |
 | **Job Nodes** | Execute mining jobs on modules | 2026 in, 2027 out | Per job | ← Broker commands, → Status updates |
 
@@ -279,9 +293,17 @@ All telemetry nodes send updates in this format:
 ```lua
 {
   drones = { ["lv"]=2, ["mv"]=5, ... },
-  drills = { ["steel"]=10, ["titanium"]=3, ... }
+  -- A "kit" is min(tips, rods) of one material. All three counts are sent so the
+  -- broker can tell "no tips" apart from "no rods".
+  drills = { ["steel"] = { kits=10, tips=10, rods=64 }, ... },
+  -- Present only while restock orders are outstanding; absent at par.
+  crafting = { ["Steel Drill Tip"] = { want=156, state="crafting" }, ... }
 }
 ```
+`crafting` states: `"crafting"` (request accepted, in flight), `"nopattern"` (no
+crafting pattern in the network — needs a human), `"failed"` (request rejected).
+The broker replaces its copy wholesale on every HW_UPDATE, so a resolved entry
+clears itself.
 
 **DUST_UPDATE** data:
 ```lua
@@ -318,6 +340,30 @@ Job nodes send status updates:
   lastSeen    = os.time()
 }
 ```
+
+### MEDINA_COMMAND (Broker → HW Telem Node, Port 2025)
+
+Broker broadcasts drill consumable par levels, every 30s on the same timer as the
+dust watchlist:
+
+```lua
+{
+  protocol    = "MEDINA_COMMAND",
+  sender      = "broker-id",
+  payloadType = "DRILL_PAR",
+  data        = {
+    ["Steel Drill Tip"] = 256,
+    ["Steel Rod"]       = 256,
+    ...
+  }
+}
+```
+
+**Notes:**
+- Built from `config.drillPar`, resolved to ME labels through `config.drills` — the hw node does not load `config.lua` and cannot map a drill key to a label itself
+- Sent on its own port rather than 2027 because the hw node is the most memory-constrained machine in the fleet, and sharing a port would make it unserialize every DUST_WATCHLIST broadcast just to discard it. Port 2025 was already open on that node for a query protocol that never got a client
+- The node **replaces** its par table on receipt, so removing a material from `config.drillPar` actually stops it being ordered
+- An empty `data` table is valid and means "order nothing"
 
 ### MEDINA_COMMAND (Broker → Job Nodes, Port 2027)
 
@@ -356,6 +402,7 @@ All mining parameters are defined in `config.lua`:
 - **Asteroids:** Material compositions, size ranges, valid distance and drone tier ranges, computation and power requirements
 - **Drones:** 14 tiers from MK-I (LV) to MK-XIV (MAX)
 - **Drills:** 9 material tiers (Steel through Transcendent Metal)
+- **Drill par:** `config.drillPar` — per-material stock levels the hw node auto-crafts back up to. An explicit list, not derived from `droneDrillMap`: derivation would queue crafts for tiers that have no `drillRegistry` entry and cannot be dispatched anyway. Defaults to 4× a full load (256) for the six registered materials
 - **Plasmas:** 5 tiers with consumption rates, time discounts, and size bonuses
 - **Optimization Matrix:** Pre-computed optimal distances per [module tier][asteroid][drone tier]
 - **Dust Targets:** Mapping of dust items to source asteroids and mining priorities

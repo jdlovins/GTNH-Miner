@@ -81,7 +81,7 @@ Loaded by every node with `dofile("/home/config.lua")`. Sections:
 8. **Dust target registry** — maps each tracked dust/item name to its source asteroid and a priority number
 9. **Module filter blacklist** — high-volume junk ores to exclude from module output
 10. **Dust stock thresholds** — `config.conditions` — what the broker uses to decide when to mine
-11. **Network settings** — `config.ports` (telemetry=2026; command=2027 reserved for optional remote job nodes), `config.pipelineCheckDelay` (default 120 s)
+11. **Network settings** — `config.ports` (telemetry=2026; command=2027 reserved for optional remote job nodes; hardware=2025 for `DRILL_PAR` to the hw node), `config.pipelineCheckDelay` (default 120 s), `config.drillPar` (per-material stock the hw node auto-crafts back up to)
 
 ---
 
@@ -147,7 +147,22 @@ Scans for all five plasmas by exact name. Determines the highest-tier plasma cur
 
 **Hardware:** T2 wireless card · T3 GPU · T3 screen · OC Adapter on the **hardware-staging ME Controller** (where drones and drill consumables are stored)
 
-Builds reverse-lookup tables from `config.drills` at startup so item matching is exact (e.g. `"Cosmic Neutronium Drill Tip"` → key `cosmicNeutronium`). Drone counts are keyed by drone tier key so the broker can compare against `config.droneTierKeys` directly. Broadcasts `HW_UPDATE` every 10 s.
+Matches items by exact label against a compiled-in lookup table (e.g. `"Cosmic Neutronium Drill Tip"` → key `cosmicNeutronium`) — this node deliberately does **not** load `config.lua`, to stay inside its memory budget. Drone counts are keyed by drone tier key so the broker can compare against `config.droneTierKeys` directly. Broadcasts `HW_UPDATE` every 10 s.
+
+**Auto-crafts drill consumables to par.** The broker publishes `config.drillPar`
+as ME labels (`DRILL_PAR`, port 2025); this node diffs par against its own live
+scan and asks the ME network to craft the shortfall. Policy stays on the broker,
+execution happens here — this node holds the ME controller proxy and the freshest
+counts.
+
+Without it, running low on one material had no visible symptom: the broker
+silently refuses to dispatch below 64 kits, so the affected drone tier just stops
+being used and its modules sit idle. Materials with no crafting pattern are
+reported as `NO CRAFTING PATTERN` on both this display and the broker's hardware
+panel, because that is the one part a human has to fix.
+
+With no broker on the air, or an empty `config.drillPar`, it orders nothing and
+behaves exactly as it did before.
 
 **Display (80×25):**
 ```
@@ -368,12 +383,12 @@ The single broker is limited by the host computer's component budget (≈6 modul
 
 ## Config file ownership
 
-Three tables, three writers, one file each. They never overwrite each other.
+Three files, three writers, one writer each. They never overwrite each other.
 
 | file | written by | contains |
 |---|---|---|
 | `config.lua` | this repo | shipped tables plus the generated `asteroidOutputs` block. Regenerated wholesale, so never hand-edit it in game. |
-| `user_config.lua` | the in-game editor (press `E`) | what you track and any dust→asteroid mappings you added. Safe to hand-edit. |
+| `user_config.lua` | the in-game editor (press `E`) | what you track, any dust→asteroid mappings you added, and your drill par overrides. Safe to hand-edit. |
 | `job_node_config.lua` | `detect_module` / `detect_sides` | your hardware addresses and transposer sides. |
 
 `config.lua` applies `user_config.lua` as an overlay at the end:
@@ -383,6 +398,19 @@ Three tables, three writers, one file each. They never overwrite each other.
 - **`dustTargets`** — yours merges over the shipped table, so mappings you added
   or corrected win, while everything you have not touched keeps following
   updates to `config.lua`.
+- **`drillPar`** — merges per material, same reasoning. Set a material to `false`
+  to stop ordering it entirely:
+
+  ```lua
+  drillPar = {
+    naquadah = { tips = 512, rods = 512 },  -- keep more of the one you burn most
+    steel    = false,                        -- stop auto-crafting this entirely
+  }
+  ```
+
+  Par is not edited by the in-game editor — hand-edit `user_config.lua` for this
+  one. Keep any par at or above `config.tipsPerLoad` (64) or a module can still
+  stall while nominally "at par".
 
 The editor only persists mappings that are genuinely yours, compared against
 `config.shippedDustTargets` — the snapshot taken before the overlay is applied.

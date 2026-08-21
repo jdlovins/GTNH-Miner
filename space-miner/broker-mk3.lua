@@ -124,6 +124,10 @@ local brokerState = {
   plasma = {},
   drones = {},
   drills = {},
+  -- What the hw node currently has on order, keyed by ME label. Populated
+  -- wholesale from HW_UPDATE -- see processMessage() -- so an entry that
+  -- resolves itself (a craft lands, a pattern gets added) disappears on its own.
+  crafting = {},
   jobs = {},
   cooldowns = {},
   lastDustSyncTime = 0,
@@ -786,6 +790,11 @@ local function processMessage(evType, _, _, _, _, rawMsg)
   elseif msg.payloadType == "HW_UPDATE" then
     if msg.data.drones then for k, v in pairs(msg.data.drones) do brokerState.drones[k] = v end end
     if msg.data.drills then for k, v in pairs(msg.data.drills) do brokerState.drills[k] = v end end
+    -- Replaced wholesale, not merged like the two above. The node sends its
+    -- complete set of outstanding orders every cycle, so assignment is what
+    -- lets a resolved entry clear itself -- merging would pin a "nopattern"
+    -- warning on screen forever after you added the pattern.
+    brokerState.crafting = (type(msg.data.crafting) == "table") and msg.data.crafting or {}
     brokerState.lastHWSyncTime = os.time()
     brokerState.lastHWSync = os.date("%X")
   end
@@ -1040,6 +1049,54 @@ local function drawHWPanel()
     if row <= H then
       clear(row); term.setCursor(P3 + 1, row)
       gpu.setForeground(0xFF4444); io.write("  [ NO DRILL KITS IN STOCK ]")
+      row = row + 1
+    end
+  end
+
+  -- Restock: what the hw node has on order against config.drillPar.
+  --
+  -- This is the only place a per-material shortage becomes visible. The block
+  -- above lists kits > 0, so a single material sitting under the 64-kit
+  -- dispatch floor used to render as an ordinary blue count -- or vanish
+  -- entirely at zero -- while its whole drone tier quietly stopped dispatching.
+  local restock = {}
+  for label in pairs(brokerState.crafting) do restock[#restock + 1] = label end
+  -- Two reasons to sort. pairs() order is arbitrary and this panel repaints four
+  -- times a second, so an unsorted list visibly shuffles between frames. And
+  -- nopattern/failed go first because they are the entries a human has to act
+  -- on: if the panel runs out of rows, the benign "crafting" lines are the ones
+  -- that should be cut.
+  table.sort(restock, function(a, b)
+    local oa, ob = brokerState.crafting[a], brokerState.crafting[b]
+    local ba = (type(oa) == "table" and oa.state == "crafting") and 1 or 0
+    local bb = (type(ob) == "table" and ob.state == "crafting") and 1 or 0
+    if ba ~= bb then return ba < bb end
+    return a < b
+  end)
+
+  if #restock > 0 then
+    row = row + 1
+    if row <= H then
+      clear(row); term.setCursor(P3 + 1, row)
+      gpu.setForeground(0x888888); io.write("  RESTOCK:")
+      row = row + 1
+    end
+    for _, label in ipairs(restock) do
+      if row > H then break end
+      local o     = brokerState.crafting[label]
+      local state = (type(o) == "table" and o.state) or "?"
+      -- "Naquadah Alloy Drill Tip" -> "Naquadah Alloy TIP": the material is what
+      -- distinguishes these, and it is the part that gets truncated away.
+      local short = label:gsub(" Drill Tip$", " TIP"):gsub(" Rod$", " ROD")
+      clear(row); term.setCursor(P3 + 1, row)
+      if state == "crafting" then
+        gpu.setForeground(0xFFAA00)
+        io.write(string.format("  %-24s x%d", short:sub(1, 24), (type(o) == "table" and o.want) or 0))
+      else
+        gpu.setForeground(0xFF4444)
+        io.write(string.format("  %-24s %s", short:sub(1, 24),
+          state == "nopattern" and "NO PATTERN" or "FAILED"))
+      end
       row = row + 1
     end
   end
@@ -1950,6 +2007,41 @@ local function broadcastWatchlist()
   }))
 end
 
+-- ---------------------------------------------------------------------------
+-- DRILL PAR
+-- Same split as the watchlist above: policy here, execution on the node. The hw
+-- node holds the ME controller proxy and the freshest counts (our copy of them
+-- is up to an HW_UPDATE cycle stale), so it does the comparing and ordering --
+-- but what "enough" means is a broker decision, and it lives in config.drillPar.
+--
+-- Sent as ME labels rather than drill keys because the node resolves crafting
+-- patterns by label, and because it does not load config.lua at all -- it has no
+-- way to turn "naquadahAlloy" into "Naquadah Alloy Drill Tip".
+--
+-- Goes out on config.ports.hardware, not the command port: see the note beside
+-- config.ports for why the hw node does not want the dust watchlist traffic.
+-- ---------------------------------------------------------------------------
+local function broadcastDrillPar()
+  local list = {}
+  for key, par in pairs(config.drillPar or {}) do
+    local drill = config.drills[key]
+    -- An unknown key is a config typo. Skip it rather than shipping a nil label
+    -- the node would have to defend against.
+    if drill and drill.tip and drill.rod then
+      list[drill.tip] = par.tips or 0
+      list[drill.rod] = par.rods or 0
+    end
+  end
+  -- An empty table still goes out: that is how a node that was ordering learns
+  -- to stop after you cleared config.drillPar.
+  modem.broadcast(config.ports.hardware, serial.serialize({
+    protocol    = "MEDINA_COMMAND",
+    sender      = nodeId,
+    payloadType = "DRILL_PAR",
+    data        = list,
+  }))
+end
+
 while true do
   -- 1. Service one inbound message. Very short timeout: returns immediately if a
   --    message is waiting, otherwise yields the CPU for ~10ms and comes back so
@@ -1995,6 +2087,7 @@ while true do
   local nowW = computer.uptime()
   if nowW - lastWatchlistSend >= WATCHLIST_INTERVAL then
     broadcastWatchlist()
+    broadcastDrillPar()  -- one timer, two audiences; par changes just as rarely
     lastWatchlistSend = nowW
   end
 
