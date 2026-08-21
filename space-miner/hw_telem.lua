@@ -35,12 +35,13 @@ local nodeName = "MEDINA-HWRelay"
 
 -- Hardcoded drone and drill lists (don't load config to save memory)
 local droneKeys = {"max","uxv","umv","uiv","uev","uhv","uv","zpm","luv","iv","ev","hv","mv","lv"}
+-- Full ME network labels, including the voltage suffix (mirrors config.drones).
 local droneNames = {
-  max="Mining Drone MK-XIV", uxv="Mining Drone MK-XIII", umv="Mining Drone MK-XII",
-  uiv="Mining Drone MK-XI", uev="Mining Drone MK-X", uhv="Mining Drone MK-IX",
-  uv="Mining Drone MK-VIII", zpm="Mining Drone MK-VII", luv="Mining Drone MK-VI",
-  iv="Mining Drone MK-V", ev="Mining Drone MK-IV", hv="Mining Drone MK-III",
-  mv="Mining Drone MK-II", lv="Mining Drone MK-I"
+  max="Mining Drone MK-XIV (MAX)", uxv="Mining Drone MK-XIII (UXV)", umv="Mining Drone MK-XII (UMV)",
+  uiv="Mining Drone MK-XI (UIV)", uev="Mining Drone MK-X (UEV)", uhv="Mining Drone MK-IX (UHV)",
+  uv="Mining Drone MK-VIII (UV)", zpm="Mining Drone MK-VII (ZPM)", luv="Mining Drone MK-VI (LuV)",
+  iv="Mining Drone MK-V (IV)", ev="Mining Drone MK-IV (EV)", hv="Mining Drone MK-III (HV)",
+  mv="Mining Drone MK-II (MV)", lv="Mining Drone MK-I (LV)"
 }
 
 -- Map drone keys to their voltage tiers
@@ -107,12 +108,6 @@ local function drawStaticFrame()
   term.setCursor(2, 24) io.write("  Network Port: 2026")
 end
 
--- In-game drone labels carry a voltage suffix, e.g. "Mining Drone MK-IX (UHV)".
--- Strip it so lookups line up with the canonical names in droneNames.
-local function canonicalDroneLabel(label)
-  return (label:gsub("%s*%b()%s*$", ""))
-end
-
 -- Reads items directly from ME network via controller
 local function scanAssets()
   local assets = { drones={}, drillTips={}, drillRods={} }
@@ -124,8 +119,7 @@ local function scanAssets()
   for _, item in ipairs(itemList) do
     if item.label then
       if string.find(item.label, "Mining Drone", 1, true) then
-        local canon = canonicalDroneLabel(item.label)
-        assets.drones[canon] = (assets.drones[canon] or 0) + item.size
+        assets.drones[item.label] = (assets.drones[item.label] or 0) + item.size
       elseif drillLookup[item.label] then
         local key = drillLookup[item.label]
         if string.find(item.label, "Drill Tip", 1, true) then
@@ -152,8 +146,10 @@ local function updateDashboard(assets)
     gpu.fill(2, row, 36, 1, " ")
     gpu.setForeground(count > 0 and 0x00FFFF or 0x555555)
     -- Display drone model with voltage tier
+    -- Labels carry a voltage suffix; show just the MK-N model, tier is its own column.
     local voltage = droneVoltages[key]
-    io.write(string.format("  %-14s [%s]: %d", string.sub(label, 14), voltage, count))
+    local model   = string.match(label, "MK%-[XVI]+") or label
+    io.write(string.format("  %-14s [%s]: %d", model, voltage, count))
   end
 
   -- Drill column (right, rows 7-15)
