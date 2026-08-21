@@ -33,7 +33,14 @@ local loader = {}
 -- Tunables (all in real seconds, all honest — no tick/second mixing).
 local CONFIRM_TIMEOUT   = 8    -- max wait for a fingerprint to appear in the db
 local ARRIVE_TIMEOUT    = 15   -- max wait for the DRONE to reach the interface buffer
-local POLL_INTERVAL     = 0.2  -- how often to re-check while awaiting
+-- How often to re-check while awaiting. Straight latency: every wait that misses
+-- its first check costs at least this long, and a load contains several.
+--
+-- Measured against a simulated ME, per load: 0.2 cost 0.55s of pure polling with
+-- an instant network, 0.1 cost 0.40s, 0.05 cost 0.35s. Calls rise with the rate,
+-- and they are metered per tick, so 0.05 gave back nearly everything the
+-- snapshot scanning saved for very little extra speed. 0.1 is the knee.
+local POLL_INTERVAL     = 0.1
 local TIPS_PER_DEFAULT  = 64   -- drill tips to stock (config.tipsPerLoad overrides)
 local RODS_PER_DEFAULT  = 64   -- drill rods to stock (config.rodsPerLoad overrides)
 local FILL_TIMEOUT      = 30   -- total seconds to get every consumable into the bus
@@ -286,10 +293,26 @@ function loader.run(mod, job, deps)
   -- at 2.
   local busSlots = mod.transposer.getInventorySize(mod.conf.inputBusSide) or 16
 
-  local function busTotal(label)
+  -- One read of each inventory per pass, then every decision comes off the
+  -- snapshot.
+  --
+  -- busTotal, destFor and findSlot each used to rescan on their own, so a single
+  -- drain pass over two consumables cost about 78 getStackInSlot calls. Those
+  -- are metered per tick in OpenComputers, so the scanning was itself part of
+  -- what made loading slow -- and it capped how tight the poll interval could
+  -- sensibly be.
+  local function scanSide(side, from, count)
+    local snap = {}
+    for s = from, count do
+      snap[s] = mod.transposer.getStackInSlot(side, s)
+    end
+    return snap
+  end
+
+  local function totalIn(snap, from, to, label)
     local total = 0
-    for s = 2, busSlots do
-      local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, s)
+    for s = from, to do
+      local st = snap[s]
       if st and st.label == label then total = total + (st.size or 0) end
     end
     return total
@@ -297,10 +320,10 @@ function loader.run(mod, job, deps)
 
   -- Where should the next transfer land? Prefer a partly filled stack of this
   -- item, otherwise the first empty slot. Returns the slot and the room in it.
-  local function destFor(label)
+  local function destIn(snap, label)
     local firstEmpty
     for s = 2, busSlots do
-      local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, s)
+      local st = snap[s]
       if not st or (st.size or 0) == 0 then
         firstEmpty = firstEmpty or s
       elseif st.label == label then
@@ -311,6 +334,19 @@ function loader.run(mod, job, deps)
     end
     if firstEmpty then return firstEmpty, STACK_DEFAULT end
     return nil, 0
+  end
+
+  local function srcIn(snap, label)
+    for s = 1, ibufSize do
+      local st = snap[s]
+      if st and st.label == label and (st.size or 0) >= 1 then return s end
+    end
+    return nil
+  end
+
+  -- Kept for the failure messages, which run once and are not hot.
+  local function busTotal(label)
+    return totalIn(scanSide(mod.conf.inputBusSide, 2, busSlots), 2, busSlots, label)
   end
 
   -- Drain both consumables together until each reaches its target.
@@ -329,18 +365,34 @@ function loader.run(mod, job, deps)
     while true do
       local outstanding, moved = false, false
 
+      -- Two reads for the whole pass, however many consumables are outstanding.
+      local busSnap = scanSide(mod.conf.inputBusSide, 2, busSlots)
+      local bufSnap = scanSide(mod.conf.interfaceSide, 1, ibufSize)
+
       for _, w in ipairs(wanted) do
-        local have = busTotal(w.label)
+        local have = totalIn(busSnap, 2, busSlots, w.label)
         if have < w.target then
           outstanding = true
-          local src = findSlot(w.label, 1)
+          local src = srcIn(bufSnap, w.label)
           if src then
-            local dst, room = destFor(w.label)
+            local dst, room = destIn(busSnap, w.label)
             if dst then
               local n = math.min(w.target - have, room)
               local got = mod.transposer.transferItem(
                 mod.conf.interfaceSide, mod.conf.inputBusSide, n, src, dst)
-              if (got or 0) > 0 then moved = true end
+              if (got or 0) > 0 then
+                moved = true
+                -- Keep the snapshot honest so a second consumable in this same
+                -- pass does not pick the slot we just filled.
+                local d = busSnap[dst]
+                if d then d.size = (d.size or 0) + got
+                else busSnap[dst] = { label = w.label, size = got, maxSize = STACK_DEFAULT } end
+                local sst = bufSnap[src]
+                if sst then
+                  sst.size = (sst.size or 0) - got
+                  if sst.size <= 0 then bufSnap[src] = nil end
+                end
+              end
             else
               -- No room anywhere on the bus; more waiting will not help.
               return false, w.label
