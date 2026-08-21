@@ -107,6 +107,12 @@ local function drawStaticFrame()
   term.setCursor(2, 24) io.write("  Network Port: 2026")
 end
 
+-- In-game drone labels carry a voltage suffix, e.g. "Mining Drone MK-IX (UHV)".
+-- Strip it so lookups line up with the canonical names in droneNames.
+local function canonicalDroneLabel(label)
+  return (label:gsub("%s*%b()%s*$", ""))
+end
+
 -- Reads items directly from ME network via controller
 local function scanAssets()
   local assets = { drones={}, drillTips={}, drillRods={} }
@@ -118,7 +124,8 @@ local function scanAssets()
   for _, item in ipairs(itemList) do
     if item.label then
       if string.find(item.label, "Mining Drone", 1, true) then
-        assets.drones[item.label] = (assets.drones[item.label] or 0) + item.size
+        local canon = canonicalDroneLabel(item.label)
+        assets.drones[canon] = (assets.drones[canon] or 0) + item.size
       elseif drillLookup[item.label] then
         local key = drillLookup[item.label]
         if string.find(item.label, "Drill Tip", 1, true) then
