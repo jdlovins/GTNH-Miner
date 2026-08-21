@@ -16,16 +16,29 @@ local term          = require("term")
 
 local config = dofile("/home/config.lua")
 
-if not component.isAvailable("modem")   then error("Missing network card.")          end
-if not component.isAvailable("me_controller") then error("Missing ME Controller.") end
-if not component.isAvailable("gpu")            then error("Requires GPU.")           end
+if not component.isAvailable("modem") then error("Missing network card.") end
+if not component.isAvailable("gpu")   then error("Requires GPU.")         end
 
 local modem = component.modem
 if not modem.isWireless or not modem.isWireless() then
   error("Node requires a T2 Wireless Network Card.")
 end
 
-local me_ctrl  = component.me_controller
+-- Read stock through an ME Interface (via adapter) — it exposes the same
+-- network query API as a controller, so this node can sit on a dust subnet
+-- without one. A controller is still accepted if that is what is attached.
+local me = nil
+for addr in component.list("me_interface") do me = component.proxy(addr) break end
+if not me then
+  for addr in component.list("me_controller") do me = component.proxy(addr) break end
+end
+if not me then
+  error("Missing ME Interface (attach one via an Adapter to read network stock).")
+end
+if type(me.getItemsInNetwork) ~= "function" then
+  error("ME Interface cannot query the network - check it is joined to the dust subnet.")
+end
+
 local gpu      = component.gpu
 local nodeName = "MEDINA-DustRelay"
 
@@ -40,7 +53,7 @@ end
 
 local function scanDustStock()
   local stocks = {}
-  local success, items = pcall(me_ctrl.getItemsInNetwork)
+  local success, items = pcall(me.getItemsInNetwork)
   if success and items then
     for _, item in ipairs(items) do
       if item and item.label and thresholds[item.label] then
