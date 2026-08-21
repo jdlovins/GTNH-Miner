@@ -292,9 +292,10 @@ local function drawStaticFrame()
   term.setCursor(40, 5) io.write("DRILL KIT AVAILABILITY")
   term.setCursor(2, 6)  io.write(string.rep("-", 76))
 
+  -- Right column only (x=40+). The drone list occupies rows 7-20 on the left,
+  -- so anything full-width here gets erased by it.
   gpu.setForeground(0xFFFFFF)
-  term.setCursor(2, 16)  io.write("RESTOCK QUEUE (auto-craft to broker par)")
-  term.setCursor(2, 17)  io.write(string.rep("-", 76))
+  term.setCursor(40, 16) io.write("RESTOCK (auto-craft to par)")
 
   gpu.setForeground(0x555555)
   term.setCursor(2, 22) io.write(string.rep("=", 76))
@@ -365,37 +366,62 @@ local function updateDashboard(assets)
     end
   end
 
-  -- Restock queue (rows 18-21). The drill column above ends at row 15 and the
-  -- footer starts at 22, so this fits without moving anything that was there.
-  local qRow = 18
+  -- Restock queue: right column (x=40, width 38), rows 17-21.
+  --
+  -- This has to live under the DRILL column, not across the screen. The drone
+  -- loop above owns rows 7-20 on the left and clears x=2..37 on every one of
+  -- them, so a full-width block here is partly erased on each repaint. The
+  -- drill column stops at row 15, which is what leaves 16-21 free on the right.
+  local QX, QW = 40, 38
+
+  -- Failures first: they are the entries a human has to act on, so if there are
+  -- more orders than rows, the benign "crafting" lines are the ones to lose.
+  local pending = {}
   for _, label in ipairs(drillLabels) do
+    if orders[label] then pending[#pending + 1] = label end
+  end
+  table.sort(pending, function(a, b)
+    local ba = (orders[a].state == "crafting") and 1 or 0
+    local bb = (orders[b].state == "crafting") and 1 or 0
+    if ba ~= bb then return ba < bb end
+    return a < b
+  end)
+
+  local qRow, QLAST = 17, 21
+  for i, label in ipairs(pending) do
+    if qRow > QLAST then break end
     local o = orders[label]
-    if o then
-      if qRow > 21 then break end
-      gpu.fill(2, qRow, 76, 1, " ")
-      term.setCursor(2, qRow)
+    gpu.fill(QX, qRow, QW, 1, " ")
+    term.setCursor(QX, qRow)
+    -- More entries than rows: spend the last line on a count rather than
+    -- showing one more and silently hiding the rest.
+    if qRow == QLAST and #pending > i then
+      gpu.setForeground(0x555555)
+      io.write(string.format("  ...and %d more", #pending - i + 1))
+    else
       local short = label:gsub(" Drill Tip$", " TIP"):gsub(" Rod$", " ROD")
       if o.state == "crafting" then
         gpu.setForeground(0xFFAA00)
-        io.write(string.format("  %-30s crafting x%d", short, o.want or 0))
+        io.write(string.format("  %-22s x%d", short, o.want or 0))
       else
         gpu.setForeground(0xFF4444)
-        io.write(string.format("  %-30s %s", short,
-          o.state == "nopattern" and "NO CRAFTING PATTERN" or "REQUEST FAILED"))
+        io.write(string.format("  %-22s %s", short,
+          o.state == "nopattern" and "NO PATTERN" or "FAILED"))
       end
-      qRow = qRow + 1
     end
+    qRow = qRow + 1
   end
-  if qRow == 18 then
-    gpu.fill(2, qRow, 76, 1, " ")
-    term.setCursor(2, qRow)
+
+  if #pending == 0 then
+    gpu.fill(QX, qRow, QW, 1, " ")
+    term.setCursor(QX, qRow)
     gpu.setForeground(0x555555)
     -- Distinguish "at par" from "no par received": a broker that is down or on
     -- a stale config would otherwise look identical to a fully stocked network.
-    io.write(next(par) and "  All drill consumables at par." or "  Awaiting par levels from broker...")
+    io.write(next(par) and "  All at par." or "  Awaiting par from broker...")
     qRow = qRow + 1
   end
-  for r = qRow, 21 do gpu.fill(2, r, 76, 1, " ") end
+  for r = qRow, QLAST do gpu.fill(QX, r, QW, 1, " ") end
 
   gpu.setForeground(0x555555)
   term.setCursor(55, 2)
