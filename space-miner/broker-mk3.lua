@@ -157,6 +157,11 @@ local P2 = math.floor(W / 3) + 1
 local P3 = math.floor(W * 2 / 3) + 1
 local PW = P2 - 2
 
+-- Dust panel scroll offset (index into the sorted list, 0 = top). Each entry
+-- occupies two rows, so a full condition list runs off the bottom long before
+-- it is fully shown; without this the overflow was simply invisible.
+local dustScroll = 0
+
 local DISPATCH_INTERVAL = 0.2
 local lastDispatchCheck = 0
 local ERROR_TIMEOUT = 10
@@ -880,7 +885,28 @@ local function drawDustPanel()
     list[#list + 1] = { name = name, stock = stock, threshold = cond.amountToMaintain, ratio = ratio }
   end
   table.sort(list, function(a, b) return a.ratio < b.ratio end)
-  for _, item in ipairs(list) do
+
+  -- Two rows per entry, so this is how many entries actually fit.
+  local capacity  = math.floor((H - row + 1) / 2)
+  local maxScroll = math.max(0, #list - capacity)
+  if dustScroll > maxScroll then dustScroll = maxScroll end
+  if dustScroll < 0 then dustScroll = 0 end
+
+  -- Range indicator in the panel header, so a truncated list is obvious rather
+  -- than looking like the whole list.
+  if #list > 0 then
+    local tag = string.format("%d-%d/%d",
+      math.min(dustScroll + 1, #list), math.min(dustScroll + capacity, #list), #list)
+    if maxScroll > 0 then tag = tag .. " ^v" end
+    local tx = P3 - #tag - 1
+    gpu.fill(tx, 4, #tag + 1, 1, " ")
+    gpu.setForeground(maxScroll > 0 and 0xFFAA00 or 0x888888)
+    term.setCursor(tx, 4)
+    io.write(tag)
+  end
+
+  for i = dustScroll + 1, #list do
+    local item = list[i]
     if row > H then break end
     gpu.fill(P2 + 1, row, PW, 1, " "); term.setCursor(P2 + 1, row)
     local pct = math.floor(item.ratio * 100)
@@ -1157,8 +1183,19 @@ while true do
   -- 1. Service one inbound message. Very short timeout: returns immediately if a
   --    message is waiting, otherwise yields the CPU for ~10ms and comes back so
   --    the scheduler keeps ticking fast.
-  local ev = { event.pull(0.01, "modem_message") }
-  if ev[1] == "modem_message" then processMessage(table.unpack(ev)) end
+  -- Pull ANY event, not just modem_message: the dust panel is scrollable and
+  -- nothing else in this program consumes input.
+  local ev = { event.pull(0.01) }
+  if ev[1] == "modem_message" then
+    processMessage(table.unpack(ev))
+  elseif ev[1] == "scroll" then
+    -- ev = { "scroll", screenAddr, x, y, direction, player }
+    local sx, dir = ev[3], ev[5]
+    if sx and dir and sx >= P2 and sx < P3 then
+      dustScroll = dustScroll - dir * 2   -- clamped in drawDustPanel
+      lastUIDraw = 0                      -- repaint now, do not wait for the tick
+    end
+  end
 
   -- 1b. Re-publish the dust watchlist on its own slow cadence.
   local nowW = computer.uptime()
