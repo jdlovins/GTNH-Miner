@@ -2984,28 +2984,34 @@ config.rodsPerLoad = 64
 -- to false in user_config.lua, if you would rather approve those crafts by hand.
 --
 -- Levels are scaled to what each material costs to make rather than held flat.
--- A flat number is wrong at both ends: four loads of Steel is nothing on a
--- mature base, while the same figure in Transcendent Metal is an enormous
--- unattended craft. Values are in items and config.tipsPerLoad is 64, so divide
--- by 64 for loads. Keep every value at or above 64 or a module can stall on the
--- kits < 64 dispatch floor while nominally sitting at par.
+-- A flat number is wrong at both ends: a shallow buffer of Steel is nothing on
+-- a mature base, while the same figure in Transcendent Metal is an enormous
+-- unattended craft.
+--
+-- Values are in ITEMS. One module refill is config.tipsPerLoad (64) of each, so
+-- 4096 is 64 refills. How long a refill lasts depends on the module: the recipe
+-- burns 4 tips and 4 rods per parallel per cycle, and maxParallels is 2/4/8 for
+-- MK-I/II/III -- so on an MK-II a refill covers 4 cycles, making 4096 roughly
+-- 256 cycles of buffer.
+--
+-- Keep every value at or above 64 or a module can stall on the kits < 64
+-- dispatch floor while nominally sitting at par.
 --
 -- If the network has no crafting pattern for a listed item, the node reports it
 -- as "nopattern" and it shows up red on both dashboards -- a missing pattern is
 -- meant to be loud, since the failure it replaces (a module that silently never
 -- loads) is the hardest thing in this system to diagnose.
 config.drillPar = {
-  -- Cheap tiers: deep buffers. 4096 is 64 loads.
+  -- Cheap tiers: full 4k buffers.
   steel             = { tips = 4096, rods = 4096 },
-  titanium          = { tips = 2048, rods = 2048 },
-  tungstensteel     = { tips = 2048, rods = 2048 },
-  -- Mid tiers.
-  naquadah          = { tips = 1024, rods = 1024 },
-  naquadahAlloy     = { tips = 1024, rods = 1024 },
-  neutronium        = { tips =  512, rods =  512 },
-  -- Tiers 11-14 (MK-XI UIV and up). Held at 4 loads deliberately: these are the
-  -- ones where an unattended craft is genuinely expensive, and par is only
-  -- published once you own a drone that uses them anyway.
+  titanium          = { tips = 4096, rods = 4096 },
+  tungstensteel     = { tips = 4096, rods = 4096 },
+  naquadah          = { tips = 2048, rods = 2048 },
+  naquadahAlloy     = { tips = 2048, rods = 2048 },
+  neutronium        = { tips = 1024, rods = 1024 },
+  -- Tiers 11-14 (MK-XI UIV and up). Held low deliberately: these are the ones
+  -- where an unattended craft is genuinely expensive, and par is only published
+  -- once you own a drone that uses them anyway.
   cosmicNeutronium  = { tips =  256, rods =  256 },
   infinity          = { tips =  256, rods =  256 },
   transcendentMetal = { tips =  256, rods =  256 },
