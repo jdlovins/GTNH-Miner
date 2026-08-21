@@ -2990,6 +2990,15 @@ config.rodsPerLoad = 64
 -- as "nopattern" and it shows up red on both dashboards -- a missing pattern is
 -- meant to be loud, since the failure it replaces (a module that silently never
 -- loads) is the hardest thing in this system to diagnose.
+-- How many drill crafts the hw node may have in flight at once.
+--
+-- Match this to your AE2 crafting CPUs in the staging network. AE2 cancels a
+-- request outright when no CPU is free, so firing every shortfall at once on a
+-- one-CPU network means one craft starts and the rest come back rejected --
+-- which read as hard failures on both dashboards and re-fired every retry.
+-- Shortfalls beyond this limit wait quietly as "queued" instead.
+config.drillCraftSlots = 1
+
 config.drillPar = {
   steel         = { tips = 256, rods = 256 },
   titanium      = { tips = 256, rods = 256 },

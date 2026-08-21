@@ -942,11 +942,25 @@ local function drawHWPanel()
   local row = 6
   local function clear(r) gpu.fill(P3 + 1, r, PW, 1, " ") end
 
-  -- No full-column pre-wipe here. Every row below clears itself before it is
-  -- written, and the tail wipe at the end of this function blanks whatever
-  -- rows the layout vacated -- so ghosts are already impossible. Blanking the
-  -- whole column up front only added a visible blank frame between the wipe
-  -- and the repaint, four times a second: that was the flicker.
+  -- Advance past n blank rows, wiping each one.
+  --
+  -- Clear-as-you-write covers every row this panel WRITES, but not the spacers
+  -- it skips -- and the sections here vary in height, so a row that is a spacer
+  -- this frame may have held text last frame. That is how a drone or drill line
+  -- appears twice: the list grows by one, every entry shifts down, and the row
+  -- the old last entry occupied is now a spacer that nobody wipes. The tail
+  -- wipe below only reaches rows underneath the cursor, never these.
+  local function skip(n)
+    for _ = 1, (n or 1) do
+      if row <= H then clear(row) end
+      row = row + 1
+    end
+  end
+
+  -- No full-column pre-wipe: blanking the whole column up front added a visible
+  -- blank frame between the wipe and the repaint, four times a second, and that
+  -- was the flicker. Every row is instead either written (and cleared first) or
+  -- passed through skip().
 
   clear(row); term.setCursor(P3 + 1, row)
   if brokerState.nextTarget then
@@ -980,11 +994,13 @@ local function drawHWPanel()
   gpu.setForeground(brokerState.lastParCount > 0 and 0x00FF00 or 0x555555)
   io.write("  PAR TX: " .. brokerState.lastParSend ..
            " (" .. brokerState.lastParCount .. ")")
-  row = row + 2
+  row = row + 1
+  skip(1)
 
   clear(row); term.setCursor(P3 + 1, row)
   gpu.setForeground(0x888888); io.write("  TASKS RUNNING: " .. sched.count())
-  row = row + 2
+  row = row + 1
+  skip(1)
 
   -- Plasma stock (required to mine — a module won't run without a plasma fluid).
   clear(row); term.setCursor(P3 + 1, row)
@@ -1021,8 +1037,7 @@ local function drawHWPanel()
     end
     row = row + 1
   end
-  if row <= H then clear(row) end
-  row = row + 1
+  skip(1)
 
   clear(row); term.setCursor(P3 + 1, row)
   gpu.setForeground(0x888888); io.write("  DRONES IN STOCK:")
@@ -1046,7 +1061,7 @@ local function drawHWPanel()
     row = row + 1
   end
 
-  row = row + 1
+  skip(1)
 
   -- Drill kits (a "kit" = one drill tip + one rod of the same material).
   clear(row); term.setCursor(P3 + 1, row)
@@ -1088,11 +1103,14 @@ local function drawHWPanel()
   -- nopattern/failed go first because they are the entries a human has to act
   -- on: if the panel runs out of rows, the benign "crafting" lines are the ones
   -- that should be cut.
+  local RANK = { nopattern = 0, failed = 0, crafting = 1, queued = 2 }
+  local function rankOf(label)
+    local o = brokerState.crafting[label]
+    return RANK[type(o) == "table" and o.state or ""] or 3
+  end
   table.sort(restock, function(a, b)
-    local oa, ob = brokerState.crafting[a], brokerState.crafting[b]
-    local ba = (type(oa) == "table" and oa.state == "crafting") and 1 or 0
-    local bb = (type(ob) == "table" and ob.state == "crafting") and 1 or 0
-    if ba ~= bb then return ba < bb end
+    local ra, rb = rankOf(a), rankOf(b)
+    if ra ~= rb then return ra < rb end
     return a < b
   end)
 
@@ -1107,17 +1125,23 @@ local function drawHWPanel()
       if row > H then break end
       local o     = brokerState.crafting[label]
       local state = (type(o) == "table" and o.state) or "?"
+      local want  = (type(o) == "table" and o.want) or 0
       -- "Naquadah Alloy Drill Tip" -> "Naquadah Alloy TIP": the material is what
       -- distinguishes these, and it is the part that gets truncated away.
       local short = label:gsub(" Drill Tip$", " TIP"):gsub(" Rod$", " ROD")
       clear(row); term.setCursor(P3 + 1, row)
       if state == "crafting" then
         gpu.setForeground(0xFFAA00)
-        io.write(string.format("  %-24s x%d", short:sub(1, 24), (type(o) == "table" and o.want) or 0))
+        io.write(string.format("  %-24s x%d", short:sub(1, 24), want))
+      elseif state == "queued" then
+        -- Not a problem: below par, waiting on a crafting CPU. Dim so it reads
+        -- as backlog rather than as another thing demanding attention.
+        gpu.setForeground(0x555555)
+        io.write(string.format("  %-24s queued x%d", short:sub(1, 24), want))
       else
         gpu.setForeground(0xFF4444)
         io.write(string.format("  %-24s %s", short:sub(1, 24),
-          state == "nopattern" and "NO PATTERN" or "FAILED"))
+          state == "nopattern" and "NO PATTERN" or "REJECTED"))
       end
       row = row + 1
     end
@@ -2043,13 +2067,45 @@ end
 -- Goes out on config.ports.hardware, not the command port: see the note beside
 -- config.ports for why the hw node does not want the dust watchlist traffic.
 -- ---------------------------------------------------------------------------
+-- Which drill materials can this base actually consume right now?
+--
+-- Par for a material we have no drone for is pure noise: it cannot be
+-- dispatched, so the kits are never spent, and on a network without the pattern
+-- it produces a permanent row of red on both dashboards. Worse, for the top
+-- tiers it would queue genuinely expensive crafts for hardware not owned.
+local function usableDrillKeys()
+  local keys = {}
+
+  -- Drones sitting in the staging network.
+  for droneKey, count in pairs(brokerState.drones) do
+    if (count or 0) > 0 then
+      local tier = config.droneTierKeys[droneKey]
+      local dk   = tier and config.droneDrillMap[tier]
+      if dk then keys[dk] = true end
+    end
+  end
+
+  -- Plus anything a busy module is holding. A drone loaded into a running
+  -- module is NOT in the ME network, so it reports zero above -- and dropping
+  -- its material from par mid-run is exactly backwards, since that is the
+  -- material actively being consumed.
+  for _, mod in ipairs(modules) do
+    if mod.status ~= "IDLE" and mod.job and mod.job.drillKey then
+      keys[mod.job.drillKey] = true
+    end
+  end
+
+  return keys
+end
+
 local function broadcastDrillPar()
   local list = {}
+  local usable = usableDrillKeys()
   for key, par in pairs(config.drillPar or {}) do
     local drill = config.drills[key]
     -- An unknown key is a config typo. Skip it rather than shipping a nil label
     -- the node would have to defend against.
-    if drill and drill.tip and drill.rod then
+    if drill and drill.tip and drill.rod and usable[key] then
       list[drill.tip] = par.tips or 0
       list[drill.rod] = par.rods or 0
     end
@@ -2060,7 +2116,9 @@ local function broadcastDrillPar()
     protocol    = "MEDINA_COMMAND",
     sender      = nodeId,
     payloadType = "DRILL_PAR",
-    data        = list,
+    -- The node cannot read config.lua, so the concurrency limit rides along
+    -- with the par table rather than being configured over there.
+    data        = { par = list, slots = config.drillCraftSlots or 1 },
   }))
   local n = 0
   for _ in pairs(list) do n = n + 1 end

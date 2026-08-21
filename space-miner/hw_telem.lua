@@ -123,6 +123,16 @@ local drillDisplayNames = {
 -- node behaves exactly as it did before auto-crafting existed.
 local par = {}
 
+-- How many crafts we may have in flight at once, published alongside par.
+-- AE2 cancels a request outright when no CPU is free, so firing every shortfall
+-- at a one-CPU network starts one craft and gets the rest rejected -- which is
+-- indistinguishable from a broken pattern unless we simply do not ask.
+local slots = 1
+
+-- label -> shortfall, for materials below par that are waiting on a free slot.
+-- Deliberately not in `orders`: nothing has been requested for these.
+local queued = {}
+
 -- label -> { want, state, status, since, baseStock }
 --   state     = "crafting" | "nopattern" | "failed"
 --   status    = the AE2 craft-status object, only present while "crafting"
@@ -263,6 +273,10 @@ local function stepOrders(assets)
     end
   end
 
+  -- Collect every shortfall first, then spend the available slots on the worst
+  -- ones. Deciding in label order would let an alphabetically early material
+  -- monopolise the only CPU while something nearly empty waits.
+  local short = {}
   for _, label in ipairs(drillLabels) do
     local have = stockOf(assets, label)
 
@@ -273,10 +287,34 @@ local function stepOrders(assets)
     end
 
     local target = par[label]
-    if target and target > 0 and not orders[label] and not s then
-      if have and have < target then
-        orders[label] = placeOrder(label, have, target - have)
-      end
+    if target and target > 0 and not orders[label] and not s and have and have < target then
+      short[#short + 1] = {
+        label = label, have = have, need = target - have, ratio = have / target,
+      }
+    end
+  end
+
+  -- Emptiest first; label as a tie-break so the order is stable frame to frame.
+  table.sort(short, function(a, b)
+    if a.ratio ~= b.ratio then return a.ratio < b.ratio end
+    return a.label < b.label
+  end)
+
+  local inFlight = 0
+  for _, o in pairs(orders) do
+    if o.state == "crafting" then inFlight = inFlight + 1 end
+  end
+
+  queued = {}
+  for _, item in ipairs(short) do
+    if inFlight < slots then
+      local o = placeOrder(item.label, item.have, item.need)
+      orders[item.label] = o
+      -- Only a live craft consumes a slot. A nopattern/failed result did not
+      -- occupy a CPU, so it must not block the next material from trying.
+      if o.state == "crafting" then inFlight = inFlight + 1 end
+    else
+      queued[item.label] = item.need
     end
   end
 end
@@ -376,21 +414,33 @@ local function updateDashboard(assets)
 
   -- Failures first: they are the entries a human has to act on, so if there are
   -- more orders than rows, the benign "crafting" lines are the ones to lose.
-  local pending = {}
+  -- state -> sort rank and colour. Failures first (a human has to act on them),
+  -- then live crafts, then things merely waiting on a slot. If there are more
+  -- entries than rows, the ones that get cut are the ones nobody needs to see.
+  local RANK  = { nopattern = 0, failed = 0, crafting = 1, queued = 2 }
+  local COLOR = { nopattern = 0xFF4444, failed = 0xFF4444,
+                  crafting  = 0xFFAA00, queued = 0x555555 }
+
+  local view = {}
   for _, label in ipairs(drillLabels) do
-    if orders[label] then pending[#pending + 1] = label end
+    local o = orders[label]
+    if o then
+      view[#view + 1] = { label = label, state = o.state, want = o.want }
+    elseif queued[label] then
+      view[#view + 1] = { label = label, state = "queued", want = queued[label] }
+    end
   end
-  table.sort(pending, function(a, b)
-    local ba = (orders[a].state == "crafting") and 1 or 0
-    local bb = (orders[b].state == "crafting") and 1 or 0
-    if ba ~= bb then return ba < bb end
-    return a < b
+  table.sort(view, function(a, b)
+    local ra, rb = RANK[a.state] or 3, RANK[b.state] or 3
+    if ra ~= rb then return ra < rb end
+    return a.label < b.label
   end)
+  local pending = view
 
   local qRow, QLAST = 17, 21
-  for i, label in ipairs(pending) do
+  local WORD = { nopattern = "NO PATTERN", failed = "REJECTED", queued = "queued" }
+  for i, e in ipairs(pending) do
     if qRow > QLAST then break end
-    local o = orders[label]
     gpu.fill(QX, qRow, QW, 1, " ")
     term.setCursor(QX, qRow)
     -- More entries than rows: spend the last line on a count rather than
@@ -399,14 +449,14 @@ local function updateDashboard(assets)
       gpu.setForeground(0x555555)
       io.write(string.format("  ...and %d more", #pending - i + 1))
     else
-      local short = label:gsub(" Drill Tip$", " TIP"):gsub(" Rod$", " ROD")
-      if o.state == "crafting" then
-        gpu.setForeground(0xFFAA00)
-        io.write(string.format("  %-22s x%d", short, o.want or 0))
+      local short = e.label:gsub(" Drill Tip$", " TIP"):gsub(" Rod$", " ROD")
+      gpu.setForeground(COLOR[e.state] or 0xFF4444)
+      if e.state == "crafting" then
+        io.write(string.format("  %-22s x%d", short, e.want or 0))
+      elseif e.state == "queued" then
+        io.write(string.format("  %-22s queued x%d", short, e.want or 0))
       else
-        gpu.setForeground(0xFF4444)
-        io.write(string.format("  %-22s %s", short,
-          o.state == "nopattern" and "NO PATTERN" or "FAILED"))
+        io.write(string.format("  %-22s %s", short, WORD[e.state] or "FAILED"))
       end
     end
     qRow = qRow + 1
@@ -452,6 +502,10 @@ local function buildPayload(assets)
   local crafting, any = {}, false
   for label, o in pairs(orders) do
     crafting[label] = { want = o.want, state = o.state }
+    any = true
+  end
+  for label, need in pairs(queued) do
+    crafting[label] = { want = need, state = "queued" }
     any = true
   end
   if any then payload.crafting = crafting end
@@ -508,11 +562,15 @@ while true do
             payloadType = "HW_QUERY_RESPONSE",
             data        = payload
           }))
-        elseif msg.payloadType == "DRILL_PAR" and type(msg.data) == "table" then
+        elseif msg.payloadType == "DRILL_PAR" and type(msg.data) == "table"
+               and type(msg.data.par) == "table" then
           -- Replace, do not merge: the broker sends the complete par table, so
-          -- assignment is what lets a material you removed from config.drillPar
-          -- actually stop being ordered.
-          par = msg.data
+          -- a material it stopped publishing -- because you removed it from
+          -- config.drillPar, or because you no longer hold a drone that uses
+          -- it -- actually stops being ordered.
+          par   = msg.data.par
+          slots = tonumber(msg.data.slots) or 1
+          if slots < 1 then slots = 1 end
         end
       end
     end

@@ -300,8 +300,9 @@ All telemetry nodes send updates in this format:
   crafting = { ["Steel Drill Tip"] = { want=156, state="crafting" }, ... }
 }
 ```
-`crafting` states: `"crafting"` (request accepted, in flight), `"nopattern"` (no
-crafting pattern in the network — needs a human), `"failed"` (request rejected).
+`crafting` states: `"crafting"` (request accepted, in flight), `"queued"` (below
+par, waiting on a free craft slot — not a problem), `"nopattern"` (no crafting
+pattern in the network — needs a human), `"failed"` (request rejected by AE2).
 The broker replaces its copy wholesale on every HW_UPDATE, so a resolved entry
 clears itself.
 
@@ -352,15 +353,16 @@ dust watchlist:
   sender      = "broker-id",
   payloadType = "DRILL_PAR",
   data        = {
-    ["Steel Drill Tip"] = 256,
-    ["Steel Rod"]       = 256,
-    ...
+    par   = { ["Steel Drill Tip"] = 256, ["Steel Rod"] = 256, ... },
+    slots = 1   -- max concurrent crafts (config.drillCraftSlots)
   }
 }
 ```
 
 **Notes:**
 - Built from `config.drillPar`, resolved to ME labels through `config.drills` — the hw node does not load `config.lua` and cannot map a drill key to a label itself
+- **Filtered to materials this base can consume:** only drill keys reachable via `droneDrillMap` from a drone currently in stock, unioned with the drill keys of any non-idle module. The union matters — a drone loaded into a running module is not in the ME network and reports zero, and dropping its material from par mid-run would stop restocking the one material actively being spent
+- `slots` carries `config.drillCraftSlots` because the node cannot read config. AE2 cancels a request outright when no CPU is free, so the node keeps at most this many crafts in flight and reports the rest as `queued` rather than firing requests it knows will be rejected
 - Sent on its own port rather than 2027 because the hw node is the most memory-constrained machine in the fleet, and sharing a port would make it unserialize every DUST_WATCHLIST broadcast just to discard it. Port 2025 was already open on that node for a query protocol that never got a client
 - The node **replaces** its par table on receipt, so removing a material from `config.drillPar` actually stops it being ordered
 - An empty `data` table is valid and means "order nothing"
