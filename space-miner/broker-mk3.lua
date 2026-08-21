@@ -1234,7 +1234,8 @@ end
 -- Items mapped to this asteroid that are NOT one of its direct yields.
 local function downstreamFor(name)
   local direct = {}
-  for _, o in ipairs(outputsFor(name) or {}) do direct[o.item] = true end
+  -- Keyed on the DUST, because that is what a direct row now tracks.
+  for _, o in ipairs(outputsFor(name) or {}) do direct[o.dust or o.item] = true end
   local list = {}
   for item, t in pairs(ed.targets) do
     if t.asteroid == name and not direct[item] then list[#list + 1] = item end
@@ -1291,17 +1292,23 @@ local function buildDetail(name)
   local outs = outputsFor(name)
 
   rows[#rows + 1] = { kind = "header",
-    text = outs and "DIRECT YIELD  (from the jar, exact)"
-                 or "DIRECT YIELD  -- none derivable for this asteroid" }
+    text = outs and "DIRECT  (dust the asteroid yields, via one macerate hop)"
+                 or "DIRECT  -- none derivable for this asteroid" }
   if outs then
     for _, o in ipairs(outs) do
-      if matchesFilter(o.item) then
-        rows[#rows + 1] = { kind = "item", item = o.item, chance = o.chance, direct = true }
+      -- Track the DUST, not the ore. Ore processing consumes the ore the moment
+      -- it lands, so its stock never accumulates -- tracking it would leave a
+      -- condition permanently at 0 and mine that asteroid forever. The ore is
+      -- shown as provenance and is what the module item filter wants.
+      local dust = o.dust or o.item
+      if matchesFilter(dust) or matchesFilter(o.item) then
+        rows[#rows + 1] = { kind = "item", item = dust, source = o.item,
+                            chance = o.chance, direct = true }
       end
     end
   else
     rows[#rows + 1] = { kind = "note",
-      text = "this asteroid uses mod-specific item stacks; add its outputs below" }
+      text = "mod-specific item stacks, not derivable -- add what it gives you below" }
   end
 
   rows[#rows + 1] = { kind = "header", text = "DOWNSTREAM  (typed in by hand)" }
@@ -1635,7 +1642,8 @@ local function edLayoutButtons()
 end
 
 local X_MARK, X_NAME = 2, 6
-local X_A, X_B, X_C = 46, 58, 70
+local X_A, X_B, X_C = 40, 52, 62
+local X_SRC = 74
 
 local function edDraw()
   gpu.setBackground(0x000000)
@@ -1671,6 +1679,7 @@ local function edDraw()
     term.setCursor(X_A, 4); io.write("TARGET")
     term.setCursor(X_B, 4); io.write("HAVE")
     term.setCursor(X_C, 4); io.write(ed.mode == "detail" and "CHANCE" or "ASTEROID")
+    if ed.mode == "detail" then term.setCursor(X_SRC, 4); io.write("DROPPED AS") end
   end
 
   for r = 0, edRows() - 1 do
@@ -1726,6 +1735,13 @@ local function edDraw()
           if row.chance then
             gpu.setForeground(0x888888)
             term.setCursor(X_C, y); io.write(string.format("%.1f%%", row.chance / 100))
+            if row.source and row.source ~= item then
+              gpu.setForeground(0x666666)
+              term.setCursor(X_SRC, y); io.write(row.source:sub(1, W - X_SRC))
+            elseif row.source then
+              gpu.setForeground(0x666666)
+              term.setCursor(X_SRC, y); io.write("(dust directly)")
+            end
           else
             gpu.setForeground(0x666666)
             term.setCursor(X_C, y); io.write("downstream")
