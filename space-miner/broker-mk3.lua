@@ -2106,8 +2106,12 @@ local function broadcastDrillPar()
     -- An unknown key is a config typo. Skip it rather than shipping a nil label
     -- the node would have to defend against.
     if drill and drill.tip and drill.rod and usable[key] then
-      list[drill.tip] = par.tips or 0
-      list[drill.rod] = par.rods or 0
+      -- Each label carries its own floor plus the shared batch size. Sent per
+      -- label rather than per material because the node works in ME labels and
+      -- has no idea which tip pairs with which rod.
+      local batch = par.batch
+      list[drill.tip] = { min = par.tips or 0, batch = batch or par.tips or 0 }
+      list[drill.rod] = { min = par.rods or 0, batch = batch or par.rods or 0 }
     end
   end
   -- An empty table still goes out: that is how a node that was ordering learns

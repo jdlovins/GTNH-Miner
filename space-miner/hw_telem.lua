@@ -118,9 +118,14 @@ local drillDisplayNames = {
 --     (computer.uptime()), never a loop counter.
 -- =============================================================================
 
--- label -> par count, as last published by the broker. Empty until it speaks,
--- and an empty table means "order nothing" -- with no broker on the air this
--- node behaves exactly as it did before auto-crafting existed.
+-- label -> { min, batch }, as last published by the broker. Empty until it
+-- speaks, and an empty table means "order nothing" -- with no broker on the air
+-- this node behaves exactly as it did before auto-crafting existed.
+--
+-- `min` is the floor that triggers a craft; `batch` is how much we then ask for.
+-- They are separate on purpose: requesting the shortfall meant a material a
+-- little under its floor produced a token request that tied up a crafting CPU
+-- for almost nothing.
 local par = {}
 
 -- How many crafts we may have in flight at once, published alongside par.
@@ -287,9 +292,15 @@ local function stepOrders(assets)
     end
 
     local target = par[label]
-    if target and target > 0 and not orders[label] and not s and have and have < target then
+    local floor  = target and target.min or 0
+    if target and floor > 0 and not orders[label] and not s and have and have < floor then
       short[#short + 1] = {
-        label = label, have = have, need = target - have, ratio = have / target,
+        label = label,
+        have  = have,
+        -- A whole batch, not the shortfall. Overshooting the floor is the
+        -- intended trade -- see the config.drillPar comment.
+        need  = target.batch or floor,
+        ratio = have / floor,
       }
     end
   end
@@ -564,6 +575,7 @@ while true do
           }))
         elseif msg.payloadType == "DRILL_PAR" and type(msg.data) == "table"
                and type(msg.data.par) == "table" then
+          -- data.par is label -> { min, batch }.
           -- Replace, do not merge: the broker sends the complete par table, so
           -- a material it stopped publishing -- because you removed it from
           -- config.drillPar, or because you no longer hold a drone that uses

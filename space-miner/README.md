@@ -410,8 +410,9 @@ Three files, three writers, one writer each. They never overwrite each other.
 
   ```lua
   drillPar = {
-    naquadah = { tips = 512, rods = 512 },  -- keep more of the one you burn most
-    steel    = false,                        -- stop auto-crafting this entirely
+    -- craft 8192 at a time once naquadah drops under 2048
+    naquadah = { tips = 2048, rods = 2048, batch = 8192 },
+    steel    = false,  -- stop auto-crafting this entirely
   }
   ```
 
@@ -421,11 +422,16 @@ Three files, three writers, one writer each. They never overwrite each other.
   may run at once; set it to your AE2 crafting CPU count. Rounding down only
   slows restocking, whereas setting it too high produces rejected requests.
 
-  Shipped par is scaled to material cost rather than flat — 4096 for
+  Each material carries two numbers: `tips`/`rods` are the stock **floor** that
+  triggers a craft, and `batch` is the **request size** — always sent whole,
+  never the shortfall, so a material sitting just under its floor cannot tie up
+  a crafting CPU for a token amount. The trade is overshoot: a floor of 4096
+  with a batch of 4096 can land near 8k before settling. Lower `batch` to hold
+  less, or lower the floor to craft less often.
+
+  Shipped values are scaled to material cost — 4096 for
   steel/titanium/tungstensteel, 2048 for the naquadahs, 1024 for neutronium, 256
-  for the top three tiers — because a flat number is simultaneously too shallow
-  for cheap tiers and too aggressive for expensive ones. Values are in items; one
-  module refill is 64 of each.
+  for the top three tiers. Values are in items; one module refill is 64 of each.
 
 The editor only persists mappings that are genuinely yours, compared against
 `config.shippedDustTargets` — the snapshot taken before the overlay is applied.

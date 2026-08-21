@@ -2988,13 +2988,26 @@ config.rodsPerLoad = 64
 -- a mature base, while the same figure in Transcendent Metal is an enormous
 -- unattended craft.
 --
+-- Two numbers per material, and they do different jobs:
+--
+--   tips / rods  the stock FLOOR. Fall below it and a craft is requested.
+--   batch        the REQUEST SIZE. Always sent whole, never the shortfall.
+--
+-- Requesting the exact shortfall meant a material sitting just under its floor
+-- produced a trickle -- ask for 4096, be 196 short, order 196. Ordering a full
+-- batch instead means every request is worth the crafting CPU it occupies.
+--
+-- The trade is overshoot: floor 4096 with batch 4096 means stock at 4095 orders
+-- another 4096 and lands near 8191 before settling. Lower the batch if you would
+-- rather hold less, or lower the floor if you would rather craft less often.
+--
 -- Values are in ITEMS. One module refill is config.tipsPerLoad (64) of each, so
 -- 4096 is 64 refills. How long a refill lasts depends on the module: the recipe
 -- burns 4 tips and 4 rods per parallel per cycle, and maxParallels is 2/4/8 for
 -- MK-I/II/III -- so on an MK-II a refill covers 4 cycles, making 4096 roughly
 -- 256 cycles of buffer.
 --
--- Keep every value at or above 64 or a module can stall on the kits < 64
+-- Keep every floor at or above 64 or a module can stall on the kits < 64
 -- dispatch floor while nominally sitting at par.
 --
 -- If the network has no crafting pattern for a listed item, the node reports it
@@ -3002,19 +3015,22 @@ config.rodsPerLoad = 64
 -- meant to be loud, since the failure it replaces (a module that silently never
 -- loads) is the hardest thing in this system to diagnose.
 config.drillPar = {
-  -- Cheap tiers: full 4k buffers.
-  steel             = { tips = 4096, rods = 4096 },
-  titanium          = { tips = 4096, rods = 4096 },
-  tungstensteel     = { tips = 4096, rods = 4096 },
-  naquadah          = { tips = 2048, rods = 2048 },
-  naquadahAlloy     = { tips = 2048, rods = 2048 },
-  neutronium        = { tips = 1024, rods = 1024 },
+  -- tips/rods = the stock floor: drop below it and a craft is requested.
+  -- batch     = how many are requested when that happens, for tips and rods
+  --             alike. It is NOT the shortfall -- a full batch goes out even if
+  --             you are only a few short, so requests are always worth making.
+  steel             = { tips = 4096, rods = 4096, batch = 4096 },
+  titanium          = { tips = 4096, rods = 4096, batch = 4096 },
+  tungstensteel     = { tips = 4096, rods = 4096, batch = 4096 },
+  naquadah          = { tips = 2048, rods = 2048, batch = 2048 },
+  naquadahAlloy     = { tips = 2048, rods = 2048, batch = 2048 },
+  neutronium        = { tips = 1024, rods = 1024, batch = 1024 },
   -- Tiers 11-14 (MK-XI UIV and up). Held low deliberately: these are the ones
   -- where an unattended craft is genuinely expensive, and par is only published
   -- once you own a drone that uses them anyway.
-  cosmicNeutronium  = { tips =  256, rods =  256 },
-  infinity          = { tips =  256, rods =  256 },
-  transcendentMetal = { tips =  256, rods =  256 },
+  cosmicNeutronium  = { tips =  256, rods =  256, batch =  256 },
+  infinity          = { tips =  256, rods =  256, batch =  256 },
+  transcendentMetal = { tips =  256, rods =  256, batch =  256 },
 }
 
 -- How many drill crafts the hw node may have in flight at once.
@@ -3104,7 +3120,7 @@ do
         if p == false then
           config.drillPar[key] = nil
         elseif type(p) == "table" then
-          config.drillPar[key] = { tips = p.tips, rods = p.rods }
+          config.drillPar[key] = { tips = p.tips, rods = p.rods, batch = p.batch }
         end
       end
     end
