@@ -64,7 +64,7 @@ import java.util.*;
  *   recipe graph is near fully connected -- follow alloying and the chemical
  *   reactor and every asteroid "yields" most of the game.
  */
-@Mod(modid = AsteroidDump.MODID, name = "Asteroid Dump", version = "1.2",
+@Mod(modid = AsteroidDump.MODID, name = "Asteroid Dump", version = "1.3",
      dependencies = "required-after:gregtech", acceptableRemoteVersions = "*")
 public class AsteroidDump {
 
@@ -72,6 +72,9 @@ public class AsteroidDump {
 
     private static final int DEFAULT_DEPTH = 3;
     private static final int MAX_PRODUCTS_PER_DROP = 400;
+
+    /** OreDictionary.WILDCARD_VALUE. Hardcoded to avoid a Forge import. */
+    private static final int WILDCARD_DAMAGE = 32767;
 
     // ---------------------------------------------------------------------
     // Reflection into net.minecraft. SRG first, MCP second.
@@ -212,12 +215,20 @@ public class AsteroidDump {
                 for (ItemStack in : r.mInputs) {
                     if (in == null) continue;
                     Step st = new Step(e.getKey(), r);
-                    // Defensive: a single unresolvable item should cost us that
-                    // item, not the entire dump.
-                    // Index exact and wildcard: GT inputs routinely use damage
-                    // 32767 to mean "any damage".
+                    // Exact identity always. The wildcard bucket ONLY for inputs
+                    // that really are damage-agnostic.
+                    //
+                    // v1.2 indexed every input under both, which was badly wrong:
+                    // GregTech packs thousands of distinct items into one item id
+                    // separated only by damage -- every ore is gt.blockores:<dmg>.
+                    // Putting them all in one gt.blockores:* bucket meant a lookup
+                    // for End Coal Ore returned every recipe consuming any ore, so
+                    // coal "broke down into" crushed tungsten. 66821 products at
+                    // one hop was the symptom.
                     add(byInput, idOf(in), st);
-                    add(byInput, wildIdOf(in), st);
+                    if (damageOf(in) == WILDCARD_DAMAGE) {
+                        add(byInput, wildIdOf(in), st);
+                    }
                 }
             }
         }

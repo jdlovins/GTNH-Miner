@@ -26,5 +26,5 @@ mkdir -p build/classes
 javac --release 8 -nowarn -cp "$MC;$FORGE;$GT" -d build/classes \
       src/main/java/asteroiddump/AsteroidDump.java
 cp src/main/resources/mcmod.info build/classes/
-jar cf build/asteroiddump-1.2.jar -C build/classes .
-echo "built build/asteroiddump-1.2.jar"
+jar cf build/asteroiddump-1.3.jar -C build/classes .
+echo "built build/asteroiddump-1.3.jar"
