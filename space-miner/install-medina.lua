@@ -31,7 +31,7 @@ local ROLES = {
   ["broker"] = {
     label = "Broker (main computer)",
     files = { "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
-              "list_components.lua", "detect_module.lua" },
+              "list_components.lua", "detect_module.lua", "detect_sides.lua" },
     config = { ["job_node_config.example.lua"] = "job_node_config.lua" },
     note = "Edit /home/job_node_config.lua with your hardware, then run: broker-mk3",
   },
@@ -52,7 +52,7 @@ local ROLES = {
   },
   ["jobnode"] = {
     label = "Remote job node (optional, multi-node fleets)",
-    files = { "job_node.lua", "list_components.lua", "detect_module.lua" },
+    files = { "job_node.lua", "list_components.lua", "detect_module.lua", "detect_sides.lua" },
     config = { ["job_node_config.example.lua"] = "job_node_config.lua" },
     note = "Edit /home/job_node_config.lua (give it a unique nodeId), then run: job_node",
   },
@@ -151,7 +151,7 @@ if choice == 6 then
   print("\nInstalling EVERYTHING from " .. RAW .. "\n")
   local everything = {
     "config.lua", "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
-    "list_components.lua", "detect_module.lua",
+    "list_components.lua", "detect_module.lua", "detect_sides.lua",
     "dust_telem.lua", "hw_telem.lua", "fluid_telem.lua", "job_node.lua",
   }
   local allOk = true
