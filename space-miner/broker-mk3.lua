@@ -1326,8 +1326,7 @@ local function buildDetail(name)
   if o then
     for _, e in ipairs(o.main or {}) do
       if matchesFilter(e.item) then
-        rows[#rows + 1] = { kind = "item", item = e.item, hops = e.hops,
-                            source = e.via, direct = true }
+        rows[#rows + 1] = { kind = "item", item = e.item, source = e.via, direct = true }
       end
     end
     if #(o.main or {}) == 0 then
@@ -1339,8 +1338,7 @@ local function buildDetail(name)
   if o and #(o.processed or {}) > 0 then
     for _, e in ipairs(o.processed) do
       if matchesFilter(e.item) then
-        rows[#rows + 1] = { kind = "item", item = e.item, hops = e.hops,
-                            source = e.via, direct = true }
+        rows[#rows + 1] = { kind = "item", item = e.item, source = e.via, direct = true }
       end
     end
   else
@@ -1678,8 +1676,7 @@ local function edLayoutButtons()
 end
 
 local X_MARK, X_NAME = 2, 6
-local X_A, X_B, X_C = 40, 52, 62
-local X_SRC = 74
+local X_A, X_B, X_C = 44, 56, 68
 
 local function edDraw()
   gpu.setBackground(0x000000)
@@ -1714,8 +1711,7 @@ local function edDraw()
     term.setCursor(X_NAME, 4); io.write("ITEM")
     term.setCursor(X_A, 4); io.write("TARGET")
     term.setCursor(X_B, 4); io.write("HAVE")
-    term.setCursor(X_C, 4); io.write(ed.mode == "detail" and "STEPS" or "ASTEROID")
-    if ed.mode == "detail" then term.setCursor(X_SRC, 4); io.write("VIA") end
+    term.setCursor(X_C, 4); io.write(ed.mode == "detail" and "VIA" or "ASTEROID")
   end
 
   for r = 0, edRows() - 1 do
@@ -1768,18 +1764,9 @@ local function edDraw()
         term.setCursor(X_B, y); io.write(formatQty(have))
 
         if ed.mode == "detail" then
-          if row.hops then
-            gpu.setForeground(0x888888)
-            term.setCursor(X_C, y)
-            io.write(row.hops == 0 and "direct" or (row.hops .. " hop"))
-            if row.source then
-              gpu.setForeground(0x666666)
-              term.setCursor(X_SRC, y); io.write(tostring(row.source):sub(1, W - X_SRC))
-            end
-          else
-            gpu.setForeground(0x666666)
-            term.setCursor(X_C, y); io.write("hand-typed")
-          end
+          gpu.setForeground(0x666666)
+          term.setCursor(X_C, y)
+          io.write(tostring(row.source or "hand-typed"):sub(1, W - X_C))
         else
           local t = ed.targets[item]
           if t then
