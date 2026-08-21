@@ -120,12 +120,22 @@ if not nodeConf.dbAddr or nodeConf.dbAddr == "" then
 end
 
 -- config.lua only supplies a sensible default probe item; it isn't required.
+--
+-- The probe has to be an item you ACTUALLY HOLD -- it gets borrowed from the ME
+-- network and put back. This used to take the first drone out of pairs(), whose
+-- order is arbitrary, so it could just as easily suggest MK-XIV (MAX) as MK-I.
+-- Prefer the lowest tier, which is the one you are most likely to own, and walk
+-- droneKeyOrder backwards (it runs highest to lowest) so the fallback is
+-- deterministic too.
 local okMain, mainConf = pcall(dofile, "/home/config.lua")
-local defaultProbe
+local defaultProbe = "Mining Drone MK-I (LV)"
 if okMain and type(mainConf) == "table" and type(mainConf.drones) == "table" then
-  for _, name in pairs(mainConf.drones) do
-    defaultProbe = name
-    break
+  defaultProbe = mainConf.drones.lv or defaultProbe
+  if not mainConf.drones.lv and type(mainConf.droneKeyOrder) == "table" then
+    for i = #mainConf.droneKeyOrder, 1, -1 do
+      local name = mainConf.drones[mainConf.droneKeyOrder[i]]
+      if name then defaultProbe = name; break end
+    end
   end
 end
 
