@@ -972,6 +972,273 @@ config.optimizationMatrix = {
 }
 
 --------------------------------------------------------------------------------
+-- 7b. ASTEROID OUTPUTS  (generated -- do not hand-edit)
+--
+-- The exact item each asteroid yields, extracted from the installed
+-- gregtech jar: gtnhintergalactic.recipe.SpaceMiningRecipes.addAsteroids().
+-- Labels are built the way the game builds them, OrePrefixes prefix+suffix
+-- around the material's default local name, so "End Lignite Coal Ore" comes
+-- out of oreEndstone + Materials.Lignite ("Lignite Coal") rather than a guess.
+--
+-- NOTE these are the module's IMMEDIATE output. Most asteroids yield ORE
+-- (33 of them use oreEndstone), not dust. config.conditions deliberately
+-- tracks the processed dust instead, which is why the two lists differ.
+--
+-- chance is out of 10000. Use this to set each module's item filter, and to
+-- check that a dustTargets entry really is reachable from its asteroid.
+--------------------------------------------------------------------------------
+config.asteroidOutputs = {
+  ["Adamantium"] = {   -- adamantiumAsteroid, drones EV..ZPM, module tier 1
+    { item = "End Adamantium Ore",                  chance =  2500 },   -- 25.0%
+    { item = "End Bismuth Ore",                     chance =  2000 },   -- 20.0%
+    { item = "End Antimony Ore",                    chance =  2000 },   -- 20.0%
+    { item = "End Gallium Ore",                     chance =  2000 },   -- 20.0%
+    { item = "End Lithium Ore",                     chance =  1500 },   -- 15.0%
+  },
+  ["Aluminium"] = {   -- aluminiumAsteroid, drones MV..EV, module tier 1
+    { item = "End Aluminium Ore",                   chance =  5000 },   -- 50.0%
+    { item = "End Bauxite Ore",                     chance =  3500 },   -- 35.0%
+    { item = "End Rutile Ore",                      chance =  1500 },   -- 15.0%
+  },
+  ["Aluminium-LanthLine"] = {   -- aluminiumLanthlineAsteroid, drones MV..ZPM, module tier 1
+    { item = "End Aluminium Ore",                   chance =  3500 },   -- 35.0%
+    { item = "End Bauxite Ore",                     chance =  1500 },   -- 15.0%
+    { item = "End Monazite Ore",                    chance =  2500 },   -- 25.0%
+    { item = "End Bastnasite Ore",                  chance =  2500 },   -- 25.0%
+  },
+  ["Ardite/Cobalt"] = {   -- arditeCobaltAsteroid, drones EV..UHV, module tier 1
+    { item = "Cobalt Ore",                          chance =  3750 },   -- 37.5%
+    { item = "Ardite Ore",                          chance =  3750 },   -- 37.5%
+    { item = "Manyullyn Ore",                       chance =  2500 },   -- 25.0%
+  },
+  ["Basic Magic"] = {   -- basicMagicAsteroid, drones HV..LuV, module tier 1
+    { item = "End Infused Gold Ore",                chance =  3500 },   -- 35.0%
+    { item = "End Shadow Metal Ore",                chance =  3500 },   -- 35.0%
+    { item = "End Aer Ore",                         chance =   500 },   -- 5.0%
+    { item = "End Terra Ore",                       chance =   500 },   -- 5.0%
+    { item = "End Ignis Ore",                       chance =   500 },   -- 5.0%
+    { item = "End Aqua Ore",                        chance =   500 },   -- 5.0%
+    { item = "End Perditio Ore",                    chance =   500 },   -- 5.0%
+    { item = "End Ordo Ore",                        chance =   500 },   -- 5.0%
+  },
+  ["Blue"] = {   -- blueAsteroid, drones HV..UV, module tier 1
+    { item = "End Lapis Ore",                       chance =  6000 },   -- 60.0%
+    { item = "End Calcite Ore",                     chance =  2000 },   -- 20.0%
+    { item = "End Lazurite Ore",                    chance =  1000 },   -- 10.0%
+    { item = "End Sodalite Ore",                    chance =  1000 },   -- 10.0%
+  },
+  ["Cheese"] = {   -- cheeseAsteroid, drones IV..UXV, module tier 2
+    { item = "End Cheese Ore",                      chance = 10000 },   -- 100.0%
+  },
+  ["Chrome"] = {   -- chromeAsteroid, drones MV..LuV, module tier 1
+    { item = "End Chrome Ore",                      chance =  5000 },   -- 50.0%
+    { item = "End Ruby Ore",                        chance =  3000 },   -- 30.0%
+    { item = "End Chromite Ore",                    chance =  2000 },   -- 20.0%
+  },
+  ["Coal"] = {   -- coalAsteroid, drones LV..ZPM, module tier 1
+    { item = "End Coal Ore",                        chance =  7000 },   -- 70.0%
+    { item = "End Lignite Coal Ore",                chance =  1000 },   -- 10.0%
+    { item = "End Graphite Ore",                    chance =  2000 },   -- 20.0%
+  },
+  ["Copper"] = {   -- copperAsteroid, drones LV..LuV, module tier 1
+    { item = "End Copper Ore",                      chance =  5000 },   -- 50.0%
+    { item = "End Chalcopyrite Ore",                chance =  3000 },   -- 30.0%
+    { item = "End Malachite Ore",                   chance =  2000 },   -- 20.0%
+  },
+  ["Cosmic"] = {   -- cosmicAsteroid, drones ZPM..UXV, module tier 2
+    { item = "End Cosmic Neutronium Ore",           chance =  2500 },   -- 25.0%
+    { item = "End Neutronium Ore",                  chance =  2500 },   -- 25.0%
+    { item = "End Black Plutonium Ore",             chance =  2500 },   -- 25.0%
+    { item = "End Bedrockium Ore",                  chance =  2500 },   -- 25.0%
+  },
+  ["Draconic"] = {   -- draconicAsteroid, drones LuV..UHV, module tier 2
+    { item = "End Draconium Ore",                   chance =  6500 },   -- 65.0%
+    { item = "End Awakened Draconium Ore",          chance =  2500 },   -- 25.0%
+    { item = "End Fluxed Electrum Ore",             chance =  1000 },   -- 10.0%
+  },
+  ["Europium"] = {   -- europiumAsteroid, drones ZPM..UXV, module tier 2
+    { item = "End Ledox Ore",                       chance =  4000 },   -- 40.0%
+    { item = "End Callisto Ice Ore",                chance =  4000 },   -- 40.0%
+    { item = "End Borax Ore",                       chance =  1500 },   -- 15.0%
+    { item = "End Europium Ore",                    chance =   500 },   -- 5.0%
+  },
+  ["Gem Ores"] = {   -- gemAsteroid, drones LV..LuV, module tier 1
+    { item = "End Ruby Ore",                        chance =  1500 },   -- 13.9%
+    { item = "End Emerald Ore",                     chance =  1500 },   -- 13.9%
+    { item = "End Sapphire Ore",                    chance =  1500 },   -- 13.9%
+    { item = "End Green Sapphire Ore",              chance =  1500 },   -- 13.9%
+    { item = "End Diamond Ore",                     chance =   750 },   -- 7.0%
+    { item = "End Opal Ore",                        chance =   750 },   -- 7.0%
+    { item = "End Amethyst Ore",                    chance =   750 },   -- 7.0%
+    { item = "End Topaz Ore",                       chance =  1000 },   -- 9.3%
+    { item = "End Blue Topaz Ore",                  chance =   500 },   -- 4.7%
+    { item = "End Bauxite Ore",                     chance =   500 },   -- 4.7%
+    { item = "End Vinteum Ore",                     chance =   400 },   -- 3.7%
+    { item = "End Nether Star Ore",                 chance =   100 },   -- 0.9%
+  },
+  ["Holmium/Samarium"] = {   -- holmiumSamariumAsteroid, drones UV..UXV, module tier 2
+    { item = "Holmium Ore",                         chance =  2000 },   -- 20.0%
+    { item = "Samarium Ore",                        chance =  3000 },   -- 30.0%
+    { item = "Tiberium Ore",                        chance =  3000 },   -- 30.0%
+    { item = "Strontium Ore",                       chance =  2000 },   -- 20.0%
+  },
+  ["Ichorium"] = {   -- ichoriumAsteroid, drones UEV..UXV, module tier 3
+    { item = "End Shadow Iron Ore",                 chance =  4500 },   -- 45.0%
+    { item = "End Meteoric Iron Ore",               chance =  3000 },   -- 30.0%
+    { item = "End Ichorium Ore",                    chance =  1500 },   -- 15.0%
+    { item = "End Desh Ore",                        chance =   500 },   -- 5.0%
+    { item = "End Americium Ore",                   chance =   500 },   -- 5.0%
+  },
+  ["Indium"] = {   -- indiumAsteroid, drones IV..UEV, module tier 2
+    { item = "End Indium Ore",                      chance =  6000 },   -- 60.0%
+    { item = "End Sphalerite Ore",                  chance =  2000 },   -- 20.0%
+    { item = "End Zinc Ore",                        chance =  1000 },   -- 10.0%
+    { item = "End Cadmium Ore",                     chance =  1000 },   -- 10.0%
+  },
+  ["Infinity Catalyst"] = {   -- infinityCatalystAsteroid, drones UV..UXV, module tier 2
+    { item = "End Infinity Catalyst Ore",           chance =  5000 },   -- 50.0%
+    { item = "End Cosmic Neutronium Ore",           chance =  3000 },   -- 30.0%
+    { item = "End Neutronium Ore",                  chance =  2000 },   -- 20.0%
+  },
+  ["Iron"] = {   -- ironAsteroid, drones LV..ZPM, module tier 1
+    { item = "End Iron Ore",                        chance =  4000 },   -- 44.4%
+    { item = "End Gold Ore",                        chance =  2000 },   -- 22.2%
+    { item = "End Magnetite Ore",                   chance =  1000 },   -- 11.1%
+    { item = "End Pyrite Ore",                      chance =  1000 },   -- 11.1%
+    { item = "End Basaltic Mineral Sand Ore",       chance =   500 },   -- 5.6%
+    { item = "End Granitic Mineral Sand Ore",       chance =   500 },   -- 5.6%
+  },
+  ["Lanthanum"] = {   -- lanthanumAsteroid, drones IV..UIV, module tier 2
+    { item = "Trinium Ore",                         chance =  1500 },   -- 15.0%
+    { item = "Lanthanum Ore",                       chance =  2000 },   -- 20.0%
+    { item = "Orundum Ore",                         chance =  3000 },   -- 30.0%
+    { item = "Silver Ore",                          chance =  3500 },   -- 35.0%
+  },
+  ["Lead"] = {   -- leadAsteroid, drones LV..UV, module tier 1
+    { item = "End Lead Ore",                        chance =  3000 },   -- 30.0%
+    { item = "End Arsenic Ore",                     chance =  2500 },   -- 25.0%
+    { item = "End Barium Ore",                      chance =  2500 },   -- 25.0%
+    { item = "End Lepidolite Ore",                  chance =  2000 },   -- 20.0%
+  },
+  ["Lutetium"] = {   -- lutetiumAsteroid, drones IV..UHV, module tier 1
+    { item = "End Tellurium Ore",                   chance =  1500 },   -- 15.0%
+    { item = "End Thulium Ore",                     chance =  1000 },   -- 10.0%
+    { item = "End Tantalum Ore",                    chance =  1500 },   -- 15.0%
+    { item = "End Lutetium Ore",                    chance =   500 },   -- 5.0%
+    { item = "End Redstone Ore",                    chance =  5500 },   -- 55.0%
+  },
+  ["Magnesium"] = {   -- magnesiumAsteroid, drones EV..UHV, module tier 1
+    { item = "Magnesium Ore",                       chance =  4000 },   -- 40.0%
+    { item = "Manganese Ore",                       chance =  3000 },   -- 30.0%
+    { item = "Fluorspar Ore",                       chance =  3000 },   -- 30.0%
+  },
+  ["Naquadah"] = {   -- naquadahAsteroid, drones IV..UV, module tier 1
+    { item = "NaquadahEarth Ore",                   chance =  4000 },   -- 40.0%
+    { item = "EnrichedNaquadahEarth Ore",           chance =  3500 },   -- 35.0%
+    { item = "NaquadriaEarth Ore",                  chance =  2500 },   -- 25.0%
+  },
+  ["Nether Ores"] = {   -- NetherOreAsteroid, drones EV..ZPM, module tier 1
+    { item = "Nether Nether Quartz Ore",            chance =  3000 },   -- 30.0%
+    { item = "Nether Sulfur Ore",                   chance =  3000 },   -- 30.0%
+    { item = "Nether Certus Quartz Ore",            chance =  2000 },   -- 20.0%
+    { item = "Nether Quartzite Ore",                chance =  1500 },   -- 15.0%
+    { item = "Nether Firestone Ore",                chance =   500 },   -- 5.0%
+  },
+  ["Nickel"] = {   -- nickelAsteroid, drones LV..IV, module tier 1
+    { item = "End Nickel Ore",                      chance =  4000 },   -- 40.0%
+    { item = "End Pentlandite Ore",                 chance =  3000 },   -- 30.0%
+    { item = "End Garnierite Ore",                  chance =  3000 },   -- 30.0%
+  },
+  ["Niobium"] = {   -- niobiumAsteroid, drones IV..UHV, module tier 1
+    { item = "End Niobium Ore",                     chance =  3000 },   -- 30.0%
+    { item = "End Quantium Ore",                    chance =  2000 },   -- 20.0%
+    { item = "End Ytterbium Ore",                   chance =  1500 },   -- 15.0%
+    { item = "End Yttrium Ore",                     chance =  3500 },   -- 35.0%
+  },
+  ["Phosphate"] = {   -- phosphateAsteroid, drones IV..UIV, module tier 1
+    { item = "End Phosphate Ore",                   chance =  4500 },   -- 34.6%
+    { item = "End Tricalcium Phosphate Ore",        chance =  2500 },   -- 19.2%
+    { item = "End Sulfur Ore",                      chance =  3000 },   -- 23.1%
+    { item = "End Apatite Ore",                     chance =  3000 },   -- 23.1%
+  },
+  ["PlatLine Dust"] = {   -- platlinePureAsteroid, drones ZPM..UEV, module tier 3
+    { item = "Platinum Dust",                       chance =  3800 },   -- 38.0%
+    { item = "Palladium Dust",                      chance =  2000 },   -- 20.0%
+    { item = "Iridium Dust",                        chance =  1500 },   -- 15.0%
+    { item = "Osmium Dust",                         chance =   500 },   -- 5.0%
+    { item = "Ruthenium Dust",                      chance =  1200 },   -- 12.0%
+    { item = "Rhodium Dust",                        chance =  1000 },   -- 10.0%
+  },
+  ["PlatLine Ore"] = {   -- platlineOreAsteroid, drones HV..ZPM, module tier 1
+    { item = "End Platinum Ore",                    chance =  6000 },   -- 60.0%
+    { item = "End Palladium Ore",                   chance =  2000 },   -- 20.0%
+    { item = "End Iridium Ore",                     chance =  1500 },   -- 15.0%
+    { item = "End Osmium Ore",                      chance =   500 },   -- 5.0%
+  },
+  ["Quartz"] = {   -- quartzAsteroid, drones MV..ZPM, module tier 1
+    { item = "End Quartzite Ore",                   chance =  3000 },   -- 30.0%
+    { item = "End Certus Quartz Ore",               chance =  2250 },   -- 22.5%
+    { item = "End Nether Quartz Ore",               chance =  2250 },   -- 22.5%
+    { item = "End Vanadium Ore",                    chance =  2500 },   -- 25.0%
+  },
+  ["Salt"] = {   -- saltAsteroid, drones LV..IV, module tier 1
+    { item = "End Salt Ore",                        chance =  4000 },   -- 40.0%
+    { item = "End Rock Salt Ore",                   chance =  2000 },   -- 20.0%
+    { item = "End Saltpeter Ore",                   chance =  4000 },   -- 40.0%
+  },
+  ["Silicon"] = {   -- siliconAsteroid, drones HV..LuV, module tier 2
+    { item = "End Mica Ore",                        chance =  2000 },   -- 22.2%
+    { item = "End Raw Silicon Ore",                 chance =  4500 },   -- 50.0%
+    { item = "End Silicon Solar Grade (Poly SI) Ore", chance =  2500 },   -- 27.8%
+  },
+  ["Space Ores"] = {   -- spaceOreAsteroid, drones LuV..UV, module tier 1
+    { item = "End Meteoric Iron Ore",               chance =  2000 },   -- 6.9%
+    { item = "End Deep Iron Ore",                   chance =  2000 },   -- 6.9%
+    { item = "End Mytryl Ore",                      chance =  2000 },   -- 6.9%
+    { item = "End Black Plutonium Ore",             chance =  1000 },   -- 3.5%
+    { item = "End Callisto Ice Ore",                chance =  2000 },   -- 6.9%
+    { item = "End Ledox Ore",                       chance =  2000 },   -- 6.9%
+    { item = "End Alduorite Ore",                   chance =  3000 },   -- 10.3%
+    { item = "End Rubracium Ore",                   chance =  3000 },   -- 10.3%
+    { item = "End Vulcanite Ore",                   chance =  3000 },   -- 10.3%
+    { item = "End Vyroxeres Ore",                   chance =  3000 },   -- 10.3%
+    { item = "End Ceruclase Ore",                   chance =  3000 },   -- 10.3%
+    { item = "End Orichalcum Ore",                  chance =  3000 },   -- 10.3%
+  },
+  ["Tengam"] = {   -- tengamAsteroid, drones UEV..UXV, module tier 3
+    { item = "Dilithium Ore",                       chance =   100 },   -- 1.0%
+    { item = "Orundum Ore",                         chance =  1650 },   -- 16.5%
+    { item = "Vanadium Ore",                        chance =  3500 },   -- 35.0%
+    { item = "Ytterbium Ore",                       chance =  2250 },   -- 22.5%
+    { item = "Raw Tengam Ore",                      chance =  2500 },   -- 25.0%
+  },
+  ["Thaumium Dusts"] = {   -- thaumiumAsteroid, drones HV..LuV, module tier 1
+    { item = "Thaumium Dust",                       chance =  6000 },   -- 60.0%
+    { item = "Void Metal Dust",                     chance =  4000 },   -- 40.0%
+  },
+  ["Tin"] = {   -- tinAsteroid, drones LV..IV, module tier 1
+    { item = "End Cassiterite Ore",                 chance =  2000 },   -- 20.0%
+    { item = "End Cassiterite Sand Ore",            chance =  1500 },   -- 15.0%
+    { item = "End Tin Ore",                         chance =  6000 },   -- 60.0%
+    { item = "End Asbestos Ore",                    chance =   500 },   -- 5.0%
+  },
+  ["Tungsten-Titanium"] = {   -- tungstenTitaniumAsteroid, drones LV..LuV, module tier 1
+    { item = "End Tungsten Ore",                    chance =  3000 },   -- 30.0%
+    { item = "End Titanium Ore",                    chance =  3000 },   -- 30.0%
+    { item = "End Neodymium Ore",                   chance =  2000 },   -- 20.0%
+    { item = "End Molybdenum Ore",                  chance =  1500 },   -- 15.0%
+    { item = "End Tungstate Ore",                   chance =   500 },   -- 5.0%
+  },
+  ["Uranium-Plutonium"] = {   -- uraniumPlutoniumAsteroid, drones HV..ZPM, module tier 1
+    { item = "Uranium 238 Ore",                     chance =  3000 },   -- 30.0%
+    { item = "Uranium 235 Ore",                     chance =  2450 },   -- 24.5%
+    { item = "Plutonium 239 Ore",                   chance =  2450 },   -- 24.5%
+    { item = "Plutonium 241 Ore",                   chance =  2000 },   -- 20.0%
+    { item = "Thorianit Ore",                       chance =   100 },   -- 1.0%
+  },
+}
+
+--------------------------------------------------------------------------------
 -- 8. DUST TARGET REGISTRY
 -- Maps each tracked dust/item name to its source asteroid and a priority value.
 -- Broker uses this to resolve: "dust X is low → mine asteroid Y".
@@ -995,8 +1262,14 @@ config.dustTargets = {
   -- === TOP TIER — MK-III EXCLUSIVES (UIV+ DRONE REQUIRED) ===
   ["Ichorium Dust"]           = { asteroid = "Ichorium", priority = 1 },
   ["Draconic Core Dust"]      = { asteroid = "Draconic Core", priority = 1 },
-  ["Tengam Dust"]             = { asteroid = "Tengam", priority = 1 },
-  ["PlatLine Dust"]           = { asteroid = "PlatLine Dust", priority = 1 },
+  ["Raw Tengam Dust"]         = { asteroid = "Tengam", priority = 1 },
+  -- "PlatLine Dust" was listed here as an item. It is not one: it is the
+  -- asteroid's own name. platlinePureAsteroid uses OrePrefixes.dust over
+  -- Platinum/Palladium/Iridium/Osmium/Ruthenium/Rhodium, and Ruthenium and
+  -- Rhodium are what it yields that PlatLine Ore does not -- neither had an
+  -- entry, so that MK-III asteroid was unreachable.
+  ["Ruthenium Dust"]          = { asteroid = "PlatLine Dust", priority = 1 },
+  ["Rhodium Dust"]            = { asteroid = "PlatLine Dust", priority = 2 },
 
   -- === EXOTICS — UHV ERA AND ABOVE ===
   ["Mysterious Crystal Dust"] = { asteroid = "Mysterious Crystal", priority = 1 },
@@ -1094,8 +1367,8 @@ config.dustTargets = {
   ["Nether Star"]             = { asteroid = "Gem Ores", priority = 2 },
   ["Diamond Dust"]            = { asteroid = "Gem Ores", priority = 3 },
   ["Emerald Dust"]            = { asteroid = "Gem Ores", priority = 4 },
-  ["Certus Quartz Dust"]      = { asteroid = "Gem Ores", priority = 5 },
-  ["Nether Quartz Dust"]      = { asteroid = "Gem Ores", priority = 6 },
+  ["Certus Quartz Dust"]      = { asteroid = "Quartz", priority = 5 },
+  ["Nether Quartz Dust"]      = { asteroid = "Quartz", priority = 6 },
   ["Sapphire Dust"]           = { asteroid = "Gem Ores", priority = 7 },
   ["Green Sapphire Dust"]     = { asteroid = "Gem Ores", priority = 8 },
   ["Olivine Dust"]            = { asteroid = "Gem Ores", priority = 9 },
@@ -1104,9 +1377,9 @@ config.dustTargets = {
   ["Borax Dust"]              = { asteroid = "Europium", priority = 4 },
 
   -- === NUCLEAR MATERIALS & NAQUADAH LINE ===
-  ["Uranium-235 Dust"]        = { asteroid = "Uranium-Plutonium", priority = 2 },
-  ["Uranium-238 Dust"]        = { asteroid = "Uranium-Plutonium", priority = 1 },
-  ["Plutonium-239 Dust"]      = { asteroid = "Uranium-Plutonium", priority = 3 },
+  ["Uranium 235 Dust"]        = { asteroid = "Uranium-Plutonium", priority = 2 },
+  ["Uranium 238 Dust"]        = { asteroid = "Uranium-Plutonium", priority = 1 },
+  ["Plutonium 239 Dust"]      = { asteroid = "Uranium-Plutonium", priority = 3 },
   ["Thorium Dust"]            = { asteroid = "Uranium-Plutonium", priority = 4 },
   ["Naquadah Dust"]           = { asteroid = "Naquadah", priority = 1 },
   ["Enriched Naquadah Dust"]  = { asteroid = "Naquadah", priority = 2 },
@@ -1146,7 +1419,7 @@ config.blacklist = {
 config.conditions = {
   --  { itemName = "Ichorium Dust",           amountToMaintain = qty("5m")  },
   --  { itemName = "Draconic Core Dust",      amountToMaintain = qty("5m")  },
-  --  { itemName = "Tengam Dust",             amountToMaintain = qty("5m")  }, -- Requires MK-III modules
+  --  { itemName = "Raw Tengam Dust",         amountToMaintain = qty("5m")  }, -- Requires MK-III modules
   --  { itemName = "Mysterious Crystal Dust", amountToMaintain = qty("5m")  },
   --  { itemName = "Cosmic Neutronium Dust",  amountToMaintain = qty("5m")  },
   --  { itemName = "Trinium Dust",            amountToMaintain = qty("5m")  },
