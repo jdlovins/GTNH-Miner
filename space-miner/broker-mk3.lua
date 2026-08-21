@@ -619,6 +619,9 @@ local function tryDispatch(mod, asteroid, droneKey)
     asteroid = asteroid,
     droneKey = droneKey,
     drillKey = drillKey,
+    -- When this commitment was made, so availableDrones/availableKits can tell
+    -- whether the last telemetry sweep has seen it leave the ME network yet.
+    dispatchedAt = os.time(),
     distance = getOptimalDistance(mod.tier, asteroid, droneKey),
     parallels = config.moduleTiers[mod.tier].maxParallels,
     startTime = os.time(),
@@ -630,17 +633,35 @@ local function tryDispatch(mod, asteroid, droneKey)
   return true
 end
 
+-- Has telemetry already accounted for this commitment?
+--
+-- HW_UPDATE reports what is in the ME network. A drone pulled two seconds ago
+-- may still be counted there, so a commitment newer than the last sweep has to
+-- be subtracted by hand or two modules get handed the same physical drone --
+-- the bug behind "Infinity Catalyst everywhere" when only one high-tier drone
+-- existed.
+--
+-- But once a sweep has run AFTER the pull, the stock figure already excludes
+-- it, and subtracting again counts it twice. That is what idled modules while
+-- drones sat in stock: three MK-IX committed against a reported two left read
+-- as MINUS one available, so nothing more could dispatch even though two were
+-- genuinely free. It also imposed a standing tax of one spare drone per busy
+-- module just to keep dispatching.
+--
+-- If the hw node goes quiet, lastHWSyncTime stops advancing and every
+-- commitment counts again -- which is the conservative direction to fail in.
+local function telemetryHasSeen(mod)
+  local at = mod.job and mod.job.dispatchedAt
+  if not at then return true end   -- pre-existing job from before this field
+  return at <= (brokerState.lastHWSyncTime or 0)
+end
+
 -- How many of each drone are actually free to assign right now?
--- = telemetry stock  -  drones already committed to non-idle modules.
--- Telemetry lags (HW_UPDATE every 10s), so a drone we assigned 2s ago may still
--- show "in stock". Subtracting in-flight commitments prevents handing the same
--- physical drone to multiple modules — the bug that caused "Infinity Catalyst
--- everywhere" when only one high-tier drone existed.
 local function availableDrones()
   local avail = {}
   for key, count in pairs(brokerState.drones) do avail[key] = count end
   for _, mod in ipairs(modules) do
-    if mod.status ~= "IDLE" and mod.job and mod.job.droneKey then
+    if mod.status ~= "IDLE" and mod.job and mod.job.droneKey and not telemetryHasSeen(mod) then
       local k = mod.job.droneKey
       avail[k] = (avail[k] or 0) - 1
     end
@@ -648,14 +669,18 @@ local function availableDrones()
   return avail
 end
 
--- Same idea for drill kits: stock minus kits already committed to busy modules.
+-- Same idea for drill kits, with one extra correction: a load costs a full
+-- config.tipsPerLoad / rodsPerLoad, not one kit. Subtracting 1 under-counted an
+-- unseen commitment by that whole factor, which every other site in this file
+-- already charges in full.
 local function availableKits()
+  local perLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
   local avail = {}
   for key, d in pairs(brokerState.drills) do avail[key] = (d and d.kits) or 0 end
   for _, mod in ipairs(modules) do
-    if mod.status ~= "IDLE" and mod.job and mod.job.drillKey then
+    if mod.status ~= "IDLE" and mod.job and mod.job.drillKey and not telemetryHasSeen(mod) then
       local k = mod.job.drillKey
-      avail[k] = (avail[k] or 0) - 1
+      avail[k] = (avail[k] or 0) - perLoad
     end
   end
   return avail
