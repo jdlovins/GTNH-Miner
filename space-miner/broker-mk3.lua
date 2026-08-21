@@ -2316,32 +2316,19 @@ while true do
     lastWatchlistSend = nowW
   end
 
-  -- 2. Advance every in-flight load task. This is the hot path — runs every
-  --    iteration so concurrent loads progress as fast as the hardware allows.
-  sched.tick()
-
-  -- 3. Advance module lifecycle (load results, running->done, cleanup).
-  stepModules()
-
-  -- 4. Telemetry-ready gate. All three telem sources are required: dust (what to
-  --    mine), hardware (drones/kits available), and fluid (plasma — modules can't
-  --    run without it). Wait for all three before dispatching.
-  if not brokerState.telemetryReady then
-    brokerState.telemetryReady = (brokerState.lastDustSyncTime > 0)
-        and (brokerState.lastHWSyncTime > 0)
-        and (brokerState.lastFluidSyncTime > 0)
-  end
-
-  -- 5. Dispatch on its own cadence.
-  local now = os.time()
-  if brokerState.telemetryReady and (now - lastDispatchCheck >= DISPATCH_INTERVAL) then
-    dispatchBatch()
-    lastDispatchCheck = now
-  end
-
-  -- 6. Redraw the UI a few times a second, not every iteration. The full
-  --    three-panel repaint is the most expensive thing we do; throttling it
-  --    frees the loop to tick the scheduler hundreds of times per second.
+  -- 2. Redraw, BEFORE advancing any work.
+  --
+  -- Two reasons this comes first rather than last. Latency: the event that was
+  -- just handled is usually a keypress, and running the scheduler, the module
+  -- lifecycle and dispatch before repainting put all of that in the
+  -- keypress-to-pixels path. Budget: OpenComputers meters direct component
+  -- calls per tick, and whoever calls first in a tick gets served first -- so
+  -- drawing ahead of the loader means the UI is not left waiting on the next
+  -- tick behind a batch of transposer and ME calls.
+  --
+  -- The cost is that a frame reflects state from just before this iteration's
+  -- sched.tick(). At a 0.25s panel cadence and 2s in the editor, one iteration
+  -- of staleness is not observable.
   local up = computer.uptime()
   if ed.open then
     -- Event-driven: repaint when the editor changed, plus a slow tick so live
@@ -2356,4 +2343,28 @@ while true do
     drawUI()
     lastUIDraw = up
   end
+
+  -- 3. Advance every in-flight load task. This is the hot path — runs every
+  --    iteration so concurrent loads progress as fast as the hardware allows.
+  sched.tick()
+
+  -- 4. Advance module lifecycle (load results, running->done, cleanup).
+  stepModules()
+
+  -- 5. Telemetry-ready gate. All three telem sources are required: dust (what to
+  --    mine), hardware (drones/kits available), and fluid (plasma — modules can't
+  --    run without it). Wait for all three before dispatching.
+  if not brokerState.telemetryReady then
+    brokerState.telemetryReady = (brokerState.lastDustSyncTime > 0)
+        and (brokerState.lastHWSyncTime > 0)
+        and (brokerState.lastFluidSyncTime > 0)
+  end
+
+  -- 6. Dispatch on its own cadence.
+  local now = os.time()
+  if brokerState.telemetryReady and (now - lastDispatchCheck >= DISPATCH_INTERVAL) then
+    dispatchBatch()
+    lastDispatchCheck = now
+  end
+
 end
