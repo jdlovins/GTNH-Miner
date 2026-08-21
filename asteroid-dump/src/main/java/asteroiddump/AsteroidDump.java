@@ -3,6 +3,7 @@ package asteroiddump;
 import cpw.mods.fml.common.FMLLog;
 import cpw.mods.fml.common.Mod;
 import cpw.mods.fml.common.event.FMLServerStartedEvent;
+import cpw.mods.fml.common.registry.GameData;
 import cpw.mods.fml.common.registry.GameRegistry;
 
 import net.minecraft.item.Item;
@@ -63,7 +64,7 @@ import java.util.*;
  *   recipe graph is near fully connected -- follow alloying and the chemical
  *   reactor and every asteroid "yields" most of the game.
  */
-@Mod(modid = AsteroidDump.MODID, name = "Asteroid Dump", version = "1.1",
+@Mod(modid = AsteroidDump.MODID, name = "Asteroid Dump", version = "1.2",
      dependencies = "required-after:gregtech", acceptableRemoteVersions = "*")
 public class AsteroidDump {
 
@@ -116,21 +117,40 @@ public class AsteroidDump {
         return idOf(s);
     }
 
-    /** modid:name:damage, via GameRegistry so no remapped field access is needed. */
+    /**
+     * Stable identity for an item, without touching a remapped member.
+     *
+     * findUniqueIdentifierFor gives the readable modid:name, but it throws NPE
+     * when GameData has no unique name for the item -- its UniqueIdentifier
+     * constructor calls split() on the null. Across 200-odd mods some item in
+     * the recipe maps always hits that, and it killed the whole run. So it is
+     * attempted, then fallen back to the registry's numeric id, which is FML's
+     * own method and cannot be remapped. Readability is not lost: the display
+     * name is recorded separately.
+     */
+    private static String baseOf(Item it) {
+        try {
+            GameRegistry.UniqueIdentifier u = GameRegistry.findUniqueIdentifierFor(it);
+            if (u != null && u.modId != null && u.name != null) return u.modId + ":" + u.name;
+        } catch (Throwable ignored) { }
+        try {
+            return "id#" + GameData.getItemRegistry().getId(it);
+        } catch (Throwable ignored) { }
+        return it.getClass().getName();
+    }
+
     private static String idOf(ItemStack s) {
         Item it = itemOf(s);
         if (it == null) return null;
-        GameRegistry.UniqueIdentifier u = GameRegistry.findUniqueIdentifierFor(it);
-        String base = (u == null) ? it.getClass().getName() : (u.modId + ":" + u.name);
-        return base + ":" + damageOf(s);
+        try { return baseOf(it) + ":" + damageOf(s); }
+        catch (Throwable t) { return null; }
     }
 
     private static String wildIdOf(ItemStack s) {
         Item it = itemOf(s);
         if (it == null) return null;
-        GameRegistry.UniqueIdentifier u = GameRegistry.findUniqueIdentifierFor(it);
-        String base = (u == null) ? it.getClass().getName() : (u.modId + ":" + u.name);
-        return base + ":*";
+        try { return baseOf(it) + ":*"; }
+        catch (Throwable t) { return null; }
     }
 
     // ---------------------------------------------------------------------
@@ -192,6 +212,8 @@ public class AsteroidDump {
                 for (ItemStack in : r.mInputs) {
                     if (in == null) continue;
                     Step st = new Step(e.getKey(), r);
+                    // Defensive: a single unresolvable item should cost us that
+                    // item, not the entire dump.
                     // Index exact and wildcard: GT inputs routinely use damage
                     // 32767 to mean "any damage".
                     add(byInput, idOf(in), st);
