@@ -203,17 +203,34 @@ local function pollLoad(mod)
       "[LOAD] M%d ready (confirm polls d=%s t=%s r=%s, arrive=%s)",
       mod.index, tostring(cp.drone), tostring(cp.tip), tostring(cp.rod),
       tostring(s.arrivePolls)))
+    -- Push the job's parameters into the module before letting it work.
+    --
+    -- GT replaced setParameters(index, 0, value) with setParameter(key, value):
+    -- keyed by STRING, not by index, which is why conf.distanceParam no longer
+    -- means anything. Keys confirmed live via getParameters() on an MK-II:
+    --   cycle (bool), cycleDistance, distance, parallel, range, step
+    -- There is no overdrive parameter any more -- it is gone from the machine,
+    -- not merely unset here.
+    --
+    -- "parallel" is the module's parallel count, which is what the tier buys you
+    -- (MK-I 2, MK-II 4, MK-III 8). job.parallels already carried the right value
+    -- from config.moduleTiers; until now nothing applied it.
+    --
+    -- Wrapped in pcall deliberately: a nil setParameter is exactly what took the
+    -- whole broker down before. If GT renames these again, that module goes to
+    -- ERROR and the other five keep mining.
+    local okParams, paramErr = pcall(function()
+      mod.adapter.setParameter("distance", mod.job.distance)
+      mod.adapter.setParameter("parallel", mod.job.parallels)
+    end)
+    if not okParams then
+      mod.status = "ERROR"
+      logger:error("[LOAD] M" .. mod.index .. " setParameter failed: " .. tostring(paramErr))
+      return
+    end
+
     mod.status = "RUNNING"
     mod.job.startTime = os.time()
-    -- NOTE: this used to call
-    --   mod.adapter.setParameters(mod.conf.distanceParam, 0, mod.job.distance)
-    -- to push the chosen asteroid distance into the module. GT no longer exposes
-    -- setParameters on the machine's OC interface, so the call died with
-    -- "attempt to call a nil value (field 'setParameters')". Distance must now be
-    -- set on the module by hand.
-    --
-    -- job.distance is still computed by getOptimalDistance() and shown on the
-    -- dashboard, but it is ADVISORY ONLY now -- nothing applies it.
     mod.adapter.setWorkAllowed(true)
   else
     mod.status = "ERROR"
