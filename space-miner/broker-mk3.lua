@@ -1232,13 +1232,24 @@ local function outputsFor(name)
 end
 
 -- Items mapped to this asteroid that are NOT one of its direct yields.
-local function downstreamFor(name)
-  local direct = {}
-  -- Keyed on the DUST, because that is what a direct row now tracks.
-  for _, o in ipairs(outputsFor(name) or {}) do direct[o.dust or o.item] = true end
+-- Items already covered by the asteroid's derived main/processed lists.
+local function derivedFor(name)
+  local o = outputsFor(name)
+  local set = {}
+  if not o then return set end
+  for _, e in ipairs(o.main or {})      do set[e.item] = true end
+  for _, e in ipairs(o.processed or {}) do set[e.item] = true end
+  return set
+end
+
+-- dustTargets entries pointing at this asteroid that the dump did NOT derive.
+-- These are the hand-typed ones: alloys, chemical lines, anything past the
+-- ore-processing graph the mod walks.
+local function manualFor(name)
+  local derived = derivedFor(name)
   local list = {}
   for item, t in pairs(ed.targets) do
-    if t.asteroid == name and not direct[item] then list[#list + 1] = item end
+    if t.asteroid == name and not derived[item] then list[#list + 1] = item end
   end
   table.sort(list)
   return list
@@ -1287,45 +1298,61 @@ local function buildAsteroids()
   return rows
 end
 
+-- Three sections, as the data itself divides:
+--   MAIN       processing the drop -- macerator, washer, thermal centrifuge,
+--              sifter, chemical bath, EM separator. hops=0 means the module
+--              drops it finished.
+--   PROCESSED  breaking those down further in a centrifuge or electrolyzer.
+--   MANUAL     typed in by hand. Everything past the ore-processing graph --
+--              alloys, chemical lines -- which no dump can reach.
 local function buildDetail(name)
   local rows = {}
-  local outs = outputsFor(name)
+  local o = outputsFor(name)
+
+  -- The raw drops are context, not choices: they are ore, processing eats them
+  -- on arrival, and their stock never accumulates. Shown for the item filter.
+  if o and o.drops then
+    local parts = {}
+    for _, dr in ipairs(o.drops) do
+      parts[#parts + 1] = string.format("%s (%.0f%%)", dr.item, (dr.chance or 0) / 100)
+    end
+    rows[#rows + 1] = { kind = "header", text = "DROPS  (for the module item filter -- do not track)" }
+    rows[#rows + 1] = { kind = "note", text = table.concat(parts, "   ") }
+  end
 
   rows[#rows + 1] = { kind = "header",
-    text = outs and "DIRECT  (dust the asteroid yields, via one macerate hop)"
-                 or "DIRECT  -- none derivable for this asteroid" }
-  if outs then
-    for _, o in ipairs(outs) do
-      -- Track the DUST, not the ore. Ore processing consumes the ore the moment
-      -- it lands, so its stock never accumulates -- tracking it would leave a
-      -- condition permanently at 0 and mine that asteroid forever. The ore is
-      -- shown as provenance and is what the module item filter wants.
-      --
-      -- dust = nil means processing yields no dust of that material (Platinum
-      -- Ore gives Platinum Metallic Powder Dust, Redstone Ore gives an Impure
-      -- Pile). Those are shown but NOT selectable, so nobody can tick the ore
-      -- and recreate the always-starved condition.
-      if o.dust then
-        if matchesFilter(o.dust) or matchesFilter(o.item) then
-          rows[#rows + 1] = { kind = "item", item = o.dust, source = o.item,
-                              chance = o.chance, hops = o.hops, direct = true }
-        end
-      elseif matchesFilter(o.item) then
-        rows[#rows + 1] = { kind = "note",
-          text = o.item .. "  -- no dust of this material; add the real one below" }
+    text = o and "MAIN  (from macerating / washing / centrifuging the drop)"
+             or  "MAIN  -- nothing derived for this asteroid" }
+  if o then
+    for _, e in ipairs(o.main or {}) do
+      if matchesFilter(e.item) then
+        rows[#rows + 1] = { kind = "item", item = e.item, hops = e.hops,
+                            source = e.via, direct = true }
+      end
+    end
+    if #(o.main or {}) == 0 then
+      rows[#rows + 1] = { kind = "note", text = "none" }
+    end
+  end
+
+  rows[#rows + 1] = { kind = "header", text = "PROCESSED  (electrolyzing / centrifuging the above)" }
+  if o and #(o.processed or {}) > 0 then
+    for _, e in ipairs(o.processed) do
+      if matchesFilter(e.item) then
+        rows[#rows + 1] = { kind = "item", item = e.item, hops = e.hops,
+                            source = e.via, direct = true }
       end
     end
   else
-    rows[#rows + 1] = { kind = "note",
-      text = "mod-specific item stacks, not derivable -- add what it gives you below" }
+    rows[#rows + 1] = { kind = "note", text = "none" }
   end
 
-  rows[#rows + 1] = { kind = "header", text = "DOWNSTREAM  (typed in by hand)" }
-  local down = downstreamFor(name)
-  if #down == 0 then
+  rows[#rows + 1] = { kind = "header", text = "MANUAL  (typed in -- alloys, chemical lines)" }
+  local man = manualFor(name)
+  if #man == 0 then
     rows[#rows + 1] = { kind = "note", text = "none yet -- press A to add one" }
   end
-  for _, item in ipairs(down) do
+  for _, item in ipairs(man) do
     if matchesFilter(item) then
       rows[#rows + 1] = { kind = "item", item = item, direct = false }
     end
@@ -1687,8 +1714,8 @@ local function edDraw()
     term.setCursor(X_NAME, 4); io.write("ITEM")
     term.setCursor(X_A, 4); io.write("TARGET")
     term.setCursor(X_B, 4); io.write("HAVE")
-    term.setCursor(X_C, 4); io.write(ed.mode == "detail" and "CHANCE" or "ASTEROID")
-    if ed.mode == "detail" then term.setCursor(X_SRC, 4); io.write("DROPPED AS") end
+    term.setCursor(X_C, 4); io.write(ed.mode == "detail" and "STEPS" or "ASTEROID")
+    if ed.mode == "detail" then term.setCursor(X_SRC, 4); io.write("VIA") end
   end
 
   for r = 0, edRows() - 1 do
@@ -1741,19 +1768,17 @@ local function edDraw()
         term.setCursor(X_B, y); io.write(formatQty(have))
 
         if ed.mode == "detail" then
-          if row.chance then
+          if row.hops then
             gpu.setForeground(0x888888)
-            term.setCursor(X_C, y); io.write(string.format("%.1f%%", row.chance / 100))
-            if row.source and row.source ~= item then
+            term.setCursor(X_C, y)
+            io.write(row.hops == 0 and "direct" or (row.hops .. " hop"))
+            if row.source then
               gpu.setForeground(0x666666)
-              term.setCursor(X_SRC, y); io.write(row.source:sub(1, W - X_SRC))
-            elseif row.source then
-              gpu.setForeground(0x666666)
-              term.setCursor(X_SRC, y); io.write("(dust directly)")
+              term.setCursor(X_SRC, y); io.write(tostring(row.source):sub(1, W - X_SRC))
             end
           else
             gpu.setForeground(0x666666)
-            term.setCursor(X_C, y); io.write("downstream")
+            term.setCursor(X_C, y); io.write("hand-typed")
           end
         else
           local t = ed.targets[item]
