@@ -19,6 +19,12 @@
 --   interfaceSide  : transposer side facing the ME Interface buffer (0-5)
 --   inputBusSide   : transposer side facing the Input Bus (0-5)
 --   distanceParam  : setParameters index for distance (usually 0)
+--   pinnedAsteroid : (optional) reserve this module to ALWAYS mine one asteroid,
+--                    ignoring dust thresholds and the per-asteroid cap. Use the
+--                    exact asteroid name from config.asteroids, e.g.
+--                    "Infinity Catalyst" to keep a module on Infinity dust.
+--                    The module still needs an eligible drone + drill kits in
+--                    stock; it stays idle only when those run out.
 --
 -- Transposer side numbers (OpenComputers sides API):
 --   0 = bottom (down)   1 = top (up)
@@ -45,6 +51,7 @@ return {
     --     interfaceSide  = 3,   -- 0=down 1=up 2=north 3=south 4=west 5=east
     --     inputBusSide   = 2,
     --     distanceParam  = 0,
+    --     -- pinnedAsteroid = "Infinity Catalyst", -- optional: reserve to one asteroid
     --   },
   },
 }

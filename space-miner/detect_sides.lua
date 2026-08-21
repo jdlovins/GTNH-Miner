@@ -303,6 +303,11 @@ local function writeConfig()
     f:write("      interfaceSide  = " .. mod.interfaceSide .. ",\n")
     f:write("      inputBusSide   = " .. mod.inputBusSide .. ",\n")
     f:write("      distanceParam  = " .. mod.distanceParam .. ",\n")
+    -- pinnedAsteroid is optional and hand-set. Emit it only when present,
+    -- so re-running this script never silently drops a module's pin.
+    if mod.pinnedAsteroid then
+      f:write("      pinnedAsteroid = \"" .. mod.pinnedAsteroid .. "\",\n")
+    end
     f:write("    },\n")
   end
   f:write("  }\n")

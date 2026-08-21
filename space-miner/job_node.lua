@@ -499,9 +499,11 @@ local STARTUP_GRACE = 10  -- seconds after start before polling isMachineActive 
 local POLL_INTERVAL = 5 * 20   -- Minecraft seconds between active-status polls (0.25 real seconds for fast DONE detection)
 
 local function startModule(mod, distance)
-  -- Parameter index 0 is the distance value, confirmed in-game.
+  -- GTNH 2.9: named-key API replaces positional setParameters.
   local ok, err = pcall(function()
-    mod.adapter.setParameters(mod.conf.distanceParam, 0, distance)
+    mod.adapter.setParameter("distance", distance)
+    mod.adapter.setParameter("parallel", mod.job and mod.job.parallels or 1)
+    mod.adapter.setParameter("cycle", false)
     mod.adapter.setWorkAllowed(true)
   end)
   if not ok then return false, tostring(err) end
@@ -561,7 +563,7 @@ local function stepDone(mod)
   -- Clear module distance parameter to reset adapter state
   pcall(function()
     mod.adapter.setWorkAllowed(false)
-    mod.adapter.setParameters(mod.conf.distanceParam, 0, 1)
+    mod.adapter.setParameter("distance", 1)
   end)
   log("DONE M" .. mod.index .. ": " .. mod.job.asteroid)
   modLog(mod.index, "Job complete!")
