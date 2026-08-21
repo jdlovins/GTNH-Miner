@@ -21,7 +21,7 @@
 -- =============================================================================
 
 local component = require("component")
-local RAW = "https://raw.githubusercontent.com/novashep/GTNH/main/space-miner"
+local RAW = "https://raw.githubusercontent.com/jdlovins/GTNH-Miner/main/space-miner"
 
 -- Files every role needs.
 local COMMON = { "config.lua" }
