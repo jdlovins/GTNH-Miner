@@ -809,7 +809,11 @@ end
 local function drawModulePanel()
   local row = 6
   local function clear(r) gpu.fill(P1 + 1, r, PW, 1, " ") end
-  for r = 6, H do clear(r) end -- wipe column first; sections shift between frames
+  -- No full-column pre-wipe here. Every row below clears itself before it is
+  -- written, and the tail wipe at the end of this function blanks whatever
+  -- rows the layout vacated -- so ghosts are already impossible. Blanking the
+  -- whole column up front only added a visible blank frame between the wipe
+  -- and the repaint, four times a second: that was the flicker.
   for _, mod in ipairs(modules) do
     if row > H then break end
     clear(row); term.setCursor(P1 + 1, row)
@@ -863,7 +867,11 @@ end
 
 local function drawDustPanel()
   local row = 6
-  for r = 6, H do gpu.fill(P2 + 1, r, PW, 1, " ") end -- wipe column first
+  -- No full-column pre-wipe here. Every row below clears itself before it is
+  -- written, and the tail wipe at the end of this function blanks whatever
+  -- rows the layout vacated -- so ghosts are already impossible. Blanking the
+  -- whole column up front only added a visible blank frame between the wipe
+  -- and the repaint, four times a second: that was the flicker.
   local list = {}
   for _, cond in ipairs(config.conditions) do
     local name      = cond.itemName
@@ -895,11 +903,11 @@ local function drawHWPanel()
   local row = 6
   local function clear(r) gpu.fill(P3 + 1, r, PW, 1, " ") end
 
-  -- Wipe the whole panel column first. Sections here grow/shrink between frames
-  -- (plasma message appears/disappears, drone/kit lists change length), and
-  -- clearing only the rows we draw leaves "ghost" text on vacated rows when the
-  -- layout shifts up. Clearing the full column each frame makes ghosts impossible.
-  for r = 6, H do clear(r) end
+  -- No full-column pre-wipe here. Every row below clears itself before it is
+  -- written, and the tail wipe at the end of this function blanks whatever
+  -- rows the layout vacated -- so ghosts are already impossible. Blanking the
+  -- whole column up front only added a visible blank frame between the wipe
+  -- and the repaint, four times a second: that was the flicker.
 
   clear(row); term.setCursor(P3 + 1, row)
   if brokerState.nextTarget then
