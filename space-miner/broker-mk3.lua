@@ -136,6 +136,10 @@ local brokerState = {
   lastDustSync = "--:--:--",
   lastFluidSync = "--:--:--",
   lastHWSync = "--:--:--",
+  -- Outbound, unlike the three above. Without this there is no way to tell a
+  -- broker that is publishing par from one running code that cannot.
+  lastParSend = "--:--:--",
+  lastParCount = 0,
   nextTarget = nil,
   telemetryReady = false,
   priorityMode = "threshold", -- "threshold" (lowest fill first) | "rarity" (dust priority first)
@@ -969,6 +973,13 @@ local function drawHWPanel()
   row = row + 1
   clear(row); term.setCursor(P3 + 1, row)
   gpu.setForeground(getSyncColor(brokerState.lastHWSyncTime)); io.write("  HW:     " .. brokerState.lastHWSync)
+  row = row + 1
+  -- Outbound par. Grey dashes here mean this broker has never sent DRILL_PAR --
+  -- almost always an older broker-mk3.lua, since the send is unconditional.
+  clear(row); term.setCursor(P3 + 1, row)
+  gpu.setForeground(brokerState.lastParCount > 0 and 0x00FF00 or 0x555555)
+  io.write("  PAR TX: " .. brokerState.lastParSend ..
+           " (" .. brokerState.lastParCount .. ")")
   row = row + 2
 
   clear(row); term.setCursor(P3 + 1, row)
@@ -2051,7 +2062,18 @@ local function broadcastDrillPar()
     payloadType = "DRILL_PAR",
     data        = list,
   }))
+  local n = 0
+  for _ in pairs(list) do n = n + 1 end
+  brokerState.lastParSend  = os.date("%X")
+  brokerState.lastParCount = n
 end
+
+-- Publish par once before entering the loop. The interval timer below compares
+-- against computer.uptime(), which is time since this COMPUTER booted, not since
+-- this program started -- so on a freshly booted machine the first send would
+-- otherwise be 30s away, and a node that just started sits on "Awaiting par"
+-- long enough to look broken.
+pcall(broadcastDrillPar)
 
 while true do
   -- 1. Service one inbound message. Very short timeout: returns immediately if a
