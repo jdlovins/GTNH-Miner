@@ -25,6 +25,7 @@
 -- =============================================================================
 
 local component = require("component")
+local computer  = require("computer")   -- drain() times out against uptime()
 local sched     = dofile("/home/scheduler.lua")
 
 local loader = {}
@@ -35,8 +36,9 @@ local ARRIVE_TIMEOUT    = 15   -- max wait for the DRONE to reach the interface 
 local POLL_INTERVAL     = 0.2  -- how often to re-check while awaiting
 local TIPS_PER_DEFAULT  = 64   -- drill tips to stock (config.tipsPerLoad overrides)
 local RODS_PER_DEFAULT  = 64   -- drill rods to stock (config.rodsPerLoad overrides)
-local FILL_ROUNDS       = 10   -- re-request rounds per STACK before giving up
+local FILL_TIMEOUT      = 30   -- total seconds to get every consumable into the bus
 local STACK_DEFAULT     = 64   -- fallback when a stack does not report maxSize
+local MAX_CFG_SLOTS     = 8    -- ME Interface configuration slots we may use
 
 -- Map a module index to its three dedicated database slots.
 local function dbSlotsFor(modIndex)
@@ -78,9 +80,12 @@ local function clearInputBus(mod)
 end
 
 local function clearInterfaceSlots(mod)
-  mod.iface.setInterfaceConfiguration(1)
-  mod.iface.setInterfaceConfiguration(2)
-  mod.iface.setInterfaceConfiguration(3)
+  -- Clear every slot we might have configured, not just the original three:
+  -- a multi-stack load spreads its requests across more of them, and a slot
+  -- left configured keeps the ME stocking items we no longer want.
+  for slot = 1, MAX_CFG_SLOTS do
+    mod.iface.setInterfaceConfiguration(slot)
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -145,22 +150,58 @@ function loader.run(mod, job, deps)
     { slot = slotRod,   label = drillEntry.rod,  tag = "rod"   },
   }
 
+  -- Issue all three writes first, then wait for them together.
+  --
+  -- Confirming each before starting the next served the three waits back to
+  -- back, so the load paid three round-trips where the writes could have been
+  -- settling concurrently. store()'s return is a hint; the read-back is truth.
+  local storeOk = {}
   for _, it in ipairs(items) do
-    local ok = mod.iface.store({ label = it.label }, dbAddr, it.slot)
-    -- store()'s return is treated as a hint; the read-back is the truth.
+    storeOk[it.tag] = mod.iface.store({ label = it.label }, dbAddr, it.slot)
+  end
+
+  for _, it in ipairs(items) do
     local confirmed, polls = confirmFingerprint(db, it.slot, it.label)
     stats.confirmPolls[it.tag] = polls
     if not confirmed then
       return false, "fingerprint never confirmed for " .. it.tag ..
                     " (" .. it.label .. ") in slot " .. it.slot ..
-                    "; store() returned " .. tostring(ok)
+                    "; store() returned " .. tostring(storeOk[it.tag])
     end
   end
 
   -- 3. Tell the interface to stock items matching those fingerprints.
-  mod.iface.setInterfaceConfiguration(1, dbAddr, slotDrone, 1)
-  mod.iface.setInterfaceConfiguration(2, dbAddr, slotTip, TIPS_PER)
-  mod.iface.setInterfaceConfiguration(3, dbAddr, slotRod, RODS_PER)
+  --
+  -- One configuration slot stocks at most a stack, so a 128-item target needs
+  -- two of them. Allocating a slot per stack lets the ME deliver them
+  -- CONCURRENTLY; with a single slot per consumable the load waits out one
+  -- delivery, drains it, waits out the next, and so on.
+  --
+  -- A configured slot is also self-refilling: the interface maintains that
+  -- stock, so draining the buffer is itself the request for more. The old fill
+  -- loop re-issued setInterfaceConfiguration every round, which was churn.
+  local cfgSlots = { tip = {}, rod = {} }
+  do
+    local next_ = 2   -- slot 1 is the drone
+    local function alloc(kind, dbSlot, total)
+      local stacks = math.max(1, math.ceil(total / STACK_DEFAULT))
+      for _ = 1, stacks do
+        if next_ > MAX_CFG_SLOTS then break end
+        cfgSlots[kind][#cfgSlots[kind] + 1] = next_
+        next_ = next_ + 1
+      end
+      -- Spread the target evenly over however many slots we got, so a short
+      -- allocation still asks for everything rather than silently under-ordering.
+      local n = #cfgSlots[kind]
+      local per = math.min(STACK_DEFAULT, math.ceil(total / math.max(1, n)))
+      for _, slot in ipairs(cfgSlots[kind]) do
+        mod.iface.setInterfaceConfiguration(slot, dbAddr, dbSlot, per)
+      end
+    end
+    mod.iface.setInterfaceConfiguration(1, dbAddr, slotDrone, 1)
+    alloc("tip", slotTip, TIPS_PER)
+    alloc("rod", slotRod, RODS_PER)
+  end
 
   -- 4. The DRONE is the load gate: wait only for it. Tips and rods are handled
   --    by the patient fill in step 6 rather than being demanded up front.
@@ -272,45 +313,52 @@ function loader.run(mod, job, deps)
     return nil, 0
   end
 
-  -- How big is a stack of this item, per the game rather than an assumption?
-  local function stackCap(label)
-    local s = findSlot(label, 1)
-    if s then
-      local st = mod.transposer.getStackInSlot(mod.conf.interfaceSide, s)
-      if st and st.maxSize then return st.maxSize end
-    end
-    return STACK_DEFAULT
-  end
+  -- Drain both consumables together until each reaches its target.
+  --
+  -- Two changes from filling them one after another. Tips and rods are now in
+  -- flight at the same time, so their ME latencies overlap instead of adding
+  -- up. And a pass that actually moved something loops straight round again
+  -- rather than sleeping -- the old code paid a fixed POLL_INTERVAL after every
+  -- transfer, productive or not, which on a multi-stack load is most of the
+  -- wall time.
+  --
+  -- Returns true when everything landed, or false plus the label that fell
+  -- short.
+  local function drain(wanted)
+    local deadline = computer.uptime() + FILL_TIMEOUT
+    while true do
+      local outstanding, moved = false, false
 
-  local function fill(label, target, cfgSlot, dbSlot)
-    -- More stacks legitimately need more rounds; a fixed budget would fail a
-    -- healthy multi-stack load on a contended ME.
-    local rounds = FILL_ROUNDS * math.max(1, math.ceil(target / STACK_DEFAULT))
-    for _ = 1, rounds do
-      local have    = busTotal(label)
-      local deficit = target - have
-      if deficit <= 0 then return true end
-
-      -- Ask the ME for at most one stack at a time: that is all the interface
-      -- buffer will hold in a slot anyway.
-      local cap = stackCap(label)
-      mod.iface.setInterfaceConfiguration(cfgSlot, dbAddr, dbSlot, math.min(deficit, cap))
-      sched.await(function() return findSlot(label, 1) ~= nil end, 3, POLL_INTERVAL)
-
-      local src = findSlot(label, 1)
-      if src then
-        local dst, room = destFor(label)
-        if not dst then
-          -- Bus is full of other things; nothing more we can do.
-          return busTotal(label) >= target
+      for _, w in ipairs(wanted) do
+        local have = busTotal(w.label)
+        if have < w.target then
+          outstanding = true
+          local src = findSlot(w.label, 1)
+          if src then
+            local dst, room = destFor(w.label)
+            if dst then
+              local n = math.min(w.target - have, room)
+              local got = mod.transposer.transferItem(
+                mod.conf.interfaceSide, mod.conf.inputBusSide, n, src, dst)
+              if (got or 0) > 0 then moved = true end
+            else
+              -- No room anywhere on the bus; more waiting will not help.
+              return false, w.label
+            end
+          end
         end
-        mod.transposer.transferItem(
-          mod.conf.interfaceSide, mod.conf.inputBusSide,
-          math.min(deficit, room), src, dst)
       end
-      sched.sleep(POLL_INTERVAL)
+
+      if not outstanding then return true end
+      if computer.uptime() >= deadline then
+        for _, w in ipairs(wanted) do
+          if busTotal(w.label) < w.target then return false, w.label end
+        end
+        return true
+      end
+      -- Only yield when nothing could be moved: otherwise keep draining.
+      if not moved then sched.sleep(POLL_INTERVAL) end
     end
-    return busTotal(label) >= target
   end
 
   -- Verify the right drone landed before committing tips and rods (catches a
@@ -321,13 +369,15 @@ function loader.run(mod, job, deps)
     return false, "drone mismatch in bus: expected " .. droneName ..
                   ", got " .. (droneStack and droneStack.label or "empty")
   end
-  if not fill(drillEntry.tip, TIPS_PER, 2, slotTip) then
+  local ok, shortLabel = drain({
+    { label = drillEntry.tip, target = TIPS_PER },
+    { label = drillEntry.rod, target = RODS_PER },
+  })
+  if not ok then
+    local target = (shortLabel == drillEntry.tip) and TIPS_PER or RODS_PER
+    local kind   = (shortLabel == drillEntry.tip) and "tip" or "rod"
     clearInterfaceSlots(mod)
-    return false, "tip shortfall: got " .. busTotal(drillEntry.tip) .. "/" .. TIPS_PER
-  end
-  if not fill(drillEntry.rod, RODS_PER, 3, slotRod) then
-    clearInterfaceSlots(mod)
-    return false, "rod shortfall: got " .. busTotal(drillEntry.rod) .. "/" .. RODS_PER
+    return false, kind .. " shortfall: got " .. busTotal(shortLabel) .. "/" .. target
   end
 
   clearInterfaceSlots(mod)
