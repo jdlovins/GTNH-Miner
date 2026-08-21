@@ -402,7 +402,7 @@ All mining parameters are defined in `config.lua`:
 - **Asteroids:** Material compositions, size ranges, valid distance and drone tier ranges, computation and power requirements
 - **Drones:** 14 tiers from MK-I (LV) to MK-XIV (MAX)
 - **Drills:** 9 material tiers (Steel through Transcendent Metal)
-- **Drill par:** `config.drillPar` — per-material stock levels the hw node auto-crafts back up to. An explicit list, not derived from `droneDrillMap`: derivation would queue crafts for tiers that have no `drillRegistry` entry and cannot be dispatched anyway. Defaults to 4× a full load (256) for the six registered materials
+- **Drill par:** `config.drillPar` — per-material stock levels the hw node auto-crafts back up to. Defaults to 4× a full load (256) for all nine materials, because all nine are dispatchable: the gate in `tryDispatch()` is `config.drills`, not `config.drillRegistry` (which nothing reads). A material left out of `drillPar` still dispatches and still burns kits — it just never restocks. Note the top three tiers are expensive to craft unattended; lower those pars or set them `false` in `user_config.lua` if you would rather approve those by hand
 - **Plasmas:** 5 tiers with consumption rates, time discounts, and size bonuses
 - **Optimization Matrix:** Pre-computed optimal distances per [module tier][asteroid][drone tier]
 - **Dust Targets:** Mapping of dust items to source asteroids and mining priorities

@@ -137,9 +137,15 @@ config.drillRegistry = {
     tip = { name = "gregtech:gt.metaitem.02", damage = 8129 },
     rod = { name = "gregtech:gt.metaitem.01", damage = 23129 }
   },
-  -- TODO: scan these with find_item.lua and add them to enable higher drone tiers.
-  -- Until added, dispatch skips any tier that maps to an unregistered drill.
-  --   cosmicNeutronium, infinity, transcendentMetal
+  -- Missing: cosmicNeutronium, infinity, transcendentMetal.
+  --
+  -- This does NOT hold back those tiers. Nothing reads this table any more --
+  -- the loader resolves items by LABEL via iface.store(), and tryDispatch()
+  -- gates on config.drills, which has all nine materials. Tiers 11-14 dispatch
+  -- and load fine without an entry here.
+  --
+  -- Kept because a fingerprint-based loader would need it again, but treat it
+  -- as reference data, not as the list of what works.
 }
 
 -- Maps drone tier number to the drill key in config.drills above.
@@ -2963,10 +2969,19 @@ config.rodsPerLoad = 64
 -- telem node (DRILL_PAR on config.ports.hardware); the node compares it against
 -- its own live ME scan and auto-crafts anything below par.
 --
--- Only materials listed here are ever ordered. This is deliberately an explicit
--- list rather than something derived from droneDrillMap: derivation would have
--- us queueing Transcendent Metal drill tips for a tier that has no
--- drillRegistry entry and cannot be dispatched anyway.
+-- Only materials listed here are ever ordered -- an explicit list, so adding a
+-- drill material to the game does not silently start an expensive craft.
+--
+-- All nine are listed because all nine are dispatchable: the gate in
+-- tryDispatch() is config.drills, which has every material. (config.drillRegistry
+-- looks like it gates this but is dead -- nothing reads it since the loader moved
+-- to label-based lookup. Do not use it to decide what belongs here.) A tier left
+-- out of this table still dispatches and still burns kits; it just never gets
+-- restocked, which is the silent stall this whole feature exists to remove.
+--
+-- Be aware what the top three cost. 256 Infinity or Transcendent Metal drill
+-- tips is a large unattended resource commitment. Lower those pars, or drop them
+-- to false in user_config.lua, if you would rather approve those crafts by hand.
 --
 -- Default is 4x a full load (config.tipsPerLoad = 64), so there is buffer for
 -- four module loads before anything can stall on the kits < 64 dispatch floor.
@@ -2982,9 +2997,10 @@ config.drillPar = {
   naquadah      = { tips = 256, rods = 256 },
   naquadahAlloy = { tips = 256, rods = 256 },
   neutronium    = { tips = 256, rods = 256 },
-  -- cosmicNeutronium / infinity / transcendentMetal have no drillRegistry entry
-  -- yet (see the TODO above it), so dispatch skips them. Add them here once
-  -- they are registered.
+  -- Tiers 11-14 (MK-XI UIV and up). Expensive -- see the cost note above.
+  cosmicNeutronium  = { tips = 256, rods = 256 },
+  infinity          = { tips = 256, rods = 256 },
+  transcendentMetal = { tips = 256, rods = 256 },
 }
 
 -- ---------------------------------------------------------------------------
