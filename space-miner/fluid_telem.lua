@@ -38,7 +38,7 @@ local rowMap = {
   ["Bismuth Plasma"]       = 7,
   ["Radon Plasma"]         = 8,
   ["Technetium Plasma"]    = 9,
-  ["Plutonium-241 Plasma"] = 10
+  ["Plutonium 241 Plasma"] = 10
 }
 
 local function drawStaticFrame()
@@ -53,7 +53,7 @@ local function drawStaticFrame()
   term.setCursor(1, 7)  print("  Bismuth Plasma:       ")
   term.setCursor(1, 8)  print("  Radon Plasma:         ")
   term.setCursor(1, 9)  print("  Technetium Plasma:    ")
-  term.setCursor(1, 10) print("  Plutonium-241 Plasma: ")
+  term.setCursor(1, 10) print("  Plutonium 241 Plasma: ")
   print("\n--------------------------------------------------------------------------------")
   print("  [ HIGHEST AVAILABLE PLASMA ]")
   print("  Active Plasma:  ")
@@ -108,7 +108,7 @@ local function scanPlasmaStock()
     end
     -- Find the highest-tier plasma that has stock (plasmaKeyOrder is descending tier)
     for _, plasmaName in ipairs(config.plasmaKeyOrder) do
-      if volumes[plasmaName] > 0 then
+      if (volumes[plasmaName] or 0) > 0 then
         dominantPlasma = plasmaName
         highestVolume  = volumes[plasmaName]
         break
