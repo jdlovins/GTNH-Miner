@@ -4,8 +4,8 @@
     {
       "modid": "asteroiddump",
       "name": "Asteroid Dump",
-      "description": "Dumps every Space Elevator asteroid, what it drops, and what those drops break down into. Adds /asteroiddump. Diagnostic only; changes nothing in world.",
-      "version": "1.0",
+      "description": "Dumps every Space Elevator asteroid, what it drops, and what those drops break down into. Writes asteroid_dump.json on server start. Diagnostic only; changes nothing in world.",
+      "version": "1.1",
       "mcversion": "1.7.10",
       "authorList": ["jdlovins"],
       "dependencies": ["gregtech"]

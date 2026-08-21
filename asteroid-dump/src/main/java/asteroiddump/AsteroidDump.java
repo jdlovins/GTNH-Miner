@@ -1,15 +1,14 @@
 package asteroiddump;
 
+import cpw.mods.fml.common.FMLLog;
 import cpw.mods.fml.common.Mod;
-import cpw.mods.fml.common.event.FMLServerStartingEvent;
-import net.minecraft.command.CommandBase;
-import net.minecraft.command.ICommandSender;
+import cpw.mods.fml.common.event.FMLServerStartedEvent;
+import cpw.mods.fml.common.registry.GameRegistry;
+
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
-import net.minecraft.util.ChatComponentText;
 
 import gregtech.api.enums.Materials;
-import gregtech.api.enums.OrePrefixes;
 import gregtech.api.recipe.RecipeMap;
 import gregtech.api.recipe.RecipeMaps;
 import gregtech.api.util.GTOreDictUnificator;
@@ -19,90 +18,138 @@ import gtnhintergalactic.recipe.AsteroidData;
 import gtnhintergalactic.recipe.SpaceMiningRecipes;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
-import java.io.FileOutputStream;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 /**
- * Dumps, for every Space Elevator asteroid, what it drops and what that breaks
- * down into.
+ * Dumps, for every Space Elevator asteroid, what it drops and what those drops
+ * break down into. Writes asteroid_dump.json to the game directory on server
+ * start, then does nothing else.
  *
  * WHY THIS EXISTS
- *   The broker's config maps a dust to the asteroid that yields it. That mapping
- *   cannot be derived outside the game. Asteroid data and GT material names can
- *   be read out of the jar, but item LABELS are composed at runtime, bridge
- *   materials from BartWorks/GoodGenerator never appear statically at all, and
+ *   The broker config maps a dust to the asteroid that yields it, and that
+ *   mapping cannot be derived outside the game. Asteroid tables and GT material
+ *   names can be read from the jar, but item LABELS are composed at runtime,
+ *   BartWorks/GoodGenerator bridge materials never appear statically at all, and
  *   the ore-processing graph lives in recipe registrations built during load.
- *   In here all of that is just a method call on a live registry.
+ *   In here it is all a call on a live registry.
  *
- * WHAT IT DOES
- *   1. Walks SpaceMiningRecipes.uniqueAsteroidList for the drops. Asteroids
- *      declared with Materials+OrePrefixes are resolved through
- *      GTOreDictUnificator; the handful declared with explicit ItemStacks are
- *      read directly, which is what makes Clay / Everglades / Draconic Core /
- *      Mysterious Crystal resolvable here and nowhere else.
- *   2. Indexes the ore-processing recipe maps by input item.
- *   3. Breadth-first walks each drop up to MAX_DEPTH hops, recording every
- *      product with the machine and hop count that produced it.
- *   4. Writes JSON next to the world folder.
+ * WHY IT LOOKS LIKE THIS (the obfuscation trap)
+ *   Forge 1.7.10 remaps net.minecraft MEMBERS to SRG names at runtime -- class
+ *   names survive, method and field names do not. A dev-environment build fixes
+ *   that by reobfuscating MCP -> SRG on the way out. This mod is compiled by
+ *   hand against the pack's own jars with no such step, so any direct call to a
+ *   net.minecraft method would resolve to a name that does not exist at runtime.
+ *   The first version implemented ICommand and died at registration with
+ *   "does not define ... func_71517_b()", which is getCommandName().
  *
- * The traversal is deliberately limited to processing maps. The full recipe
- * graph is near fully connected -- follow alloying and the chemical reactor and
- * every asteroid "yields" most of the game.
+ *   So: no ICommand, no net.minecraft calls. It runs off an FML event (FML
+ *   classes are never remapped), identifies items through GameRegistry (also
+ *   FML), and reaches the three ItemStack methods it needs by reflection, trying
+ *   the SRG name first and the MCP name second so it works either way. The SRG
+ *   names were read out of GregTech's own bytecode rather than recalled.
  *
- * USAGE:  /asteroiddump          walk to the default depth
- *         /asteroiddump 2        override the depth
+ *   GregTech, BartWorks and Intergalactic classes are mod classes and are not
+ *   remapped, so those are called directly.
+ *
+ * DEPTH
+ *   Defaults to 3 hops, override with -Dasteroiddump.depth=N. Traversal is
+ *   limited to ore-processing maps plus centrifuge and electrolyzer. The full
+ *   recipe graph is near fully connected -- follow alloying and the chemical
+ *   reactor and every asteroid "yields" most of the game.
  */
-@Mod(modid = AsteroidDump.MODID, name = "Asteroid Dump", version = "1.0",
+@Mod(modid = AsteroidDump.MODID, name = "Asteroid Dump", version = "1.1",
      dependencies = "required-after:gregtech", acceptableRemoteVersions = "*")
 public class AsteroidDump {
 
     public static final String MODID = "asteroiddump";
 
-    /** Hops away from the raw drop. 3 reaches the dust-separation lines. */
-    private static final int MAX_DEPTH = 3;
+    private static final int DEFAULT_DEPTH = 3;
+    private static final int MAX_PRODUCTS_PER_DROP = 400;
 
-    /** Guard against a pathological expansion producing an unusable file. */
-    private static final int MAX_PRODUCTS_PER_ASTEROID = 400;
+    // ---------------------------------------------------------------------
+    // Reflection into net.minecraft. SRG first, MCP second.
+    // Names verified against GregTech's compiled bytecode:
+    //   func_82833_r()Ljava/lang/String;              getDisplayName
+    //   func_77960_j()I                               getItemDamage
+    //   func_77973_b()Lnet/minecraft/item/Item;       getItem
+    // ---------------------------------------------------------------------
+
+    private static Method find(Class<?> owner, String... names) {
+        for (String n : names) {
+            try {
+                Method m = owner.getMethod(n);
+                m.setAccessible(true);
+                return m;
+            } catch (Throwable ignored) { }
+        }
+        return null;
+    }
+
+    private static final Method M_DISPLAY = find(ItemStack.class, "func_82833_r", "getDisplayName");
+    private static final Method M_DAMAGE  = find(ItemStack.class, "func_77960_j", "getItemDamage");
+    private static final Method M_ITEM    = find(ItemStack.class, "func_77973_b", "getItem");
+
+    private static Object call(Method m, Object on) {
+        if (m == null || on == null) return null;
+        try { return m.invoke(on); } catch (Throwable t) { return null; }
+    }
+
+    private static Item itemOf(ItemStack s) {
+        Object o = call(M_ITEM, s);
+        return (o instanceof Item) ? (Item) o : null;
+    }
+
+    private static int damageOf(ItemStack s) {
+        Object o = call(M_DAMAGE, s);
+        return (o instanceof Integer) ? (Integer) o : 0;
+    }
+
+    private static String labelOf(ItemStack s) {
+        Object o = call(M_DISPLAY, s);
+        if (o instanceof String && !((String) o).isEmpty()) return (String) o;
+        return idOf(s);
+    }
+
+    /** modid:name:damage, via GameRegistry so no remapped field access is needed. */
+    private static String idOf(ItemStack s) {
+        Item it = itemOf(s);
+        if (it == null) return null;
+        GameRegistry.UniqueIdentifier u = GameRegistry.findUniqueIdentifierFor(it);
+        String base = (u == null) ? it.getClass().getName() : (u.modId + ":" + u.name);
+        return base + ":" + damageOf(s);
+    }
+
+    private static String wildIdOf(ItemStack s) {
+        Item it = itemOf(s);
+        if (it == null) return null;
+        GameRegistry.UniqueIdentifier u = GameRegistry.findUniqueIdentifierFor(it);
+        String base = (u == null) ? it.getClass().getName() : (u.modId + ":" + u.name);
+        return base + ":*";
+    }
+
+    // ---------------------------------------------------------------------
 
     @Mod.EventHandler
-    public void onServerStarting(FMLServerStartingEvent event) {
-        event.registerServerCommand(new DumpCommand());
-    }
-
-    // -----------------------------------------------------------------------
-    // Item identity
-    // -----------------------------------------------------------------------
-
-    /** Registry-name + damage. Stable, and readable in the output. */
-    private static String keyOf(ItemStack stack) {
-        if (stack == null || stack.getItem() == null) return null;
-        Object name = Item.itemRegistry.getNameForObject(stack.getItem());
-        return name + ":" + stack.getItemDamage();
-    }
-
-    /** Wildcard form, because GT recipe inputs frequently use damage 32767. */
-    private static String wildKeyOf(ItemStack stack) {
-        if (stack == null || stack.getItem() == null) return null;
-        return Item.itemRegistry.getNameForObject(stack.getItem()) + ":*";
-    }
-
-    private static String labelOf(ItemStack stack) {
-        if (stack == null) return "?";
+    public void onServerStarted(FMLServerStartedEvent event) {
+        int depth = DEFAULT_DEPTH;
         try {
-            return stack.getDisplayName();
+            depth = Integer.parseInt(System.getProperty("asteroiddump.depth",
+                    String.valueOf(DEFAULT_DEPTH)));
+        } catch (NumberFormatException ignored) { }
+        depth = Math.max(1, Math.min(6, depth));
+
+        try {
+            run(depth);
         } catch (Throwable t) {
-            // A few modded items throw when named outside a render context.
-            return String.valueOf(Item.itemRegistry.getNameForObject(stack.getItem()));
+            FMLLog.getLogger().error("[asteroiddump] failed", t);
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Recipe index
-    // -----------------------------------------------------------------------
 
     private static final class Step {
         final String machine;
@@ -110,45 +157,20 @@ public class AsteroidDump {
         Step(String machine, GTRecipe recipe) { this.machine = machine; this.recipe = recipe; }
     }
 
-    /** Processing maps only, in roughly the order ore actually flows. */
     private static Map<String, RecipeMap<?>> processingMaps() {
-        Map<String, RecipeMap<?>> maps = new LinkedHashMap<String, RecipeMap<?>>();
-        maps.put("macerator", RecipeMaps.maceratorRecipes);
-        maps.put("ore_washer", RecipeMaps.oreWasherRecipes);
-        maps.put("thermal_centrifuge", RecipeMaps.thermalCentrifugeRecipes);
-        maps.put("sifter", RecipeMaps.sifterRecipes);
-        maps.put("chemical_bath", RecipeMaps.chemicalBathRecipes);
-        maps.put("electromagnetic_separator", RecipeMaps.electroMagneticSeparatorRecipes);
-        maps.put("simple_washer", RecipeMaps.simpleWasherRecipes);
-        // Dust separation. These are what resolve the rare-earth and
-        // Naquadah Earth chains that no static source explains.
-        maps.put("centrifuge", RecipeMaps.centrifugeRecipes);
-        maps.put("electrolyzer", RecipeMaps.electrolyzerRecipes);
-        return maps;
-    }
-
-    private static Map<String, List<Step>> buildIndex(Map<String, RecipeMap<?>> maps) {
-        Map<String, List<Step>> byInput = new HashMap<String, List<Step>>();
-        for (Map.Entry<String, RecipeMap<?>> e : maps.entrySet()) {
-            Collection<GTRecipe> recipes;
-            try {
-                recipes = e.getValue().getAllRecipes();
-            } catch (Throwable t) {
-                continue;
-            }
-            for (GTRecipe r : recipes) {
-                if (r == null || r.mInputs == null) continue;
-                for (ItemStack in : r.mInputs) {
-                    String k = keyOf(in);
-                    if (k == null) continue;
-                    // Index under both the exact damage and a wildcard, because GT
-                    // recipe inputs routinely use damage 32767 to mean "any".
-                    add(byInput, k, new Step(e.getKey(), r));
-                    add(byInput, wildKeyOf(in), new Step(e.getKey(), r));
-                }
-            }
-        }
-        return byInput;
+        Map<String, RecipeMap<?>> m = new LinkedHashMap<String, RecipeMap<?>>();
+        m.put("macerator", RecipeMaps.maceratorRecipes);
+        m.put("ore_washer", RecipeMaps.oreWasherRecipes);
+        m.put("thermal_centrifuge", RecipeMaps.thermalCentrifugeRecipes);
+        m.put("sifter", RecipeMaps.sifterRecipes);
+        m.put("chemical_bath", RecipeMaps.chemicalBathRecipes);
+        m.put("electromagnetic_separator", RecipeMaps.electroMagneticSeparatorRecipes);
+        m.put("simple_washer", RecipeMaps.simpleWasherRecipes);
+        // Dust separation: what resolves the rare-earth and Naquadah Earth
+        // chains that no static source explains.
+        m.put("centrifuge", RecipeMaps.centrifugeRecipes);
+        m.put("electrolyzer", RecipeMaps.electrolyzerRecipes);
+        return m;
     }
 
     private static void add(Map<String, List<Step>> m, String k, Step s) {
@@ -158,65 +180,55 @@ public class AsteroidDump {
         l.add(s);
     }
 
-    // -----------------------------------------------------------------------
-    // Asteroid drops
-    // -----------------------------------------------------------------------
-
-    private static final class Drop {
-        final ItemStack stack;
-        final int chance;
-        Drop(ItemStack stack, int chance) { this.stack = stack; this.chance = chance; }
-    }
-
-    private static List<Drop> dropsOf(AsteroidData a) {
-        List<Drop> drops = new ArrayList<Drop>();
-        if (a.outputItems != null) {
-            for (int i = 0; i < a.outputItems.length; i++) {
-                ItemStack s = a.outputItems[i];
-                if (s != null) drops.add(new Drop(s, chanceAt(a, i)));
+    private static Map<String, List<Step>> buildIndex(Map<String, RecipeMap<?>> maps) {
+        Map<String, List<Step>> byInput = new HashMap<String, List<Step>>();
+        for (Map.Entry<String, RecipeMap<?>> e : maps.entrySet()) {
+            Collection<GTRecipe> recipes;
+            try { recipes = e.getValue().getAllRecipes(); }
+            catch (Throwable t) { continue; }
+            if (recipes == null) continue;
+            for (GTRecipe r : recipes) {
+                if (r == null || r.mInputs == null) continue;
+                for (ItemStack in : r.mInputs) {
+                    if (in == null) continue;
+                    Step st = new Step(e.getKey(), r);
+                    // Index exact and wildcard: GT inputs routinely use damage
+                    // 32767 to mean "any damage".
+                    add(byInput, idOf(in), st);
+                    add(byInput, wildIdOf(in), st);
+                }
             }
-            return drops;
         }
-        if (a.output == null || a.orePrefixes == null) return drops;
-        for (int i = 0; i < a.output.length; i++) {
-            Materials m = a.output[i];
-            if (m == null) continue;
-            ItemStack s = null;
-            try {
-                s = GTOreDictUnificator.get(a.orePrefixes, m, 1L);
-            } catch (Throwable ignored) { }
-            if (s != null) drops.add(new Drop(s, chanceAt(a, i)));
-        }
-        return drops;
+        return byInput;
     }
 
-    private static int chanceAt(AsteroidData a, int i) {
-        return (a.chances != null && i < a.chances.length) ? a.chances[i] : 0;
+    private static List<Step> stepsFor(ItemStack s, Map<String, List<Step>> index) {
+        List<Step> a = index.get(idOf(s));
+        List<Step> b = index.get(wildIdOf(s));
+        if (a == null) return b;
+        if (b == null) return a;
+        List<Step> both = new ArrayList<Step>(a);
+        both.addAll(b);
+        return both;
     }
-
-    // -----------------------------------------------------------------------
-    // Traversal
-    // -----------------------------------------------------------------------
 
     private static final class Found {
-        final String label;
-        final int depth;
-        final String via;
-        Found(String label, int depth, String via) {
-            this.label = label; this.depth = depth; this.via = via;
+        final String label; final int hops; final String via;
+        Found(String label, int hops, String via) {
+            this.label = label; this.hops = hops; this.via = via;
         }
     }
 
     private static Map<String, Found> walk(ItemStack seed, Map<String, List<Step>> index, int maxDepth) {
         Map<String, Found> found = new LinkedHashMap<String, Found>();
-        Set<String> visited = new HashSet<String>();
+        Set<String> seen = new HashSet<String>();
+        String sk = idOf(seed);
+        if (sk != null) seen.add(sk);
 
         List<ItemStack> frontier = new ArrayList<ItemStack>();
         frontier.add(seed);
-        String sk = keyOf(seed);
-        if (sk != null) visited.add(sk);
 
-        for (int depth = 1; depth <= maxDepth && !frontier.isEmpty(); depth++) {
+        for (int hop = 1; hop <= maxDepth && !frontier.isEmpty(); hop++) {
             List<ItemStack> next = new ArrayList<ItemStack>();
             for (ItemStack cur : frontier) {
                 List<Step> steps = stepsFor(cur, index);
@@ -224,11 +236,12 @@ public class AsteroidDump {
                 for (Step st : steps) {
                     if (st.recipe.mOutputs == null) continue;
                     for (ItemStack out : st.recipe.mOutputs) {
-                        String k = keyOf(out);
-                        if (k == null || visited.contains(k)) continue;
-                        visited.add(k);
-                        if (found.size() >= MAX_PRODUCTS_PER_ASTEROID) return found;
-                        found.put(k, new Found(labelOf(out), depth, st.machine));
+                        if (out == null) continue;
+                        String k = idOf(out);
+                        if (k == null || seen.contains(k)) continue;
+                        seen.add(k);
+                        if (found.size() >= MAX_PRODUCTS_PER_DROP) return found;
+                        found.put(k, new Found(labelOf(out), hop, st.machine));
                         next.add(out);
                     }
                 }
@@ -238,19 +251,36 @@ public class AsteroidDump {
         return found;
     }
 
-    private static List<Step> stepsFor(ItemStack stack, Map<String, List<Step>> index) {
-        List<Step> exact = index.get(keyOf(stack));
-        List<Step> wild = index.get(wildKeyOf(stack));
-        if (exact == null) return wild;
-        if (wild == null) return exact;
-        List<Step> both = new ArrayList<Step>(exact);
-        both.addAll(wild);
-        return both;
+    private static final class Drop {
+        final ItemStack stack; final int chance;
+        Drop(ItemStack stack, int chance) { this.stack = stack; this.chance = chance; }
     }
 
-    // -----------------------------------------------------------------------
-    // Output
-    // -----------------------------------------------------------------------
+    private static int chanceAt(AsteroidData a, int i) {
+        return (a.chances != null && i < a.chances.length) ? a.chances[i] : 0;
+    }
+
+    private static List<Drop> dropsOf(AsteroidData a) {
+        List<Drop> drops = new ArrayList<Drop>();
+        if (a.outputItems != null) {
+            // The four asteroids declared with explicit ItemStacks. Unreachable
+            // from outside the game, which is half the point of this mod.
+            for (int i = 0; i < a.outputItems.length; i++) {
+                if (a.outputItems[i] != null) drops.add(new Drop(a.outputItems[i], chanceAt(a, i)));
+            }
+            return drops;
+        }
+        if (a.output == null || a.orePrefixes == null) return drops;
+        for (int i = 0; i < a.output.length; i++) {
+            Materials m = a.output[i];
+            if (m == null) continue;
+            ItemStack s = null;
+            try { s = GTOreDictUnificator.get(a.orePrefixes, m, 1L); }
+            catch (Throwable ignored) { }
+            if (s != null) drops.add(new Drop(s, chanceAt(a, i)));
+        }
+        return drops;
+    }
 
     private static String esc(String s) {
         if (s == null) return "";
@@ -260,9 +290,9 @@ public class AsteroidDump {
             switch (c) {
                 case '"':  b.append("\\\""); break;
                 case '\\': b.append("\\\\"); break;
-                case '\n': b.append("\\n");  break;
-                case '\r': b.append("\\r");  break;
-                case '\t': b.append("\\t");  break;
+                case '\n': b.append("\\n"); break;
+                case '\r': b.append("\\r"); break;
+                case '\t': b.append("\\t"); break;
                 default:
                     if (c < 0x20) b.append(String.format("\\u%04x", (int) c));
                     else b.append(c);
@@ -271,90 +301,73 @@ public class AsteroidDump {
         return b.toString();
     }
 
-    private static class DumpCommand extends CommandBase {
-        public String getCommandName() { return "asteroiddump"; }
-        public String getCommandUsage(ICommandSender s) { return "/asteroiddump [depth]"; }
-        public int getRequiredPermissionLevel() { return 2; }
+    private static void log(String msg) {
+        FMLLog.getLogger().info("[asteroiddump] " + msg);
+    }
 
-        public void processCommand(ICommandSender sender, String[] args) {
-            int depth = MAX_DEPTH;
-            if (args.length > 0) {
-                try { depth = Math.max(1, Math.min(6, Integer.parseInt(args[0]))); }
-                catch (NumberFormatException ignored) { }
-            }
+    private static void run(int depth) throws IOException {
+        if (M_DISPLAY == null || M_ITEM == null) {
+            log("could not resolve ItemStack methods by SRG or MCP name -- aborting");
+            return;
+        }
 
-            reply(sender, "indexing recipe maps...");
-            Map<String, RecipeMap<?>> maps = processingMaps();
-            Map<String, List<Step>> index = buildIndex(maps);
-            reply(sender, "indexed " + index.size() + " distinct recipe inputs across "
-                    + maps.size() + " maps");
+        log("indexing recipe maps...");
+        Map<String, RecipeMap<?>> maps = processingMaps();
+        Map<String, List<Step>> index = buildIndex(maps);
+        log("indexed " + index.size() + " distinct inputs across " + maps.size() + " maps");
 
-            List<AsteroidData> asteroids = SpaceMiningRecipes.uniqueAsteroidList;
-            if (asteroids == null || asteroids.isEmpty()) {
-                reply(sender, "uniqueAsteroidList is empty -- is GT Intergalactic loaded?");
-                return;
-            }
+        List<AsteroidData> asteroids = SpaceMiningRecipes.uniqueAsteroidList;
+        if (asteroids == null || asteroids.isEmpty()) {
+            log("uniqueAsteroidList is empty -- GT Intergalactic not loaded?");
+            return;
+        }
 
-            File out = new File("asteroid_dump.json");
-            Writer w = null;
-            int totalProducts = 0;
-            try {
-                w = new OutputStreamWriter(new FileOutputStream(out), StandardCharsets.UTF_8);
-                w.write("{\n");
-                w.write("  \"depth\": " + depth + ",\n");
-                w.write("  \"asteroids\": [\n");
+        File out = new File("asteroid_dump.json");
+        Writer w = new OutputStreamWriter(new FileOutputStream(out), StandardCharsets.UTF_8);
+        int products = 0;
+        try {
+            w.write("{\n  \"depth\": " + depth + ",\n  \"asteroids\": [\n");
+            for (int ai = 0; ai < asteroids.size(); ai++) {
+                AsteroidData a = asteroids.get(ai);
+                w.write("    {\n");
+                w.write("      \"name\": \"" + esc(a.asteroidName) + "\",\n");
+                w.write("      \"moduleTier\": " + a.requiredModuleTier + ",\n");
+                w.write("      \"droneTier\": [" + a.minDroneTier + ", " + a.maxDroneTier + "],\n");
+                w.write("      \"distance\": [" + a.minDistance + ", " + a.maxDistance + "],\n");
+                w.write("      \"weight\": " + a.recipeWeight + ",\n");
+                w.write("      \"drops\": [\n");
 
-                for (int ai = 0; ai < asteroids.size(); ai++) {
-                    AsteroidData a = asteroids.get(ai);
-                    w.write("    {\n");
-                    w.write("      \"name\": \"" + esc(a.asteroidName) + "\",\n");
-                    w.write("      \"moduleTier\": " + a.requiredModuleTier + ",\n");
-                    w.write("      \"droneTier\": [" + a.minDroneTier + ", " + a.maxDroneTier + "],\n");
-                    w.write("      \"distance\": [" + a.minDistance + ", " + a.maxDistance + "],\n");
-                    w.write("      \"weight\": " + a.recipeWeight + ",\n");
-                    w.write("      \"drops\": [\n");
-
-                    List<Drop> drops = dropsOf(a);
-                    for (int di = 0; di < drops.size(); di++) {
-                        Drop d = drops.get(di);
-                        w.write("        {\n");
-                        w.write("          \"item\": \"" + esc(labelOf(d.stack)) + "\",\n");
-                        w.write("          \"id\": \"" + esc(keyOf(d.stack)) + "\",\n");
-                        w.write("          \"chance\": " + d.chance + ",\n");
-                        w.write("          \"breaksDownInto\": [\n");
-
-                        Map<String, Found> found = walk(d.stack, index, depth);
-                        totalProducts += found.size();
-                        int fi = 0;
-                        for (Map.Entry<String, Found> e : found.entrySet()) {
-                            Found f = e.getValue();
-                            w.write("            { \"item\": \"" + esc(f.label)
-                                    + "\", \"id\": \"" + esc(e.getKey())
-                                    + "\", \"hops\": " + f.depth
-                                    + ", \"via\": \"" + esc(f.via) + "\" }");
-                            w.write(++fi < found.size() ? ",\n" : "\n");
-                        }
-                        w.write("          ]\n");
-                        w.write(di + 1 < drops.size() ? "        },\n" : "        }\n");
+                List<Drop> drops = dropsOf(a);
+                for (int di = 0; di < drops.size(); di++) {
+                    Drop d = drops.get(di);
+                    w.write("        {\n");
+                    w.write("          \"item\": \"" + esc(labelOf(d.stack)) + "\",\n");
+                    w.write("          \"id\": \"" + esc(idOf(d.stack)) + "\",\n");
+                    w.write("          \"chance\": " + d.chance + ",\n");
+                    w.write("          \"breaksDownInto\": [\n");
+                    Map<String, Found> found = walk(d.stack, index, depth);
+                    products += found.size();
+                    int fi = 0;
+                    for (Map.Entry<String, Found> e : found.entrySet()) {
+                        Found f = e.getValue();
+                        w.write("            { \"item\": \"" + esc(f.label)
+                              + "\", \"id\": \"" + esc(e.getKey())
+                              + "\", \"hops\": " + f.hops
+                              + ", \"via\": \"" + esc(f.via) + "\" }");
+                        w.write(++fi < found.size() ? ",\n" : "\n");
                     }
-                    w.write("      ]\n");
-                    w.write(ai + 1 < asteroids.size() ? "    },\n" : "    }\n");
+                    w.write("          ]\n");
+                    w.write(di + 1 < drops.size() ? "        },\n" : "        }\n");
                 }
-                w.write("  ]\n}\n");
-            } catch (IOException e) {
-                reply(sender, "write failed: " + e.getMessage());
-                return;
-            } finally {
-                if (w != null) try { w.close(); } catch (IOException ignored) { }
+                w.write("      ]\n");
+                w.write(ai + 1 < asteroids.size() ? "    },\n" : "    }\n");
             }
-
-            reply(sender, "wrote " + out.getAbsolutePath());
-            reply(sender, asteroids.size() + " asteroids, " + totalProducts
-                    + " breakdown products at depth " + depth);
+            w.write("  ]\n}\n");
+        } finally {
+            try { w.close(); } catch (IOException ignored) { }
         }
 
-        private void reply(ICommandSender s, String msg) {
-            s.addChatMessage(new ChatComponentText("[asteroiddump] " + msg));
-        }
+        log("wrote " + out.getAbsolutePath());
+        log(asteroids.size() + " asteroids, " + products + " breakdown products at depth " + depth);
     }
 }

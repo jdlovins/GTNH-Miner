@@ -20,14 +20,51 @@ about what an ore becomes.
 
 ## Use
 
-Drop the jar in `mods/`, start the server, then:
+Drop the jar in `mods/` and start the server, or load any world in singleplayer.
+It runs once on server start and writes `asteroid_dump.json` to the game
+directory. Read-only: it registers no recipes and changes no world state. Remove
+the jar afterwards.
 
-    /asteroiddump        walk 3 hops (default)
-    /asteroiddump 1      raw drops only
-    /asteroiddump 2      through ore processing
+Depth defaults to 3 hops. Override with `-Dasteroiddump.depth=2`.
 
-Writes `asteroid_dump.json` to the server working directory. Read-only: it
-registers no recipes, changes no world state, and can be removed afterwards.
+There is deliberately no command. See below.
+
+## The obfuscation trap
+
+Forge 1.7.10 remaps `net.minecraft` MEMBERS to SRG names at runtime -- class
+names survive, method and field names do not. A dev-environment build handles
+this by reobfuscating MCP -> SRG on the way out. This mod is compiled by hand
+against the pack's jars with no such step, so any direct call to a
+`net.minecraft` method resolves to a name that does not exist at runtime.
+
+v1.0 implemented `ICommand` and crashed the server at registration:
+
+    AbstractMethodError: ... does not define or inherit ... func_71517_b()
+
+which is `getCommandName()`. Compiling cleanly proved nothing, because the
+compiler was looking at MCP names that the runtime does not have.
+
+v1.1 therefore touches no `net.minecraft` member at all:
+
+- runs off `FMLServerStartedEvent` instead of a command (FML is never remapped)
+- identifies items via `GameRegistry.findUniqueIdentifierFor`, also FML
+- reaches the three `ItemStack` methods it needs by reflection, SRG name first
+  and MCP name second, so it works in either environment
+- calls GregTech / BartWorks / Intergalactic directly, as mod classes are not
+  remapped
+
+The SRG names were read out of GregTech's own bytecode, not recalled:
+
+    func_82833_r()Ljava/lang/String;           getDisplayName
+    func_77960_j()I                            getItemDamage
+    func_77973_b()Lnet/minecraft/item/Item;    getItem
+
+Verify a build is safe with:
+
+    javap -p -c build/classes/asteroiddump/*.class | grep -E "(Method|Field) net/minecraft/"
+
+That must print nothing. `net/minecraft` may appear as a TYPE; it must never
+appear as a member reference.
 
 ## Traversal
 
