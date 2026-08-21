@@ -585,6 +585,7 @@ local function tryDispatch(mod, asteroid, droneKey)
   if not drill or (drill.kits or 0) < minKits then return false end
 
   local jobId = nodeId .. "-" .. os.time() .. "-M" .. mod.index
+  mod.lastDispatchAt = os.time()   -- fairness ordering, see dispatchBatch
   mod.status = "LOADING"
   mod.job = {
     jobId = jobId,
@@ -723,6 +724,24 @@ local function dispatchBatch()
     end
   end
   if #pool == 0 then return end
+
+  -- Hand work to the module that has waited longest.
+  --
+  -- The assignment loop below walks this pool BACKWARDS (it removes entries as
+  -- it goes, which is only safe in that direction), so whatever sits at the end
+  -- is served first. Unsorted, that was always the highest-numbered idle module
+  -- -- and when drones or kits run out before the pool does, the low-numbered
+  -- ones never get a turn at all. With three drones and six modules, M1 and M2
+  -- simply never mined.
+  --
+  -- Sort most-recently-used first so the least-recently-used lands at the end.
+  -- Modules that have never run sort as 0 and go first, which is what gets a
+  -- freshly added module its first job.
+  table.sort(pool, function(a, b)
+    local ta, tb = a.lastDispatchAt or 0, b.lastDispatchAt or 0
+    if ta ~= tb then return ta > tb end
+    return a.index > b.index   -- deterministic tie-break; lowest index served first
+  end)
 
   local needs = findNeedsList()
   if #needs == 0 then return end
