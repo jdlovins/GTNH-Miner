@@ -264,6 +264,13 @@ IDLE ──[JOB_ASSIGN]──► LOADING ──[load ok + started]──► RUNN
 ```
 
 **Item loading sequence (confirmed in-game API path):**
+Consumables are stocked as **totals across the input bus**, not per slot.
+`config.tipsPerLoad` / `rodsPerLoad` default to 128 — two stacks each — because a
+slot holds only 64, and one stack per consumable meant a module stopped to reload
+twice as often. Slot 1 holds the drone; tips and rods fill from slot 2 onward, so
+a 128/128 load needs five bus slots. Drop both back to 64 if a module ever
+refuses to run with consumables spread over more than one slot.
+
 1. `iface.store({label=name}, dbAddress, slot)` — write item fingerprint from ME into the shared database
 2. `iface.setInterfaceConfiguration(slot, dbAddress, dbSlot, count)` — tell the interface to pull those items from ME into its buffer
 3. Poll `transposer.getSlotStackSize(interfaceSide, slot)` until expected counts appear

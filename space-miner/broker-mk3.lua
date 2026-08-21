@@ -354,14 +354,36 @@ local function restockPinned(mod)
     return nil, 0
   end
 
+  -- Where should a refill land? Prefer a partly filled stack of the same item,
+  -- otherwise the first empty slot. busTotal already counts the whole bus, but
+  -- the transfer used to target the FIRST slot holding the item -- which, once a
+  -- load spans more than one stack, is usually the full one, so the move landed
+  -- nothing and the module ran dry anyway. Slot 1 is the drone; start at 2.
+  local function destFor(label)
+    local firstEmpty
+    for s = 2, busSize do
+      local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, s)
+      if not st or (st.size or 0) == 0 then
+        firstEmpty = firstEmpty or s
+      elseif st.label == label then
+        local room = (st.maxSize or 64) - (st.size or 0)
+        if room > 0 then return s, room end
+      end
+    end
+    if firstEmpty then return firstEmpty, 64 end
+    return nil, 0
+  end
+
   -- Refill one consumable in the bus back up to `target` from the ME interface.
   local function refill(label, target, cfgSlot, dbSlot)
     if mod.status ~= "RUNNING" then return end
-    local have, slot = busTotal(label)
+    local have = busTotal(label)
     local deficit = target - have
     if deficit <= 0 then return end
-    slot = slot or cfgSlot
-    mod.iface.setInterfaceConfiguration(cfgSlot, dbAddr, dbSlot, target)
+    local dst, room = destFor(label)
+    if not dst then return end
+    -- One stack at a time: that is all an interface buffer slot holds.
+    mod.iface.setInterfaceConfiguration(cfgSlot, dbAddr, dbSlot, math.min(deficit, 64))
     sched.await(function() return (select(1, findBuf(label))) ~= nil end, 5, 0.2)
     if mod.status ~= "RUNNING" then
       mod.iface.setInterfaceConfiguration(cfgSlot)
@@ -369,7 +391,12 @@ local function restockPinned(mod)
     end
     local src = select(1, findBuf(label))
     if src then
-      mod.transposer.transferItem(mod.conf.interfaceSide, mod.conf.inputBusSide, deficit, src, slot)
+      -- Re-pick the destination: the module has been consuming while we waited.
+      local d, r = destFor(label)
+      if d then
+        mod.transposer.transferItem(mod.conf.interfaceSide, mod.conf.inputBusSide,
+                                    math.min(deficit, r), src, d)
+      end
     end
     mod.iface.setInterfaceConfiguration(cfgSlot) -- stop hoarding the buffer between refills
   end

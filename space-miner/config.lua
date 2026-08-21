@@ -2959,11 +2959,23 @@ config.ports = {
 -- Accounts for ore processing pipeline delay (ore → ore factory → dust storage).
 config.pipelineCheckDelay = 30
 
--- How many drill tips and rods to stock per module load. The loader requests
--- this many from the ME interface; the broker won't dispatch unless at least
--- this many kits are available in stock.
-config.tipsPerLoad = 64
-config.rodsPerLoad = 64
+-- How many drill tips and rods to stock per module load, in ITEMS.
+--
+-- These are totals across the input bus, not per slot. A slot holds one stack
+-- (64), so anything above that is spread over additional bus slots -- slot 1 is
+-- the drone, and tips and rods fill from slot 2 onwards. The bus needs enough
+-- free slots for the total you ask for, and the loader stops filling when it
+-- runs out of room rather than failing.
+--
+-- 128 is two stacks each, which halves how often a module stops to reload. Drop
+-- back to 64 if a module ever refuses to run with consumables spread over more
+-- than one slot.
+--
+-- The broker will not dispatch unless at least this many kits are in stock, so
+-- raising it also raises the dispatch floor -- keep config.drillPar comfortably
+-- above it.
+config.tipsPerLoad = 128
+config.rodsPerLoad = 128
 
 -- Par levels for drill consumables. The broker publishes this table to the hw
 -- telem node (DRILL_PAR on config.ports.hardware); the node compares it against

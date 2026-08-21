@@ -35,7 +35,8 @@ local ARRIVE_TIMEOUT    = 15   -- max wait for the DRONE to reach the interface 
 local POLL_INTERVAL     = 0.2  -- how often to re-check while awaiting
 local TIPS_PER_DEFAULT  = 64   -- drill tips to stock (config.tipsPerLoad overrides)
 local RODS_PER_DEFAULT  = 64   -- drill rods to stock (config.rodsPerLoad overrides)
-local FILL_ROUNDS       = 10   -- how many times fill() re-requests before giving up
+local FILL_ROUNDS       = 10   -- re-request rounds per STACK before giving up
+local STACK_DEFAULT     = 64   -- fallback when a stack does not report maxSize
 
 -- Map a module index to its three dedicated database slots.
 local function dbSlotsFor(modIndex)
@@ -232,27 +233,84 @@ function loader.run(mod, job, deps)
   --    failed the whole load if the ME had only trickled in 40. This re-requests
   --    and moves the deficit, up to FILL_ROUNDS times, so a slow or contended ME
   --    still completes the load instead of erroring out.
-  local function busCount(busSlot, label)
-    local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, busSlot)
-    if st and st.label == label then return st.size or 0 end
-    return 0
+  -- Consumables are counted and placed across the WHOLE bus, not one fixed slot.
+  --
+  -- An inventory slot holds a single stack, so a target above the stack size
+  -- cannot land in one slot: the old code drove bus slot 2 towards `target` and,
+  -- asked for more than 64, would spin FILL_ROUNDS times and fail with
+  -- "tip shortfall: got 64/128". Spreading across slots is what lets the module
+  -- carry more than one stack of buffer and idle less between reloads.
+  --
+  -- Slot 1 is reserved for the drone, which is not consumed, so scanning starts
+  -- at 2.
+  local busSlots = mod.transposer.getInventorySize(mod.conf.inputBusSide) or 16
+
+  local function busTotal(label)
+    local total = 0
+    for s = 2, busSlots do
+      local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, s)
+      if st and st.label == label then total = total + (st.size or 0) end
+    end
+    return total
   end
 
-  local function fill(label, target, busSlot, dbSlot)
-    for _ = 1, FILL_ROUNDS do
-      local have = busCount(busSlot, label)
+  -- Where should the next transfer land? Prefer a partly filled stack of this
+  -- item, otherwise the first empty slot. Returns the slot and the room in it.
+  local function destFor(label)
+    local firstEmpty
+    for s = 2, busSlots do
+      local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, s)
+      if not st or (st.size or 0) == 0 then
+        firstEmpty = firstEmpty or s
+      elseif st.label == label then
+        local cap  = st.maxSize or STACK_DEFAULT
+        local room = cap - (st.size or 0)
+        if room > 0 then return s, room end
+      end
+    end
+    if firstEmpty then return firstEmpty, STACK_DEFAULT end
+    return nil, 0
+  end
+
+  -- How big is a stack of this item, per the game rather than an assumption?
+  local function stackCap(label)
+    local s = findSlot(label, 1)
+    if s then
+      local st = mod.transposer.getStackInSlot(mod.conf.interfaceSide, s)
+      if st and st.maxSize then return st.maxSize end
+    end
+    return STACK_DEFAULT
+  end
+
+  local function fill(label, target, cfgSlot, dbSlot)
+    -- More stacks legitimately need more rounds; a fixed budget would fail a
+    -- healthy multi-stack load on a contended ME.
+    local rounds = FILL_ROUNDS * math.max(1, math.ceil(target / STACK_DEFAULT))
+    for _ = 1, rounds do
+      local have    = busTotal(label)
       local deficit = target - have
       if deficit <= 0 then return true end
-      mod.iface.setInterfaceConfiguration(busSlot, dbAddr, dbSlot, target)
+
+      -- Ask the ME for at most one stack at a time: that is all the interface
+      -- buffer will hold in a slot anyway.
+      local cap = stackCap(label)
+      mod.iface.setInterfaceConfiguration(cfgSlot, dbAddr, dbSlot, math.min(deficit, cap))
       sched.await(function() return findSlot(label, 1) ~= nil end, 3, POLL_INTERVAL)
+
       local src = findSlot(label, 1)
       if src then
+        local dst, room = destFor(label)
+        if not dst then
+          -- Bus is full of other things; nothing more we can do.
+          return busTotal(label) >= target
+        end
         mod.transposer.transferItem(
-          mod.conf.interfaceSide, mod.conf.inputBusSide, deficit, src, busSlot)
+          mod.conf.interfaceSide, mod.conf.inputBusSide,
+          math.min(deficit, room), src, dst)
       end
       sched.sleep(POLL_INTERVAL)
     end
-    return busCount(busSlot, label) >= target
+    return busTotal(label) >= target
   end
 
   -- Verify the right drone landed before committing tips and rods (catches a
@@ -265,11 +323,11 @@ function loader.run(mod, job, deps)
   end
   if not fill(drillEntry.tip, TIPS_PER, 2, slotTip) then
     clearInterfaceSlots(mod)
-    return false, "tip shortfall: got " .. busCount(2, drillEntry.tip) .. "/" .. TIPS_PER
+    return false, "tip shortfall: got " .. busTotal(drillEntry.tip) .. "/" .. TIPS_PER
   end
   if not fill(drillEntry.rod, RODS_PER, 3, slotRod) then
     clearInterfaceSlots(mod)
-    return false, "rod shortfall: got " .. busCount(3, drillEntry.rod) .. "/" .. RODS_PER
+    return false, "rod shortfall: got " .. busTotal(drillEntry.rod) .. "/" .. RODS_PER
   end
 
   clearInterfaceSlots(mod)
