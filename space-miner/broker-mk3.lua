@@ -1300,10 +1300,19 @@ local function buildDetail(name)
       -- it lands, so its stock never accumulates -- tracking it would leave a
       -- condition permanently at 0 and mine that asteroid forever. The ore is
       -- shown as provenance and is what the module item filter wants.
-      local dust = o.dust or o.item
-      if matchesFilter(dust) or matchesFilter(o.item) then
-        rows[#rows + 1] = { kind = "item", item = dust, source = o.item,
-                            chance = o.chance, direct = true }
+      --
+      -- dust = nil means processing yields no dust of that material (Platinum
+      -- Ore gives Platinum Metallic Powder Dust, Redstone Ore gives an Impure
+      -- Pile). Those are shown but NOT selectable, so nobody can tick the ore
+      -- and recreate the always-starved condition.
+      if o.dust then
+        if matchesFilter(o.dust) or matchesFilter(o.item) then
+          rows[#rows + 1] = { kind = "item", item = o.dust, source = o.item,
+                              chance = o.chance, hops = o.hops, direct = true }
+        end
+      elseif matchesFilter(o.item) then
+        rows[#rows + 1] = { kind = "note",
+          text = o.item .. "  -- no dust of this material; add the real one below" }
       end
     end
   else
