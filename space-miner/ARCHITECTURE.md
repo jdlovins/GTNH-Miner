@@ -354,7 +354,7 @@ dust watchlist:
   payloadType = "DRILL_PAR",
   data        = {
     par   = { ["Steel Drill Tip"] = 256, ["Steel Rod"] = 256, ... },
-    slots = 1   -- max concurrent crafts (config.drillCraftSlots)
+    slots = 2   -- max concurrent crafts (config.drillCraftSlots)
   }
 }
 ```

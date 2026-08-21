@@ -2997,7 +2997,11 @@ config.rodsPerLoad = 64
 -- one-CPU network means one craft starts and the rest come back rejected --
 -- which read as hard failures on both dashboards and re-fired every retry.
 -- Shortfalls beyond this limit wait quietly as "queued" instead.
-config.drillCraftSlots = 1
+--
+-- Setting this HIGHER than your CPU count is the failure mode to avoid: the
+-- surplus requests are rejected on arrival and show as REJECTED. Setting it
+-- lower only makes restocking slower, so when in doubt round down.
+config.drillCraftSlots = 2
 
 config.drillPar = {
   steel         = { tips = 256, rods = 256 },

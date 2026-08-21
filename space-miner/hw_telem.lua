@@ -568,7 +568,10 @@ while true do
           -- a material it stopped publishing -- because you removed it from
           -- config.drillPar, or because you no longer hold a drone that uses
           -- it -- actually stops being ordered.
-          par   = msg.data.par
+          par = msg.data.par
+          -- Absent-value fallback, not the shipped default (config sets 2).
+          -- A broker that does not tell us the CPU count gets the conservative
+          -- answer: too few slots is slow, too many is rejected requests.
           slots = tonumber(msg.data.slots) or 1
           if slots < 1 then slots = 1 end
         end

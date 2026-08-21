@@ -2118,6 +2118,11 @@ local function broadcastDrillPar()
     payloadType = "DRILL_PAR",
     -- The node cannot read config.lua, so the concurrency limit rides along
     -- with the par table rather than being configured over there.
+    --
+    -- The `or 1` is the absent-value case, not the default -- config ships 2.
+    -- An older config.lua tells us nothing about the CPU count, and guessing
+    -- low only slows restocking whereas guessing high produces rejected
+    -- requests. Leave it at 1.
     data        = { par = list, slots = config.drillCraftSlots or 1 },
   }))
   local n = 0

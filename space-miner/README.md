@@ -157,7 +157,7 @@ counts.
 
 Par is published only for materials this base can actually consume — drill keys
 reachable from a drone you currently hold, plus whatever busy modules are using.
-No MK-XI, no Cosmic Neutronium crafting. And `config.drillCraftSlots` (default 1)
+No MK-XI, no Cosmic Neutronium crafting. And `config.drillCraftSlots` (default 2)
 caps how many crafts run at once, matched to your AE2 crafting CPUs: AE2 cancels
 requests when no CPU is free, so anything over the limit waits as `queued`
 instead of being fired and rejected.
@@ -418,7 +418,8 @@ Three files, three writers, one writer each. They never overwrite each other.
   Par is not edited by the in-game editor — hand-edit `user_config.lua` for this
   one. Keep any par at or above `config.tipsPerLoad` (64) or a module can still
   stall while nominally "at par". `config.drillCraftSlots` sets how many crafts
-  may run at once; set it to your AE2 crafting CPU count.
+  may run at once; set it to your AE2 crafting CPU count. Rounding down only
+  slows restocking, whereas setting it too high produces rejected requests.
 
 The editor only persists mappings that are genuinely yours, compared against
 `config.shippedDustTargets` — the snapshot taken before the overlay is applied.
