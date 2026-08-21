@@ -1175,6 +1175,7 @@ local ed = {
   open = false, items = {}, view = {}, enabled = {}, threshold = {},
   sel = 1, scroll = 0, filter = nil, filtering = false,
   msg = "", msgColor = 0x888888,
+  dirty = true,   -- repaint only when something actually changed
 }
 
 local function edSay(m, c) ed.msg = m; ed.msgColor = c or 0x888888 end
@@ -1343,16 +1344,21 @@ local EX_MARK, EX_NAME = 2, 6
 local EX_TGT, EX_HAVE, EX_AST = 44, 55, 68
 
 local function edDraw()
+  -- Never blank the whole screen here. Filling W x H and then repainting it
+  -- leaves a visible empty frame between the two, which is exactly the flicker
+  -- the dashboard panels had. Every row below clears only itself.
   gpu.setBackground(0x000000)
-  gpu.fill(1, 1, W, H, " ")
 
+  gpu.fill(1, 1, W, 1, " ")
   gpu.setForeground(0x00FF00)
   term.setCursor(2, 1); io.write("CONDITION EDITOR")
+  gpu.fill(1, 2, W, 1, " ")
   gpu.setForeground(0x888888)
   term.setCursor(2, 2)
   io.write(string.format("%d mineable  |  %d enabled  |  click target to cycle  |  modules keep running",
     #ed.items, edCount()))
 
+  gpu.fill(1, 4, W, 1, " ")
   gpu.setForeground(0x888888)
   term.setCursor(EX_NAME, 4); io.write("ITEM")
   term.setCursor(EX_TGT, 4);  io.write("TARGET")
@@ -1362,12 +1368,15 @@ local function edDraw()
   for r = 0, edRows() - 1 do
     local y   = edFirst() + r
     local idx = ed.view[ed.scroll + r + 1]
+
+    -- One fill per row, doubling as the selection highlight. Rows past the end
+    -- of the list get cleared too, so a shrinking filter leaves no ghosts.
+    gpu.setBackground((ed.scroll + r + 1 == ed.sel and idx) and 0x222222 or 0x000000)
+    gpu.fill(1, y, W, 1, " ")
+
     if idx then
       local it = ed.items[idx]
       local on = ed.enabled[it.name]
-      if ed.scroll + r + 1 == ed.sel then
-        gpu.setBackground(0x222222); gpu.fill(1, y, W, 1, " ")
-      end
       gpu.setForeground(on and 0x00FFFF or 0x555555)
       term.setCursor(EX_MARK, y); io.write(on and "[x]" or "[ ]")
       term.setCursor(EX_NAME, y); io.write(it.name:sub(1, EX_TGT - EX_NAME - 1))
@@ -1391,6 +1400,8 @@ local function edDraw()
   end
 
   local by = H - 1
+  gpu.setBackground(0x000000)
+  gpu.fill(1, by, W, 1, " ")
   for _, b in ipairs(edButtons) do
     gpu.setBackground(0x333333); gpu.setForeground(0xFFFFFF)
     term.setCursor(b.x1, by); io.write(b.label)
@@ -1401,6 +1412,8 @@ local function edDraw()
     math.min(ed.scroll + edRows(), #ed.view), #ed.view)
   term.setCursor(W - #pos - 1, by); io.write(pos)
 
+  gpu.setBackground(0x000000)
+  gpu.fill(1, H, W, 1, " ")
   term.setCursor(2, H)
   if ed.filtering then
     gpu.setForeground(0xFFAA00)
@@ -1550,13 +1563,14 @@ while true do
   local ev = { event.pull(0.01) }
   if ev[1] == "modem_message" then
     processMessage(table.unpack(ev))
+    if ed.open then ed.dirty = true end   -- HAVE values may have moved
 
   elseif ed.open then
     -- The editor owns input while it is up, but ONLY input. Execution still
     -- falls through to sched.tick() and stepModules() below, so loads in flight
     -- keep progressing while someone edits. That is the whole reason this is a
     -- UI mode rather than a separate blocking program.
-    if edHandle(ev) then lastUIDraw = 0 end
+    if edHandle(ev) then ed.dirty = true end
 
   elseif ev[1] == "scroll" then
     -- ev = { "scroll", screenAddr, x, y, direction, player }
@@ -1570,7 +1584,7 @@ while true do
     ed.open = true
     edBuild()
     edSay("click a row to toggle, click its target to cycle -- mining continues")
-    lastUIDraw = 0
+    ed.dirty = true
   end
 
   -- A save inside the editor rewrites config.conditions and applies it live, so
@@ -1615,8 +1629,17 @@ while true do
   --    three-panel repaint is the most expensive thing we do; throttling it
   --    frees the loop to tick the scheduler hundreds of times per second.
   local up = computer.uptime()
-  if up - lastUIDraw >= UI_INTERVAL then
-    if ed.open then edDraw() else drawUI() end
+  if ed.open then
+    -- Event-driven: repaint when the editor changed, plus a slow tick so live
+    -- HAVE values from telemetry still refresh. Repainting a full-screen list
+    -- four times a second was the other half of the flicker.
+    if ed.dirty or (up - lastUIDraw >= 2.0) then
+      edDraw()
+      ed.dirty   = false
+      lastUIDraw = up
+    end
+  elseif up - lastUIDraw >= UI_INTERVAL then
+    drawUI()
     lastUIDraw = up
   end
 end
