@@ -2954,4 +2954,49 @@ config.logging = {
   bootUnixTime = 0,
 }
 
+--------------------------------------------------------------------------------
+-- USER OVERLAY
+--
+-- Everything above this line is SHIPPED data: hand-maintained tables plus the
+-- generated asteroidOutputs block. It gets regenerated and updated wholesale,
+-- so nothing you change in game may live here -- it would be overwritten the
+-- next time this file is refreshed.
+--
+-- Your choices live in /home/user_config.lua instead, which only the in-game
+-- editor (press E on the broker) ever writes. One writer per file, so the two
+-- can never clobber each other.
+--
+-- The overlay is optional. With no user_config.lua present the shipped
+-- defaults are used exactly as before.
+--
+--   conditions   REPLACED by yours if present -- what you track is entirely
+--                your call, not something a shipped default should fight.
+--   dustTargets  MERGED over the shipped table, so new mappings you add are
+--                added and existing ones can be corrected, while everything you
+--                have not touched keeps following updates to this file.
+--------------------------------------------------------------------------------
+
+-- Snapshot before merging so the editor can tell which entries are genuinely
+-- yours and only persist those. Without this it could not distinguish a shipped
+-- mapping from one you added, and would have to write all 100-odd back out --
+-- freezing them and masking every future correction.
+config.shippedDustTargets = {}
+for item, t in pairs(config.dustTargets) do
+  config.shippedDustTargets[item] = { asteroid = t.asteroid, priority = t.priority }
+end
+
+do
+  local ok, user = pcall(dofile, "/home/user_config.lua")
+  if ok and type(user) == "table" then
+    if type(user.dustTargets) == "table" then
+      for item, t in pairs(user.dustTargets) do
+        config.dustTargets[item] = { asteroid = t.asteroid, priority = t.priority }
+      end
+    end
+    if type(user.conditions) == "table" and #user.conditions > 0 then
+      config.conditions = user.conditions
+    end
+  end
+end
+
 return config

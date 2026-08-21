@@ -1185,7 +1185,7 @@ end
 --       / filter       s save           esc back, or close at the top level
 -- =============================================================================
 
-local EDITOR_CONFIG_PATH = "/home/config.lua"
+local USER_CONFIG_PATH   = "/home/user_config.lua"
 local QUOTE              = string.char(34)
 local TARGET_LADDER      = { 1000000, 2000000, 5000000, 10000000, 25000000, 50000000, 100000000 }
 local DEFAULT_TARGET     = 5000000
@@ -1510,127 +1510,90 @@ end
 -- SAVE
 -- ---------------------------------------------------------------------------
 
--- Escape Lua pattern magic so item labels with -, (, ) match literally.
-local function esc(s)
-  return (s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"))
-end
-
 local function fmtQtyLiteral(n)
   if n >= 1000000 and n % 1000000 == 0 then return string.format("%dm", n / 1000000) end
   if n >= 1000    and n % 1000    == 0 then return string.format("%dk", n / 1000) end
   return tostring(n)
 end
 
--- conditions: regenerated wholesale. The block carries a header saying the
--- editor owns it, and every known item appears so it reads as a menu.
-local function rebuildConditionsBlock()
-  local items = {}
-  local seen = {}
-  for item in pairs(ed.targets) do if not seen[item] then seen[item] = true; items[#items+1] = item end end
-  for item in pairs(ed.enabled) do if not seen[item] then seen[item] = true; items[#items+1] = item end end
-  table.sort(items, function(a, b)
-    local ta, tb = ed.targets[a], ed.targets[b]
-    local aa = ta and ta.asteroid or "~"
-    local ab = tb and tb.asteroid or "~"
-    if aa ~= ab then return aa < ab end
-    return a < b
-  end)
-
-  local out = { "config.conditions = {",
-    "  -- Managed by the broker condition editor (press E).",
-    "  -- Grouped by asteroid. Commented entries are disabled, not deleted." }
-  local lastAst
-  for _, item in ipairs(items) do
-    local t  = ed.targets[item]
-    local ast = t and t.asteroid or nil
-    if ast ~= lastAst then
-      out[#out + 1] = "  -- ---- " .. (ast or "NO ASTEROID -- cannot dispatch") .. " ----"
-      lastAst = ast
-    end
-    out[#out + 1] = (ed.enabled[item] and "  " or "  --  ") ..
-      string.format("{ itemName = %-34s amountToMaintain = qty(%s%s%s) },",
-        QUOTE .. item .. QUOTE .. ",", QUOTE,
-        fmtQtyLiteral(ed.threshold[item] or DEFAULT_TARGET), QUOTE)
-  end
-  out[#out + 1] = "}"
-  return table.concat(out, "\n")
-end
-
--- dustTargets: edited surgically. It holds hand-written section banners and
--- notes, so it is never regenerated -- existing lines are rewritten in place
--- and genuinely new entries are appended under one marked section.
-local function applyDustTargets(src)
-  local head = src:find("config%.dustTargets%s*=%s*{")
-  if not head then return nil, "could not find config.dustTargets" end
-  local tail = src:find("\n}", head)
-  if not tail then return nil, "could not find the end of config.dustTargets" end
-
-  local block   = src:sub(head, tail)
-  local changed = 0
-
-  for item, t in pairs(ed.targets) do
-    local pat = "%[" .. QUOTE .. esc(item) .. QUOTE .. "%]%s*=%s*%b{}"
-    if block:find(pat) then
-      local repl = string.format("[%s%s%s]%s= { asteroid = %s%s%s, priority = %d }",
-        QUOTE, item, QUOTE, string.rep(" ", math.max(1, 26 - #item)),
-        QUOTE, t.asteroid, QUOTE, t.priority or 99)
-      local new = block:gsub(pat, (repl:gsub("%%", "%%%%")), 1)
-      if new ~= block then block = new; changed = changed + 1 end
-    end
-  end
-
-  -- Append anything not already in the file.
-  local additions = {}
-  for item, t in pairs(ed.targets) do
-    local pat = "%[" .. QUOTE .. esc(item) .. QUOTE .. "%]"
-    if not block:find(pat) then
-      additions[#additions + 1] = string.format(
-        "  [%s%s%s]%s= { asteroid = %s%s%s, priority = %d },",
-        QUOTE, item, QUOTE, string.rep(" ", math.max(1, 26 - #item)),
-        QUOTE, t.asteroid, QUOTE, t.priority or 99)
-    end
-  end
-  if #additions > 0 then
-    table.sort(additions)
-    -- The last existing entry may have no trailing comma -- the shipped
-    -- config ends with Naquadria Dust and no comma. Appending straight
-    -- after it would run two table fields together and corrupt the file.
-    block = block:gsub("%s*$", "")
-    if not block:match(",$") then block = block .. "," end
-    block = block .. "\n\n  -- === ADDED IN-GAME ===\n"
-                  .. table.concat(additions, "\n") .. "\n"
-    changed = changed + #additions
-  end
-
-  return src:sub(1, head - 1) .. block .. src:sub(tail + 1), nil, changed, #additions
-end
+-- ---------------------------------------------------------------------------
+-- SAVE
+--
+-- Writes ONLY /home/user_config.lua. config.lua is shipped data -- hand-kept
+-- tables plus the generated asteroidOutputs block -- and gets regenerated
+-- wholesale, so anything written there would be destroyed on the next update.
+-- One writer per file: this editor owns user_config.lua and nothing else, and
+-- nothing else ever writes it.
+--
+-- Only mappings that are genuinely yours are persisted, worked out against
+-- config.shippedDustTargets, the snapshot config.lua takes before applying the
+-- overlay. Writing all of them back would freeze the shipped table and mask
+-- every future label correction.
+-- ---------------------------------------------------------------------------
 
 local function edSave()
-  local f = io.open(EDITOR_CONFIG_PATH, "r")
-  if not f then edSay("cannot read config.lua", 0xFF4444) return end
-  local src = f:read("*a"); f:close()
+  local shipped = config.shippedDustTargets or {}
 
-  local newSrc, err, changed, added = applyDustTargets(src)
-  if not newSrc then edSay(err, 0xFF4444) return end
-
-  local head = newSrc:find("config%.conditions%s*=%s*{")
-  local tail = head and newSrc:find("\n}", head)
-  if not head or not tail then
-    edSay("could not locate config.conditions", 0xFF4444) return
+  local mine = {}
+  local mineCount = 0
+  for item, t in pairs(ed.targets) do
+    local sh = shipped[item]
+    if not sh or sh.asteroid ~= t.asteroid or sh.priority ~= t.priority then
+      mine[item] = t
+      mineCount = mineCount + 1
+    end
   end
-  newSrc = newSrc:sub(1, head - 1) .. rebuildConditionsBlock() .. newSrc:sub(tail + 2)
 
-  local w = io.open(EDITOR_CONFIG_PATH, "w")
-  if not w then edSay("cannot write config.lua", 0xFF4444) return end
-  w:write(newSrc); w:close()
+  local conds = {}
+  for item in pairs(ed.enabled) do conds[#conds + 1] = item end
+  table.sort(conds)
 
-  -- Apply live: rebuilding in memory beats re-reading the file, which every
-  -- other subsystem already holds references into.
+  local out = {}
+  out[#out + 1] = "-- user_config.lua"
+  out[#out + 1] = "--"
+  out[#out + 1] = "-- Written by the broker condition editor (press E). Safe to hand-edit."
+  out[#out + 1] = "-- Nothing else writes this file, and config.lua updates never touch it."
+  out[#out + 1] = "--"
+  out[#out + 1] = "--   conditions   what to keep in stock. Replaces the shipped list."
+  out[#out + 1] = "--   dustTargets  mappings you added or corrected. Merged over the"
+  out[#out + 1] = "--                shipped table, so untouched entries still follow"
+  out[#out + 1] = "--                config.lua."
+  out[#out + 1] = ""
+  out[#out + 1] = "return {"
+
+  out[#out + 1] = "  conditions = {"
+  for _, item in ipairs(conds) do
+    local t = ed.targets[item]
+    local ast = t and t.asteroid or nil
+    out[#out + 1] = string.format("    { itemName = %-38s amountToMaintain = %-10d },%s",
+      QUOTE .. item .. QUOTE .. ",", ed.threshold[item] or DEFAULT_TARGET,
+      ast and ("   -- " .. ast) or "   -- NO ASTEROID: cannot dispatch")
+  end
+  out[#out + 1] = "  },"
+
+  out[#out + 1] = "  dustTargets = {"
+  local names = {}
+  for item in pairs(mine) do names[#names + 1] = item end
+  table.sort(names)
+  for _, item in ipairs(names) do
+    local t = mine[item]
+    out[#out + 1] = string.format("    [%s%s%s] = { asteroid = %s%s%s, priority = %d },",
+      QUOTE, item, QUOTE, QUOTE, t.asteroid, QUOTE, t.priority or 99)
+  end
+  out[#out + 1] = "  },"
+  out[#out + 1] = "}"
+
+  local w = io.open(USER_CONFIG_PATH, "w")
+  if not w then edSay("cannot write " .. USER_CONFIG_PATH, 0xFF4444) return end
+  w:write(table.concat(out, "\n") .. "\n")
+  w:close()
+
+  -- Apply live. Rebuilding in memory beats re-reading, which every other
+  -- subsystem already holds references into.
   local fresh = {}
-  for item in pairs(ed.enabled) do
+  for _, item in ipairs(conds) do
     fresh[#fresh + 1] = { itemName = item, amountToMaintain = ed.threshold[item] or DEFAULT_TARGET }
   end
-  table.sort(fresh, function(a, b) return a.itemName < b.itemName end)
   config.conditions = fresh
 
   for item, t in pairs(ed.targets) do
@@ -1646,15 +1609,10 @@ local function edSave()
   brokerState.dust   = newDust
   dustScroll         = 0
   edRequestWatchlist = true
-  ed.added           = {}
 
-  edSay(string.format("saved: %d tracked, %d mappings updated, %d new -- applied live",
-    #fresh, changed - added, added), 0x00FF00)
+  edSay(string.format("saved %d tracked, %d own mappings -> user_config.lua, applied live",
+    #conds, mineCount), 0x00FF00)
 end
-
--- ---------------------------------------------------------------------------
--- DRAW
--- ---------------------------------------------------------------------------
 
 local edButtons = {}
 local function edLayoutButtons()

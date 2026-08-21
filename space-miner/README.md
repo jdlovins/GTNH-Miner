@@ -365,3 +365,29 @@ The single broker is limited by the host computer's component budget (≈6 modul
 - **Draconic Core** — always capped at 1 parallel regardless of module tier due to its 7.8 M EU/t draw per parallel. The broker enforces this automatically.
 - **Distances > 200** — some entries in the optimization matrix are `201`+ (optimizer result exceeded the valid range). The broker clamps all dispatched distances to 200.
 - **Component budget** — 6 modules × 3 components (module adapter + ME Interface adapter + transposer) = 18 + ~4 overhead (modem, GPU, database, computer) = 22 of the 32 OC component limit per computer.
+
+## Config file ownership
+
+Three tables, three writers, one file each. They never overwrite each other.
+
+| file | written by | contains |
+|---|---|---|
+| `config.lua` | this repo | shipped tables plus the generated `asteroidOutputs` block. Regenerated wholesale, so never hand-edit it in game. |
+| `user_config.lua` | the in-game editor (press `E`) | what you track and any dust→asteroid mappings you added. Safe to hand-edit. |
+| `job_node_config.lua` | `detect_module` / `detect_sides` | your hardware addresses and transposer sides. |
+
+`config.lua` applies `user_config.lua` as an overlay at the end:
+
+- **`conditions`** — yours replaces the shipped list outright. What you stock is
+  your call.
+- **`dustTargets`** — yours merges over the shipped table, so mappings you added
+  or corrected win, while everything you have not touched keeps following
+  updates to `config.lua`.
+
+The editor only persists mappings that are genuinely yours, compared against
+`config.shippedDustTargets` — the snapshot taken before the overlay is applied.
+Writing all of them back would freeze the shipped table and mask every future
+label correction.
+
+`user_config.lua` is optional. Without it the shipped defaults apply exactly as
+before, so a fresh install needs nothing extra.
