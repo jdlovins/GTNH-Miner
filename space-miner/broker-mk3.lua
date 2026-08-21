@@ -725,22 +725,36 @@ local function dispatchBatch()
   end
   if #pool == 0 then return end
 
-  -- Hand work to the module that has waited longest.
+  -- Decide which modules get the work when there is not enough to go round.
   --
   -- The assignment loop below walks this pool BACKWARDS (it removes entries as
-  -- it goes, which is only safe in that direction), so whatever sits at the end
-  -- is served first. Unsorted, that was always the highest-numbered idle module
-  -- -- and when drones or kits run out before the pool does, the low-numbered
-  -- ones never get a turn at all. With three drones and six modules, M1 and M2
-  -- simply never mined.
+  -- it goes, which is only safe in that direction), so whatever sits at the END
+  -- is served first. Unsorted that was simply the highest-numbered idle module,
+  -- which is array position -- meaningless as a policy. Whenever drones, kits
+  -- or the per-asteroid cap ran out before the pool did, the same low-numbered
+  -- modules lost every time, permanently.
   --
-  -- Sort most-recently-used first so the least-recently-used lands at the end.
-  -- Modules that have never run sort as 0 and go first, which is what gets a
-  -- freshly added module its first job.
+  -- Order by module tier first. A load is 64 tips and rods whatever the tier,
+  -- and the total work it buys is the same either way -- an MK-III burns 32 a
+  -- cycle for 2 cycles, an MK-I burns 8 for 8, both 16 parallel-runs per load.
+  -- What differs is elapsed time: the MK-III is done in a quarter of it. So
+  -- when only some modules can run, the higher tier is strictly better --
+  -- same consumables, same drone, sooner.
+  --
+  -- Least-recently-used breaks ties, so equals rotate instead of one of them
+  -- starving. Modules that have never run sort oldest and go first, which is
+  -- what gets a freshly added module its first job.
+  local function parallelsOf(mod)
+    local t = config.moduleTiers[mod.tier]
+    return (t and t.maxParallels) or 0
+  end
+
   table.sort(pool, function(a, b)
+    local pa, pb = parallelsOf(a), parallelsOf(b)
+    if pa ~= pb then return pa < pb end          -- weakest first => strongest at the end
     local ta, tb = a.lastDispatchAt or 0, b.lastDispatchAt or 0
-    if ta ~= tb then return ta > tb end
-    return a.index > b.index   -- deterministic tie-break; lowest index served first
+    if ta ~= tb then return ta > tb end          -- most recent first => LRU at the end
+    return a.index > b.index                     -- deterministic; lowest index served first
   end)
 
   local needs = findNeedsList()
