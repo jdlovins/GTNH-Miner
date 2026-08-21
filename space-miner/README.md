@@ -396,6 +396,16 @@ Three files, three writers, one writer each. They never overwrite each other.
 |---|---|---|
 | `config.lua` | this repo | shipped tables plus the generated `asteroidOutputs` block. Regenerated wholesale, so never hand-edit it in game. |
 | `user_config.lua` | the in-game editor (press `E`) | what you track, any dust→asteroid mappings you added, and your drill par overrides. Safe to hand-edit. |
+
+Pressing `E` does not open the editor immediately: it starts a ten second
+countdown during which **no new jobs are dispatched**, so loads already running
+can finish and the broker drains to idle. The editor competes with the loader
+for OpenComputers' per-tick component call budget, so it is least responsive
+exactly when the broker is busiest — quiescing first is what makes it fast. Work
+in flight is never interrupted, which is why this is a countdown rather than a
+pause: freezing the scheduler would let loader timeouts expire against the wall
+clock and fail a load that was fine. `esc` cancels the countdown, and dispatch
+stays suspended for as long as the editor is open.
 | `job_node_config.lua` | `detect_module` / `detect_sides` | your hardware addresses and transposer sides. |
 
 `config.lua` applies `user_config.lua` as an overlay at the end:

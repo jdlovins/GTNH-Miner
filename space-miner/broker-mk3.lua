@@ -2143,6 +2143,58 @@ local UI_INTERVAL = 0.25 -- seconds between full UI repaints
 local lastUIDraw  = 0
 
 -- ---------------------------------------------------------------------------
+-- QUIESCING BEFORE THE EDITOR
+--
+-- The editor competes with the loader for the per-tick component call budget,
+-- so it is least responsive exactly when the broker is busiest. Rather than
+-- pause work mid-flight -- which risks failing a load, since every loader wait
+-- is measured against computer.uptime() and would time out while frozen -- stop
+-- handing out NEW jobs and let the in-flight ones land on their own.
+--
+-- Pressing "e" therefore starts a countdown instead of opening immediately.
+-- Dispatch is suspended for its duration; loads already running finish
+-- untouched. By the time the editor appears the broker has gone quiet.
+--
+-- If loads are still running when the countdown ends we keep waiting rather
+-- than open into the exact contention this exists to avoid -- but only up to
+-- QUIESCE_GRACE, so a wedged module cannot lock you out of the editor.
+-- ---------------------------------------------------------------------------
+local QUIESCE_SECONDS = 10   -- countdown before the editor opens
+local QUIESCE_GRACE   = 20   -- extra wait for in-flight loads, then open anyway
+
+local edPending = nil        -- { openAt, hardAt } while counting down
+local edPendingShown = nil   -- last text painted, so we only repaint on change
+
+local function modulesLoading()
+  local n = 0
+  for _, mod in ipairs(modules) do
+    if mod.status == "LOADING" then n = n + 1 end
+  end
+  return n
+end
+
+-- A small centred box over the panels. Deliberately drawn on top rather than
+-- replacing the UI: the panels keep updating behind it, so it is obvious the
+-- broker is still alive and finishing what it started.
+local function drawQuiesce(line1, line2)
+  local w  = 52
+  local x  = math.max(1, math.floor((W - w) / 2))
+  local y  = math.max(1, math.floor(H / 2) - 2)
+  gpu.setBackground(0x000000)
+  for i = 0, 4 do gpu.fill(x, y + i, w, 1, " ") end
+  gpu.setForeground(0x00AAFF)
+  gpu.fill(x, y, w, 1, "=")
+  gpu.fill(x, y + 4, w, 1, "=")
+  gpu.setForeground(0xFFAA00)
+  gpu.set(x + math.max(0, math.floor((w - #line1) / 2)), y + 1, line1)
+  gpu.setForeground(0x888888)
+  gpu.set(x + math.max(0, math.floor((w - #line2) / 2)), y + 2, line2)
+  gpu.setForeground(0x555555)
+  local hint = "esc to cancel"
+  gpu.set(x + math.max(0, math.floor((w - #hint) / 2)), y + 3, hint)
+end
+
+-- ---------------------------------------------------------------------------
 -- DUST WATCHLIST
 -- The dust node cannot scan an ME network of thousands of item types and fit the
 -- result in one modem packet, so it needs a list to filter against. That list
@@ -2290,14 +2342,30 @@ while true do
       lastUIDraw = 0                      -- repaint now, do not wait for the tick
     end
 
-  elseif ev[1] == "key_down" and ev[3] == 101 then   -- "e" opens the editor
-    ed.open = true
-    -- drawUI has been painting over this screen; the row cache describes what
-    -- was there before, so it is now a lie. Drop it.
-    edInvalidate()
-    edBuild()
-    edSay("click a row to toggle, click its target to cycle -- mining continues")
-    ed.dirty = true
+  elseif ev[1] == "key_down" and ev[3] == 101 and not edPending then  -- "e"
+    -- Do not open yet: start quiescing. See QUIESCING above.
+    local up = computer.uptime()
+    edPending = { openAt = up + QUIESCE_SECONDS, hardAt = up + QUIESCE_SECONDS + QUIESCE_GRACE }
+    edPendingShown = nil
+
+  elseif ev[1] == "key_down" and ev[4] == 1 and edPending then       -- esc
+    edPending, edPendingShown = nil, nil
+    lastUIDraw = 0   -- wipe the box on the next pass
+  end
+
+  -- Countdown, and the handover into the editor.
+  if edPending then
+    local up = computer.uptime()
+    if up >= edPending.openAt and (modulesLoading() == 0 or up >= edPending.hardAt) then
+      edPending, edPendingShown = nil, nil
+      ed.open = true
+      -- drawUI has been painting over this screen; the row cache describes what
+      -- was there before, so it is now a lie. Drop it.
+      edInvalidate()
+      edBuild()
+      edSay("new jobs paused while this is open -- esc to resume mining")
+      ed.dirty = true
+    end
   end
 
   -- A save inside the editor rewrites config.conditions and applies it live, so
@@ -2339,9 +2407,30 @@ while true do
       ed.dirty   = false
       lastUIDraw = up
     end
-  elseif up - lastUIDraw >= UI_INTERVAL then
-    drawUI()
-    lastUIDraw = up
+  else
+    if up - lastUIDraw >= UI_INTERVAL then
+      drawUI()
+      lastUIDraw = up
+      edPendingShown = nil   -- the panels just painted over the box
+    end
+    if edPending then
+      local left = math.max(0, math.ceil(edPending.openAt - up))
+      local n    = modulesLoading()
+      local l1, l2
+      if left > 0 then
+        l1 = "OPENING EDIT MENU IN " .. left
+        l2 = (n > 0) and ("new jobs paused -- " .. n .. " load(s) finishing")
+                      or "new jobs paused -- broker going idle"
+      else
+        l1 = "WAITING FOR " .. n .. " LOAD(S) TO FINISH"
+        l2 = "opens anyway in " .. math.max(0, math.ceil(edPending.hardAt - up)) .. "s"
+      end
+      local shown = l1 .. "|" .. l2
+      if edPendingShown ~= shown then
+        drawQuiesce(l1, l2)
+        edPendingShown = shown
+      end
+    end
   end
 
   -- 3. Advance every in-flight load task. This is the hot path — runs every
@@ -2360,9 +2449,12 @@ while true do
         and (brokerState.lastFluidSyncTime > 0)
   end
 
-  -- 6. Dispatch on its own cadence.
+  -- 6. Dispatch on its own cadence -- unless we are quiescing for the editor or
+  --    it is already open. Existing work is never interrupted; we simply stop
+  --    starting more, so the broker drains to idle and stays there.
   local now = os.time()
-  if brokerState.telemetryReady and (now - lastDispatchCheck >= DISPATCH_INTERVAL) then
+  if brokerState.telemetryReady and not ed.open and not edPending
+     and (now - lastDispatchCheck >= DISPATCH_INTERVAL) then
     dispatchBatch()
     lastDispatchCheck = now
   end
