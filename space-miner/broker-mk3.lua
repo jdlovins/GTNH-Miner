@@ -775,6 +775,20 @@ end
 -- TELEMETRY
 -- =============================================================================
 
+-- Bumped whenever anything the editor DISPLAYS changes: the row list itself,
+-- what is tracked, a target, or the dust stock behind the HAVE column.
+--
+-- The painter uses it to skip rows it does not need to look at. Without it
+-- edDraw rebuilt all ~44 rows' cell tables and signature strings on every
+-- repaint just to discover nothing had moved -- cheap in GPU calls after the
+-- caching change, but real Lua work, and OpenComputers Lua is slow enough that
+-- it showed up as choppy keyboard response.
+--
+-- Navigation does NOT bump it: moving the selection changes two rows, and those
+-- are caught by the selected flag in the row key instead.
+local edGen = 0
+local function edTouch() edGen = edGen + 1 end
+
 local function processMessage(evType, _, _, _, _, rawMsg)
   if evType ~= "modem_message" then return end
   local ok, msg = pcall(serial.unserialize, rawMsg)
@@ -791,6 +805,7 @@ local function processMessage(evType, _, _, _, _, rawMsg)
       local d = brokerState.dust[name]
       if d then d.stock = entry.stock or 0 end
     end
+    edTouch()   -- HAVE column is derived from this
     brokerState.lastDustSyncTime = os.time()
     brokerState.lastDustSync = os.date("%X")
   elseif msg.payloadType == "FLUID_UPDATE" and msg.data.plasmas then
@@ -1486,6 +1501,7 @@ local function buildItems()
 end
 
 local function edRebuild()
+  edTouch()
   if ed.mode == "asteroids" then
     ed.rows = buildAsteroids()
   elseif ed.mode == "detail" then
@@ -1541,6 +1557,7 @@ end
 -- ---------------------------------------------------------------------------
 
 local function edToggle(item, asteroid)
+  edTouch()
   if ed.enabled[item] then
     ed.enabled[item] = nil
     edSay("stopped tracking " .. item)
@@ -1564,6 +1581,7 @@ local function edToggle(item, asteroid)
 end
 
 local function edCycleTarget(item)
+  edTouch()
   local cur = ed.threshold[item] or 0
   local nxt = TARGET_LADDER[1]
   for _, v in ipairs(TARGET_LADDER) do
@@ -1819,14 +1837,15 @@ local function edScrollBlock()
   edCache = moved
 end
 
-local function edPaint(y, bg, cells)
-  local sig = tostring(bg)
-  for i = 1, #cells do
-    local c = cells[i]
-    sig = sig .. "\1" .. c[1] .. "\2" .. c[3] .. "\2" .. c[2]
-  end
-  if edCache[y] == sig then return end
-  edCache[y] = sig
+-- cells = { {x, s, fg}, ... }, painted left to right over a cleared row.
+--
+-- `key` identifies the content rather than describing it. Two rows with the
+-- same key are guaranteed to hold identical content, so the caller can skip
+-- building the cells at all -- which is the expensive part in Lua terms, not
+-- the painting.
+local function edPaint(y, key, bg, cells)
+  if edCache[y] == key then return end
+  edCache[y] = key
 
   if edBG ~= bg then gpu.setBackground(bg); edBG = bg end
   gpu.fill(1, y, W, 1, " ")
@@ -1837,6 +1856,10 @@ local function edPaint(y, bg, cells)
   end
 end
 
+-- True when row y already shows exactly this content, so the caller can skip
+-- past it without constructing anything at all.
+local function edFresh(y, key) return edCache[y] == key end
+
 local function edDraw()
   local title
   if ed.mode == "asteroids" then
@@ -1846,21 +1869,22 @@ local function edDraw()
   else
     title = "CONDITION EDITOR  /  all tracked items"
   end
-  edPaint(1, 0x000000, { { 2, title, 0x00FF00 } })
+  edPaint(1, title, 0x000000, { { 2, title, 0x00FF00 } })
 
   local n = 0
   for _ in pairs(ed.enabled) do n = n + 1 end
-  edPaint(2, 0x000000, { { 2, string.format(
+  local hint = string.format(
     "%d tracked  |  enter=open  space=toggle  t=target  a=add  /=find  s=save  esc=back%s",
-    n, ed.filter and ("  |  filter: " .. ed.filter) or ""), 0x888888 } })
+    n, ed.filter and ("  |  filter: " .. ed.filter) or "")
+  edPaint(2, hint, 0x000000, { { 2, hint, 0x888888 } })
 
   if ed.mode == "asteroids" then
-    edPaint(4, 0x000000, {
+    edPaint(4, "h:ast", 0x000000, {
       { X_NAME, "ASTEROID", 0x888888 }, { X_A, "MODULE", 0x888888 },
       { X_B, "DRONES", 0x888888 },      { X_C, "TRACKED", 0x888888 },
     })
   else
-    edPaint(4, 0x000000, {
+    edPaint(4, "h:" .. ed.mode, 0x000000, {
       { X_NAME, "ITEM", 0x888888 },  { X_A, "TARGET", 0x888888 },
       { X_B, "HAVE", 0x888888 },
       { X_C, ed.mode == "detail" and "VIA" or "ASTEROID", 0x888888 },
@@ -1874,8 +1898,15 @@ local function edDraw()
     local idx = ed.scroll + r + 1
     local row = ed.rows[idx]
 
-    local bg = (idx == ed.sel and row and row.kind ~= "header" and row.kind ~= "note")
-               and 0x222222 or 0x000000
+    local sel = (idx == ed.sel and row and row.kind ~= "header" and row.kind ~= "note")
+    -- Content is fully determined by which list entry is here, whether it is
+    -- selected, and the model generation. Same key means the row on screen is
+    -- already right, so skip it before building a single table.
+    local key = idx .. (sel and "*" or "-") .. edGen
+    if edFresh(y, key) then goto continue end
+
+    do
+    local bg = sel and 0x222222 or 0x000000
     local cells = {}
 
     if row then
@@ -1927,7 +1958,9 @@ local function edDraw()
       end
     end
 
-    edPaint(y, bg, cells)
+    edPaint(y, key, bg, cells)
+    end
+    ::continue::
   end
 
   edLayoutButtons()
@@ -1939,14 +1972,17 @@ local function edDraw()
   local pos = string.format("%d-%d/%d", math.min(ed.scroll + 1, #ed.rows),
     math.min(ed.scroll + edRows(), #ed.rows), #ed.rows)
   cells[#cells+1] = { W - #pos - 1, pos, 0x888888 }
-  edPaint(by, 0x000000, cells)
+  edPaint(by, "b:" .. pos .. ":" .. #edButtons, 0x000000, cells)
 
   if ed.input then
-    edPaint(H, 0x000000, { { 2, ed.input.label .. " " .. ed.input.buffer .. "_", 0xFFAA00 } })
+    local t = ed.input.label .. " " .. ed.input.buffer .. "_"
+    edPaint(H, "i:" .. t, 0x000000, { { 2, t, 0xFFAA00 } })
   elseif ed.filtering then
-    edPaint(H, 0x000000, { { 2, "/" .. (ed.filter or "") .. "_    enter=keep  esc=clear", 0xFFAA00 } })
+    local t = "/" .. (ed.filter or "") .. "_    enter=keep  esc=clear"
+    edPaint(H, "f:" .. t, 0x000000, { { 2, t, 0xFFAA00 } })
   else
-    edPaint(H, 0x000000, { { 2, ed.msg:sub(1, W - 2), ed.msgColor } })
+    local t = ed.msg:sub(1, W - 2)
+    edPaint(H, "m:" .. t .. ":" .. tostring(ed.msgColor), 0x000000, { { 2, t, ed.msgColor } })
   end
 end
 
