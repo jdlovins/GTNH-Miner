@@ -1150,51 +1150,200 @@ end
 -- =============================================================================
 -- CONDITION EDITOR  (press E on the dashboard)
 --
--- Runs as a UI MODE, not a modal dialog. The main loop keeps calling
--- sched.tick() and stepModules() the whole time this is open, so loads in
--- flight are unaffected. A blocking prompt here could stall a load past
--- ARRIVE_TIMEOUT and fail it.
+-- Asteroid-first. Pick an asteroid, see what it yields, choose what to stock.
 --
--- That constraint shapes the input design: there is no typed-number entry.
--- Targets cycle through a preset ladder, and the filter is incremental (press
--- / then type). Every keystroke is just another event through the same loop.
+-- WHY IT IS SHAPED THIS WAY:
+--   config.conditions says WHAT to maintain. config.dustTargets says WHICH
+--   asteroid yields it. An entry only ever dispatches if both exist and the
+--   item label matches the ME label exactly; otherwise it fails silently as a
+--   permanent 0%, which reads as "we have none of this, mine it urgently".
 --
--- The menu is config.dustTargets, because a condition only dispatches if
--- dustTargets has an entry for that exact itemName -- that is how the broker
--- finds which asteroid to mine. Conditions without one are listed last, marked
--- NOT MINEABLE, and preserved on save rather than silently dropped.
+--   config.asteroidOutputs holds each asteroid's DIRECT yield, extracted from
+--   the installed jar, so those are exact. Everything downstream of ore
+--   processing -- Invar, Graphene, Cerium, the rare-earth line -- lives in
+--   thousands of runtime recipe registrations and cannot be derived here. So
+--   downstream items are TYPED IN by hand. That is not a shortcut; it is the
+--   only correct option, and the editor's job is to make it quick and to keep
+--   the two config tables consistent with each other.
+--
+-- SEMANTICS:
+--   dustTargets is a MAPPING (where an item comes from). Toggling something off
+--   never deletes it -- "Invar comes from the Nickel asteroid" stays true
+--   whether or not you currently want Invar. Turning something ON writes the
+--   mapping if it is missing, because at that point the asteroid is known.
+--   conditions is the PREFERENCE (what to actually stock).
+--
+-- RUNS AS A UI MODE, NOT A MODAL DIALOG:
+--   The main loop keeps calling sched.tick() and stepModules() the whole time
+--   this is open, so loads in flight keep progressing. That rules out
+--   term.read(): a blocking prompt could stall a load past ARRIVE_TIMEOUT and
+--   fail it. All text entry is incremental instead -- every keystroke arrives
+--   as an ordinary event through the same loop.
+--
+-- KEYS: up/down/pgup/pgdn/home/end move   enter drill in / commit
+--       space toggle   t cycle target   a add downstream item
+--       / filter       s save           esc back, or close at the top level
 -- =============================================================================
 
 local EDITOR_CONFIG_PATH = "/home/config.lua"
 local QUOTE              = string.char(34)
 local TARGET_LADDER      = { 1000000, 2000000, 5000000, 10000000, 25000000, 50000000, 100000000 }
+local DEFAULT_TARGET     = 5000000
 
 local edRequestWatchlist = false   -- set on save; main loop re-broadcasts
 
 local ed = {
-  open = false, items = {}, view = {}, enabled = {}, threshold = {},
-  sel = 1, scroll = 0, filter = nil, filtering = false,
+  open = false,
+  mode = "asteroids",          -- "asteroids" | "detail" | "items"
+  asteroid = nil,              -- selected asteroid while in detail mode
+  rows = {},                   -- row model for the current mode
+  sel = 1, scroll = 0,
+  filter = nil, filtering = false,
+  input = nil,                 -- { label, buffer, onCommit }
+  enabled = {}, threshold = {},-- working copy of config.conditions
+  targets = {},                -- working copy of config.dustTargets
+  added = {},                  -- items newly mapped this session
   msg = "", msgColor = 0x888888,
-  dirty = true,   -- repaint only when something actually changed
+  dirty = true,
 }
 
 local function edSay(m, c) ed.msg = m; ed.msgColor = c or 0x888888 end
 
-local function edRows()  return H - 6 end     -- rows 5 .. H-2 hold the list
+local function edRows()  return H - 6 end   -- rows 5 .. H-2 hold the list
 local function edFirst() return 5 end
 
-local function edRebuildView()
-  ed.view = {}
-  for i, it in ipairs(ed.items) do
-    if not ed.filter or ed.filter == ""
-       or it.name:lower():find(ed.filter, 1, true)
-       or (it.asteroid or ""):lower():find(ed.filter, 1, true) then
-      ed.view[#ed.view + 1] = i
+-- ---------------------------------------------------------------------------
+-- MODEL
+-- ---------------------------------------------------------------------------
+
+local function edLoad()
+  ed.enabled, ed.threshold, ed.targets, ed.added = {}, {}, {}, {}
+  for _, cond in ipairs(config.conditions) do
+    ed.enabled[cond.itemName]   = true
+    ed.threshold[cond.itemName] = cond.amountToMaintain
+  end
+  for item, t in pairs(config.dustTargets) do
+    ed.targets[item] = { asteroid = t.asteroid, priority = t.priority or 99 }
+  end
+end
+
+local function outputsFor(name)
+  return (config.asteroidOutputs or {})[name]
+end
+
+-- Items mapped to this asteroid that are NOT one of its direct yields.
+local function downstreamFor(name)
+  local direct = {}
+  for _, o in ipairs(outputsFor(name) or {}) do direct[o.item] = true end
+  local list = {}
+  for item, t in pairs(ed.targets) do
+    if t.asteroid == name and not direct[item] then list[#list + 1] = item end
+  end
+  table.sort(list)
+  return list
+end
+
+local function trackedCount(name)
+  local n = 0
+  for item, t in pairs(ed.targets) do
+    if t.asteroid == name and ed.enabled[item] then n = n + 1 end
+  end
+  return n
+end
+
+local function nextPriority(name)
+  local p = 0
+  for _, t in pairs(ed.targets) do
+    if t.asteroid == name and t.priority and t.priority < 90 and t.priority > p then
+      p = t.priority
     end
   end
-  if ed.sel > #ed.view then ed.sel = #ed.view end
+  return p + 1
+end
+
+local function matchesFilter(s)
+  if not ed.filter or ed.filter == "" then return true end
+  return s:lower():find(ed.filter, 1, true) ~= nil
+end
+
+local function buildAsteroids()
+  local rows = {}
+  local names = {}
+  for name in pairs(config.asteroids) do names[#names + 1] = name end
+  table.sort(names)
+  for _, name in ipairs(names) do
+    if matchesFilter(name) then
+      local a = config.asteroids[name]
+      rows[#rows + 1] = {
+        kind = "asteroid", name = name,
+        tier = a.minModule or 1,
+        drones = string.format("%d-%d", a.minDrone or 0, a.maxDrone or 0),
+        tracked = trackedCount(name),
+        direct = outputsFor(name) ~= nil,
+      }
+    end
+  end
+  return rows
+end
+
+local function buildDetail(name)
+  local rows = {}
+  local outs = outputsFor(name)
+
+  rows[#rows + 1] = { kind = "header",
+    text = outs and "DIRECT YIELD  (from the jar, exact)"
+                 or "DIRECT YIELD  -- none derivable for this asteroid" }
+  if outs then
+    for _, o in ipairs(outs) do
+      if matchesFilter(o.item) then
+        rows[#rows + 1] = { kind = "item", item = o.item, chance = o.chance, direct = true }
+      end
+    end
+  else
+    rows[#rows + 1] = { kind = "note",
+      text = "this asteroid uses mod-specific item stacks; add its outputs below" }
+  end
+
+  rows[#rows + 1] = { kind = "header", text = "DOWNSTREAM  (typed in by hand)" }
+  local down = downstreamFor(name)
+  if #down == 0 then
+    rows[#rows + 1] = { kind = "note", text = "none yet -- press A to add one" }
+  end
+  for _, item in ipairs(down) do
+    if matchesFilter(item) then
+      rows[#rows + 1] = { kind = "item", item = item, direct = false }
+    end
+  end
+  return rows
+end
+
+local function buildItems()
+  local seen, list = {}, {}
+  for item in pairs(ed.targets)  do if not seen[item] then seen[item] = true; list[#list+1] = item end end
+  for item in pairs(ed.enabled)  do if not seen[item] then seen[item] = true; list[#list+1] = item end end
+  table.sort(list)
+  local rows = {}
+  for _, item in ipairs(list) do
+    if matchesFilter(item) then
+      local t = ed.targets[item]
+      rows[#rows + 1] = { kind = "item", item = item, direct = false,
+                          asteroid = t and t.asteroid or nil, showAsteroid = true }
+    end
+  end
+  return rows
+end
+
+local function edRebuild()
+  if ed.mode == "asteroids" then
+    ed.rows = buildAsteroids()
+  elseif ed.mode == "detail" then
+    ed.rows = buildDetail(ed.asteroid)
+  else
+    ed.rows = buildItems()
+  end
+  if ed.sel > #ed.rows then ed.sel = #ed.rows end
   if ed.sel < 1 then ed.sel = 1 end
-  local maxScroll = math.max(0, #ed.view - edRows())
+  local maxScroll = math.max(0, #ed.rows - edRows())
   if ed.scroll > maxScroll then ed.scroll = maxScroll end
   if ed.scroll < 0 then ed.scroll = 0 end
 end
@@ -1205,115 +1354,247 @@ local function edFollow()
   if ed.scroll < 0 then ed.scroll = 0 end
 end
 
+-- Headers and notes are not selectable; step over them.
+local function edMoveSel(delta)
+  local n = #ed.rows
+  if n == 0 then return end
+  local i = ed.sel
+  for _ = 1, n do
+    i = i + delta
+    if i < 1 then i = 1 break end
+    if i > n then i = n break end
+    local k = ed.rows[i] and ed.rows[i].kind
+    if k ~= "header" and k ~= "note" then break end
+  end
+  ed.sel = i
+  edFollow()
+end
+
+local function selectedRow()
+  local r = ed.rows[ed.sel]
+  if r and (r.kind == "header" or r.kind == "note") then return nil end
+  return r
+end
+
+-- Entry point used by the main loop when E is pressed.
 local function edBuild()
-  ed.enabled, ed.threshold, ed.items = {}, {}, {}
-  for _, cond in ipairs(config.conditions) do
-    ed.enabled[cond.itemName]   = true
-    ed.threshold[cond.itemName] = cond.amountToMaintain
-  end
-  for name, entry in pairs(config.dustTargets) do
-    ed.items[#ed.items + 1] = {
-      name = name, asteroid = entry.asteroid, priority = entry.priority or 99,
-      mineable = true, known = config.asteroids[entry.asteroid] ~= nil,
-    }
-  end
-  for _, cond in ipairs(config.conditions) do
-    if not config.dustTargets[cond.itemName] then
-      ed.items[#ed.items + 1] = { name = cond.itemName, priority = 999,
-                                  mineable = false, known = false }
-    end
-  end
-  table.sort(ed.items, function(a, b)
-    if a.mineable ~= b.mineable then return a.mineable end
-    if a.priority ~= b.priority then return a.priority < b.priority end
-    return a.name < b.name
-  end)
-  ed.sel, ed.scroll, ed.filter, ed.filtering = 1, 0, nil, false
-  edRebuildView()
+  edLoad()
+  ed.mode, ed.asteroid = "asteroids", nil
+  ed.sel, ed.scroll, ed.filter, ed.filtering, ed.input = 1, 0, nil, false, nil
+  edRebuild()
 end
 
-local function edCount()
-  local n = 0
-  for _ in pairs(ed.enabled) do n = n + 1 end
-  return n
+-- ---------------------------------------------------------------------------
+-- MUTATIONS
+-- ---------------------------------------------------------------------------
+
+local function edToggle(item, asteroid)
+  if ed.enabled[item] then
+    ed.enabled[item] = nil
+    edSay("stopped tracking " .. item)
+    return
+  end
+  ed.enabled[item]   = true
+  ed.threshold[item] = ed.threshold[item] or DEFAULT_TARGET
+  -- Turning something on is the moment the mapping has to exist, and here the
+  -- asteroid is known, so write it rather than leaving a condition that can
+  -- never dispatch.
+  if asteroid and not ed.targets[item] then
+    ed.targets[item] = { asteroid = asteroid, priority = nextPriority(asteroid) }
+    ed.added[item] = true
+    edSay("tracking " .. item .. " at " .. formatQty(ed.threshold[item]) ..
+          "  (mapped to " .. asteroid .. ")", 0x00FF00)
+  elseif not ed.targets[item] then
+    edSay("tracking " .. item .. " -- but it has no asteroid, so it cannot mine", 0xFF4444)
+  else
+    edSay("tracking " .. item .. " at " .. formatQty(ed.threshold[item]), 0x00FF00)
+  end
 end
 
-local function edCycleTarget(idx)
-  local it  = ed.items[idx]
-  local cur = ed.threshold[it.name] or 0
+local function edCycleTarget(item)
+  local cur = ed.threshold[item] or 0
   local nxt = TARGET_LADDER[1]
   for _, v in ipairs(TARGET_LADDER) do
     if v > cur then nxt = v break end
   end
-  ed.threshold[it.name] = nxt
-  ed.enabled[it.name]   = true
-  edSay(it.name .. " target " .. formatQty(nxt), 0x00FF00)
+  ed.threshold[item] = nxt
+  ed.enabled[item]   = true
+  edSay(item .. " target " .. formatQty(nxt), 0x00FF00)
 end
 
-local function edToggle(idx)
-  local it = ed.items[idx]
-  if ed.enabled[it.name] then
-    ed.enabled[it.name] = nil
-    edSay("disabled " .. it.name)
-  else
-    ed.enabled[it.name]   = true
-    ed.threshold[it.name] = ed.threshold[it.name] or 5000000
-    if it.mineable then
-      edSay("enabled " .. it.name .. " at " .. formatQty(ed.threshold[it.name]), 0x00FF00)
-    else
-      edSay("enabled " .. it.name .. " -- no dustTargets entry, it will NEVER mine", 0xFF4444)
+-- Incremental text entry. Never blocks: each keystroke is just another event.
+local function edPrompt(label, onCommit, initial)
+  ed.input = { label = label, buffer = initial or "", onCommit = onCommit }
+end
+
+local function parseQty(s)
+  if not s then return nil end
+  local num, suffix = s:lower():gsub("%s", ""):match("^(%d+%.?%d*)([kmb]?)$")
+  if not num then return nil end
+  num = tonumber(num)
+  if suffix == "k" then return math.floor(num * 1000) end
+  if suffix == "m" then return math.floor(num * 1000000) end
+  if suffix == "b" then return math.floor(num * 1000000000) end
+  return math.floor(num)
+end
+
+local function edAddDownstream()
+  local asteroid = ed.asteroid
+  if not asteroid then return end
+  edPrompt("item label yielded by " .. asteroid .. " (exact ME name):", function(name)
+    if not name or name == "" then edSay("cancelled") return end
+    if ed.targets[name] then
+      edSay(name .. " is already mapped to " .. ed.targets[name].asteroid, 0xFFAA00)
+      return
+    end
+    ed.targets[name] = { asteroid = asteroid, priority = nextPriority(asteroid) }
+    ed.added[name]   = true
+    edPrompt("amount to maintain for " .. name .. " (5m, 500k, 250000):", function(q)
+      local n = parseQty(q)
+      if not n or n <= 0 then
+        ed.threshold[name] = DEFAULT_TARGET
+        edSay("bad amount, defaulted " .. name .. " to " .. formatQty(DEFAULT_TARGET), 0xFFAA00)
+      else
+        ed.threshold[name] = n
+        edSay("added " .. name .. " -> " .. asteroid .. " at " .. formatQty(n), 0x00FF00)
+      end
+      ed.enabled[name] = true
+      edRebuild()
+    end, "5m")
+    edRebuild()
+  end)
+end
+
+-- ---------------------------------------------------------------------------
+-- SAVE
+-- ---------------------------------------------------------------------------
+
+-- Escape Lua pattern magic so item labels with -, (, ) match literally.
+local function esc(s)
+  return (s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"))
+end
+
+local function fmtQtyLiteral(n)
+  if n >= 1000000 and n % 1000000 == 0 then return string.format("%dm", n / 1000000) end
+  if n >= 1000    and n % 1000    == 0 then return string.format("%dk", n / 1000) end
+  return tostring(n)
+end
+
+-- conditions: regenerated wholesale. The block carries a header saying the
+-- editor owns it, and every known item appears so it reads as a menu.
+local function rebuildConditionsBlock()
+  local items = {}
+  local seen = {}
+  for item in pairs(ed.targets) do if not seen[item] then seen[item] = true; items[#items+1] = item end end
+  for item in pairs(ed.enabled) do if not seen[item] then seen[item] = true; items[#items+1] = item end end
+  table.sort(items, function(a, b)
+    local ta, tb = ed.targets[a], ed.targets[b]
+    local aa = ta and ta.asteroid or "~"
+    local ab = tb and tb.asteroid or "~"
+    if aa ~= ab then return aa < ab end
+    return a < b
+  end)
+
+  local out = { "config.conditions = {",
+    "  -- Managed by the broker condition editor (press E).",
+    "  -- Grouped by asteroid. Commented entries are disabled, not deleted." }
+  local lastAst
+  for _, item in ipairs(items) do
+    local t  = ed.targets[item]
+    local ast = t and t.asteroid or nil
+    if ast ~= lastAst then
+      out[#out + 1] = "  -- ---- " .. (ast or "NO ASTEROID -- cannot dispatch") .. " ----"
+      lastAst = ast
+    end
+    out[#out + 1] = (ed.enabled[item] and "  " or "  --  ") ..
+      string.format("{ itemName = %-34s amountToMaintain = qty(%s%s%s) },",
+        QUOTE .. item .. QUOTE .. ",", QUOTE,
+        fmtQtyLiteral(ed.threshold[item] or DEFAULT_TARGET), QUOTE)
+  end
+  out[#out + 1] = "}"
+  return table.concat(out, "\n")
+end
+
+-- dustTargets: edited surgically. It holds hand-written section banners and
+-- notes, so it is never regenerated -- existing lines are rewritten in place
+-- and genuinely new entries are appended under one marked section.
+local function applyDustTargets(src)
+  local head = src:find("config%.dustTargets%s*=%s*{")
+  if not head then return nil, "could not find config.dustTargets" end
+  local tail = src:find("\n}", head)
+  if not tail then return nil, "could not find the end of config.dustTargets" end
+
+  local block   = src:sub(head, tail)
+  local changed = 0
+
+  for item, t in pairs(ed.targets) do
+    local pat = "%[" .. QUOTE .. esc(item) .. QUOTE .. "%]%s*=%s*%b{}"
+    if block:find(pat) then
+      local repl = string.format("[%s%s%s]%s= { asteroid = %s%s%s, priority = %d }",
+        QUOTE, item, QUOTE, string.rep(" ", math.max(1, 26 - #item)),
+        QUOTE, t.asteroid, QUOTE, t.priority or 99)
+      local new = block:gsub(pat, (repl:gsub("%%", "%%%%")), 1)
+      if new ~= block then block = new; changed = changed + 1 end
     end
   end
+
+  -- Append anything not already in the file.
+  local additions = {}
+  for item, t in pairs(ed.targets) do
+    local pat = "%[" .. QUOTE .. esc(item) .. QUOTE .. "%]"
+    if not block:find(pat) then
+      additions[#additions + 1] = string.format(
+        "  [%s%s%s]%s= { asteroid = %s%s%s, priority = %d },",
+        QUOTE, item, QUOTE, string.rep(" ", math.max(1, 26 - #item)),
+        QUOTE, t.asteroid, QUOTE, t.priority or 99)
+    end
+  end
+  if #additions > 0 then
+    table.sort(additions)
+    -- The last existing entry may have no trailing comma -- the shipped
+    -- config ends with Naquadria Dust and no comma. Appending straight
+    -- after it would run two table fields together and corrupt the file.
+    block = block:gsub("%s*$", "")
+    if not block:match(",$") then block = block .. "," end
+    block = block .. "\n\n  -- === ADDED IN-GAME ===\n"
+                  .. table.concat(additions, "\n") .. "\n"
+    changed = changed + #additions
+  end
+
+  return src:sub(1, head - 1) .. block .. src:sub(tail + 1), nil, changed, #additions
 end
 
--- Write config.conditions back, then apply it in-process: no restart needed.
 local function edSave()
   local f = io.open(EDITOR_CONFIG_PATH, "r")
   if not f then edSay("cannot read config.lua", 0xFF4444) return end
   local src = f:read("*a"); f:close()
 
-  local head = src:find("config%.conditions%s*=%s*{")
-  local tail = head and src:find("\n}", head)
-  if not head or not tail then
-    edSay("could not locate config.conditions in the file", 0xFF4444) return
-  end
+  local newSrc, err, changed, added = applyDustTargets(src)
+  if not newSrc then edSay(err, 0xFF4444) return end
 
-  local out = { "config.conditions = {",
-    "  -- Managed by the broker condition editor (press E).",
-    "  -- Commented entries are disabled, not deleted." }
-  local lastP, inertHdr = nil, false
-  for _, it in ipairs(ed.items) do
-    if it.mineable then
-      if it.priority ~= lastP then
-        out[#out + 1] = string.format("  -- ---- priority %d ----", it.priority)
-        lastP = it.priority
-      end
-    elseif not inertHdr then
-      out[#out + 1] = "  -- ---- no dustTargets entry: these display but never dispatch ----"
-      inertHdr = true
-    end
-    local body = string.format("{ itemName = %-32s amountToMaintain = qty(%s%s%s) },",
-      QUOTE .. it.name .. QUOTE .. ",",
-      QUOTE, formatQty(ed.threshold[it.name] or 5000000), QUOTE)
-    out[#out + 1] = (ed.enabled[it.name] and "  " or "  --  ") .. body
+  local head = newSrc:find("config%.conditions%s*=%s*{")
+  local tail = head and newSrc:find("\n}", head)
+  if not head or not tail then
+    edSay("could not locate config.conditions", 0xFF4444) return
   end
-  out[#out + 1] = "}"
+  newSrc = newSrc:sub(1, head - 1) .. rebuildConditionsBlock() .. newSrc:sub(tail + 2)
 
   local w = io.open(EDITOR_CONFIG_PATH, "w")
   if not w then edSay("cannot write config.lua", 0xFF4444) return end
-  w:write(src:sub(1, head - 1) .. table.concat(out, "\n") .. src:sub(tail + 2))
-  w:close()
+  w:write(newSrc); w:close()
 
-  -- Apply live. Rebuilding the table in memory beats re-reading the file, which
-  -- every other subsystem already holds references into.
+  -- Apply live: rebuilding in memory beats re-reading the file, which every
+  -- other subsystem already holds references into.
   local fresh = {}
-  for _, it in ipairs(ed.items) do
-    if ed.enabled[it.name] then
-      fresh[#fresh + 1] = { itemName = it.name,
-                            amountToMaintain = ed.threshold[it.name] or 5000000 }
-    end
+  for item in pairs(ed.enabled) do
+    fresh[#fresh + 1] = { itemName = item, amountToMaintain = ed.threshold[item] or DEFAULT_TARGET }
   end
+  table.sort(fresh, function(a, b) return a.itemName < b.itemName end)
   config.conditions = fresh
+
+  for item, t in pairs(ed.targets) do
+    config.dustTargets[item] = { asteroid = t.asteroid, priority = t.priority }
+  end
 
   local newDust = {}
   for _, cond in ipairs(config.conditions) do
@@ -1324,14 +1605,27 @@ local function edSave()
   brokerState.dust   = newDust
   dustScroll         = 0
   edRequestWatchlist = true
+  ed.added           = {}
 
-  edSay("saved " .. #fresh .. " conditions and applied them live", 0x00FF00)
+  edSay(string.format("saved: %d tracked, %d mappings updated, %d new -- applied live",
+    #fresh, changed - added, added), 0x00FF00)
 end
 
+-- ---------------------------------------------------------------------------
+-- DRAW
+-- ---------------------------------------------------------------------------
+
 local edButtons = {}
-do
-  local defs = { { "SAVE", "save" }, { "ALL", "all" }, { "NONE", "none" },
-                 { "FIND", "find" }, { "CLOSE", "close" } }
+local function edLayoutButtons()
+  local defs
+  if ed.mode == "asteroids" then
+    defs = { { "ITEMS", "items" }, { "FIND", "find" }, { "SAVE", "save" }, { "CLOSE", "close" } }
+  elseif ed.mode == "detail" then
+    defs = { { "BACK", "back" }, { "ADD", "add" }, { "FIND", "find" }, { "SAVE", "save" }, { "CLOSE", "close" } }
+  else
+    defs = { { "ASTEROIDS", "asteroids" }, { "FIND", "find" }, { "SAVE", "save" }, { "CLOSE", "close" } }
+  end
+  edButtons = {}
   local x = 2
   for _, d in ipairs(defs) do
     local label = " " .. d[1] .. " "
@@ -1340,65 +1634,118 @@ do
   end
 end
 
-local EX_MARK, EX_NAME = 2, 6
-local EX_TGT, EX_HAVE, EX_AST = 44, 55, 68
+local X_MARK, X_NAME = 2, 6
+local X_A, X_B, X_C = 46, 58, 70
 
 local function edDraw()
-  -- Never blank the whole screen here. Filling W x H and then repainting it
-  -- leaves a visible empty frame between the two, which is exactly the flicker
-  -- the dashboard panels had. Every row below clears only itself.
   gpu.setBackground(0x000000)
 
   gpu.fill(1, 1, W, 1, " ")
   gpu.setForeground(0x00FF00)
-  term.setCursor(2, 1); io.write("CONDITION EDITOR")
+  term.setCursor(2, 1)
+  if ed.mode == "asteroids" then
+    io.write("CONDITION EDITOR  /  asteroids")
+  elseif ed.mode == "detail" then
+    io.write("CONDITION EDITOR  /  " .. tostring(ed.asteroid))
+  else
+    io.write("CONDITION EDITOR  /  all tracked items")
+  end
+
   gpu.fill(1, 2, W, 1, " ")
   gpu.setForeground(0x888888)
   term.setCursor(2, 2)
-  io.write(string.format("%d mineable  |  %d enabled  |  click target to cycle  |  modules keep running",
-    #ed.items, edCount()))
+  local n = 0
+  for _ in pairs(ed.enabled) do n = n + 1 end
+  io.write(string.format("%d tracked  |  enter=open  space=toggle  t=target  a=add  /=find  s=save  esc=back%s",
+    n, ed.filter and ("  |  filter: " .. ed.filter) or ""))
 
   gpu.fill(1, 4, W, 1, " ")
   gpu.setForeground(0x888888)
-  term.setCursor(EX_NAME, 4); io.write("ITEM")
-  term.setCursor(EX_TGT, 4);  io.write("TARGET")
-  term.setCursor(EX_HAVE, 4); io.write("HAVE")
-  term.setCursor(EX_AST, 4);  io.write("ASTEROID")
+  if ed.mode == "asteroids" then
+    term.setCursor(X_NAME, 4); io.write("ASTEROID")
+    term.setCursor(X_A, 4); io.write("MODULE")
+    term.setCursor(X_B, 4); io.write("DRONES")
+    term.setCursor(X_C, 4); io.write("TRACKED")
+  else
+    term.setCursor(X_NAME, 4); io.write("ITEM")
+    term.setCursor(X_A, 4); io.write("TARGET")
+    term.setCursor(X_B, 4); io.write("HAVE")
+    term.setCursor(X_C, 4); io.write(ed.mode == "detail" and "CHANCE" or "ASTEROID")
+  end
 
   for r = 0, edRows() - 1 do
     local y   = edFirst() + r
-    local idx = ed.view[ed.scroll + r + 1]
+    local idx = ed.scroll + r + 1
+    local row = ed.rows[idx]
 
-    -- One fill per row, doubling as the selection highlight. Rows past the end
-    -- of the list get cleared too, so a shrinking filter leaves no ghosts.
-    gpu.setBackground((ed.scroll + r + 1 == ed.sel and idx) and 0x222222 or 0x000000)
+    gpu.setBackground((idx == ed.sel and row and row.kind ~= "header" and row.kind ~= "note")
+                      and 0x222222 or 0x000000)
     gpu.fill(1, y, W, 1, " ")
 
-    if idx then
-      local it = ed.items[idx]
-      local on = ed.enabled[it.name]
-      gpu.setForeground(on and 0x00FFFF or 0x555555)
-      term.setCursor(EX_MARK, y); io.write(on and "[x]" or "[ ]")
-      term.setCursor(EX_NAME, y); io.write(it.name:sub(1, EX_TGT - EX_NAME - 1))
-      term.setCursor(EX_TGT, y)
-      io.write(on and formatQty(ed.threshold[it.name] or 5000000) or "-")
+    if row then
+      if row.kind == "header" then
+        gpu.setForeground(0x00AAFF)
+        term.setCursor(2, y); io.write("-- " .. row.text)
 
-      local d    = brokerState.dust[it.name]
-      local have = d and d.stock or 0
-      local tgt  = ed.threshold[it.name] or 5000000
-      gpu.setForeground(have >= tgt and 0x00FF00 or (have > 0 and 0xFFAA00 or 0x555555))
-      term.setCursor(EX_HAVE, y); io.write(formatQty(have))
+      elseif row.kind == "note" then
+        gpu.setForeground(0x555555)
+        term.setCursor(6, y); io.write(row.text)
 
-      if not it.mineable then
-        gpu.setForeground(0xFF4444); term.setCursor(EX_AST, y); io.write("NOT MINEABLE")
-      else
-        gpu.setForeground(it.known and (on and 0x888888 or 0x555555) or 0xFFAA00)
-        term.setCursor(EX_AST, y); io.write(tostring(it.asteroid):sub(1, W - EX_AST))
+      elseif row.kind == "asteroid" then
+        gpu.setForeground(row.tracked > 0 and 0x00FFFF or 0x777777)
+        term.setCursor(X_NAME, y); io.write(row.name:sub(1, X_A - X_NAME - 1))
+        gpu.setForeground(0x888888)
+        term.setCursor(X_A, y); io.write("MK-" .. tostring(row.tier))
+        term.setCursor(X_B, y); io.write(row.drones)
+        gpu.setForeground(row.tracked > 0 and 0x00FF00 or 0x555555)
+        term.setCursor(X_C, y); io.write(tostring(row.tracked))
+        if not row.direct then
+          gpu.setForeground(0xFFAA00)
+          term.setCursor(X_C + 6, y); io.write("no derived outputs")
+        end
+
+      else -- item
+        local item = row.item
+        local on   = ed.enabled[item]
+        gpu.setForeground(on and 0x00FFFF or 0x555555)
+        term.setCursor(X_MARK, y); io.write(on and "[x]" or "[ ]")
+        term.setCursor(X_NAME, y)
+        io.write(((row.direct == false and ed.mode == "detail") and "~ " or "  ")
+                 .. item:sub(1, X_A - X_NAME - 3))
+
+        term.setCursor(X_A, y)
+        io.write(on and formatQty(ed.threshold[item] or DEFAULT_TARGET) or "-")
+
+        local d    = brokerState.dust[item]
+        local have = d and d.stock or 0
+        local tgt  = ed.threshold[item] or DEFAULT_TARGET
+        gpu.setForeground(have >= tgt and 0x00FF00 or (have > 0 and 0xFFAA00 or 0x555555))
+        term.setCursor(X_B, y); io.write(formatQty(have))
+
+        if ed.mode == "detail" then
+          if row.chance then
+            gpu.setForeground(0x888888)
+            term.setCursor(X_C, y); io.write(string.format("%.1f%%", row.chance / 100))
+          else
+            gpu.setForeground(0x666666)
+            term.setCursor(X_C, y); io.write("downstream")
+          end
+        else
+          local t = ed.targets[item]
+          if t then
+            gpu.setForeground(0x888888)
+            term.setCursor(X_C, y); io.write(tostring(t.asteroid):sub(1, W - X_C))
+          else
+            gpu.setForeground(0xFF4444)
+            term.setCursor(X_C, y); io.write("NOT MINEABLE")
+          end
+        end
       end
       gpu.setBackground(0x000000)
     end
   end
 
+  edLayoutButtons()
   local by = H - 1
   gpu.setBackground(0x000000)
   gpu.fill(1, by, W, 1, " ")
@@ -1408,14 +1755,16 @@ local function edDraw()
   end
   gpu.setBackground(0x000000)
   gpu.setForeground(0x888888)
-  local pos = string.format("%d-%d/%d", math.min(ed.scroll + 1, #ed.view),
-    math.min(ed.scroll + edRows(), #ed.view), #ed.view)
+  local pos = string.format("%d-%d/%d", math.min(ed.scroll + 1, #ed.rows),
+    math.min(ed.scroll + edRows(), #ed.rows), #ed.rows)
   term.setCursor(W - #pos - 1, by); io.write(pos)
 
-  gpu.setBackground(0x000000)
   gpu.fill(1, H, W, 1, " ")
   term.setCursor(2, H)
-  if ed.filtering then
+  if ed.input then
+    gpu.setForeground(0xFFAA00)
+    io.write(ed.input.label .. " " .. ed.input.buffer .. "_")
+  elseif ed.filtering then
     gpu.setForeground(0xFFAA00)
     io.write("/" .. (ed.filter or "") .. "_    enter=keep  esc=clear")
   else
@@ -1424,31 +1773,57 @@ local function edDraw()
   end
 end
 
+-- ---------------------------------------------------------------------------
+-- INPUT
+-- ---------------------------------------------------------------------------
+
 local function edAction(a)
   if a == "close" then
     ed.open = false
     drawStaticFrame()
+  elseif a == "back" then
+    if ed.mode == "detail" then
+      ed.mode, ed.asteroid = "asteroids", nil
+      ed.sel, ed.scroll = 1, 0
+      edRebuild()
+    else
+      edAction("close")
+    end
+  elseif a == "items" then
+    ed.mode = "items"; ed.sel, ed.scroll = 1, 0; edRebuild()
+  elseif a == "asteroids" then
+    ed.mode, ed.asteroid = "asteroids", nil; ed.sel, ed.scroll = 1, 0; edRebuild()
+  elseif a == "add" then
+    if ed.mode == "detail" then edAddDownstream()
+    else edSay("open an asteroid first, then A adds one of its outputs", 0xFFAA00) end
+  elseif a == "find" then
+    ed.filtering = true; ed.filter = ""; edRebuild()
   elseif a == "save" then
     edSave()
-  elseif a == "all" then
-    for _, it in ipairs(ed.items) do
-      if it.mineable then
-        ed.enabled[it.name]   = true
-        ed.threshold[it.name] = ed.threshold[it.name] or 5000000
-      end
-    end
-    edSay("enabled everything mineable", 0x00FF00)
-  elseif a == "none" then
-    ed.enabled = {}
-    edSay("disabled everything")
-  elseif a == "find" then
-    ed.filtering = true
-    ed.filter = ""
-    edRebuildView()
   end
 end
 
--- Returns true if the event was consumed by the editor.
+local function edOpenSelected()
+  local row = ed.rows[ed.sel]
+  if not row then return end
+  if row.kind == "asteroid" then
+    ed.mode, ed.asteroid = "detail", row.name
+    ed.sel, ed.scroll = 1, 0
+    edRebuild()
+    edMoveSel(1)
+  elseif row.kind == "item" and ed.mode == "items" then
+    local t = ed.targets[row.item]
+    if t then
+      ed.mode, ed.asteroid = "detail", t.asteroid
+      ed.sel, ed.scroll = 1, 0
+      edRebuild(); edMoveSel(1)
+    else
+      edSay(row.item .. " has no asteroid mapping", 0xFFAA00)
+    end
+  end
+end
+
+-- Returns true if the event was consumed.
 local function edHandle(ev)
   local kind = ev[1]
 
@@ -1461,19 +1836,26 @@ local function edHandle(ev)
       return true
     end
     if y >= edFirst() and y < edFirst() + edRows() then
-      local pos = ed.scroll + (y - edFirst()) + 1
-      local idx = ed.view[pos]
-      if idx then
-        ed.sel = pos
-        if x >= EX_TGT and x < EX_HAVE then edCycleTarget(idx) else edToggle(idx) end
+      local idx = ed.scroll + (y - edFirst()) + 1
+      local row = ed.rows[idx]
+      if row and row.kind ~= "header" and row.kind ~= "note" then
+        ed.sel = idx
+        if row.kind == "asteroid" then
+          edOpenSelected()
+        elseif x >= X_A and x < X_B then
+          edCycleTarget(row.item)
+        else
+          edToggle(row.item, ed.mode == "detail" and ed.asteroid or
+                             (ed.targets[row.item] and ed.targets[row.item].asteroid))
+          edRebuild()
+        end
       end
     end
     return true
 
   elseif kind == "scroll" then
-    local dir = ev[5]
-    ed.scroll = ed.scroll - (dir or 0) * 3
-    local maxScroll = math.max(0, #ed.view - edRows())
+    ed.scroll = ed.scroll - (ev[5] or 0) * 3
+    local maxScroll = math.max(0, #ed.rows - edRows())
     if ed.scroll > maxScroll then ed.scroll = maxScroll end
     if ed.scroll < 0 then ed.scroll = 0 end
     return true
@@ -1481,40 +1863,59 @@ local function edHandle(ev)
   elseif kind == "key_down" then
     local ch, code = ev[3], ev[4]
 
-    -- Incremental filter mode swallows printable keys.
-    if ed.filtering then
-      if code == 28 then                      -- enter
-        ed.filtering = false
-        edSay("filter: " .. (ed.filter or ""))
-      elseif code == 1 then                   -- esc
-        ed.filtering = false; ed.filter = nil
-        edRebuildView(); edSay("filter cleared")
-      elseif code == 14 then                  -- backspace
-        ed.filter = (ed.filter or ""):sub(1, -2)
-        edRebuildView()
+    -- Text entry swallows printable keys. Never blocks the scheduler.
+    if ed.input then
+      if code == 28 then            -- enter
+        local cb, buf = ed.input.onCommit, ed.input.buffer
+        ed.input = nil
+        cb(buf)
+      elseif code == 1 then         -- esc
+        ed.input = nil; edSay("cancelled")
+      elseif code == 14 then        -- backspace
+        ed.input.buffer = ed.input.buffer:sub(1, -2)
       elseif ch and ch >= 32 and ch < 127 then
-        ed.filter = (ed.filter or "") .. string.char(ch):lower()
-        edRebuildView()
+        ed.input.buffer = ed.input.buffer .. string.char(ch)
       end
       return true
     end
 
-    if     code == 200 then ed.sel = math.max(1, ed.sel - 1); edFollow()
-    elseif code == 208 then ed.sel = math.min(#ed.view, ed.sel + 1); edFollow()
-    elseif code == 201 then ed.sel = math.max(1, ed.sel - edRows()); edFollow()
-    elseif code == 209 then ed.sel = math.min(#ed.view, ed.sel + edRows()); edFollow()
-    elseif code == 199 then ed.sel = 1; edFollow()
-    elseif code == 207 then ed.sel = #ed.view; edFollow()
-    elseif code == 1   then edAction("close")
+    if ed.filtering then
+      if code == 28 then
+        ed.filtering = false; edSay("filter: " .. (ed.filter or ""))
+      elseif code == 1 then
+        ed.filtering = false; ed.filter = nil; edRebuild(); edSay("filter cleared")
+      elseif code == 14 then
+        ed.filter = (ed.filter or ""):sub(1, -2); edRebuild()
+      elseif ch and ch >= 32 and ch < 127 then
+        ed.filter = (ed.filter or "") .. string.char(ch):lower(); edRebuild()
+      end
+      return true
+    end
+
+    if     code == 200 then edMoveSel(-1)
+    elseif code == 208 then edMoveSel(1)
+    elseif code == 201 then edMoveSel(-edRows())
+    elseif code == 209 then edMoveSel(edRows())
+    elseif code == 199 then ed.sel = 1; edMoveSel(1); edMoveSel(-1); edFollow()
+    elseif code == 207 then ed.sel = #ed.rows; edMoveSel(-1); edMoveSel(1); edFollow()
+    elseif code == 28  then edOpenSelected()
+    elseif code == 1   then edAction("back")
     elseif ch == 32 then
-      local idx = ed.view[ed.sel]; if idx then edToggle(idx) end
+      local row = selectedRow()
+      if row and row.kind == "item" then
+        edToggle(row.item, ed.mode == "detail" and ed.asteroid or
+                           (ed.targets[row.item] and ed.targets[row.item].asteroid))
+        edRebuild()
+      elseif row and row.kind == "asteroid" then
+        edOpenSelected()
+      end
     elseif ch == 116 then
-      local idx = ed.view[ed.sel]; if idx then edCycleTarget(idx) end
+      local row = selectedRow()
+      if row and row.kind == "item" then edCycleTarget(row.item) end
+    elseif ch == 97  then edAction("add")
     elseif ch == 47  then edAction("find")
     elseif ch == 115 then edAction("save")
-    elseif ch == 97  then edAction("all")
-    elseif ch == 110 then edAction("none")
-    elseif ch == 113 then edAction("close")
+    elseif ch == 105 then edAction("items")
     end
     return true
   end
