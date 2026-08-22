@@ -1,202 +1,284 @@
 # GTNH Space Gas Logistics Terminal
 
-An OpenComputers automation script for GTNH (GregTech New Horizons) that manages planetary space gas extraction using Space Elevator Pumping Modules. Automatically prioritizes fluid collection across multiple planets and displays real-time production analytics.
+An OpenComputers controller for GregTech: New Horizons Space Elevator **Pumping
+Modules**. It keeps a list of planetary fluids topped up, deciding which module
+pumps what, and shows the whole array on one dashboard.
 
-## Overview
+Sibling project: [`../space-miner`](../space-miner) does the same job for Mining
+Modules. The two share `scheduler.lua` and `logger.lua` verbatim.
 
-This OpenComputers script controls Space Pumping Modules in any tier (T1, T2, T3) to extract gases and fluids from planets automatically switching between the different spaces and fluids. The main script (`autoPump-LargeScreen.lua`) orchestrates pump operations based on configurable demand, while `config.lua` defines fluid sources, extraction rates, and storage targets.
+---
 
-**Features:**
-- **Multi-planet fluid extraction** from 7 planets with 40 unique fluids
-- **Intelligent prioritization** using 3 sorting modes (Normal, Stairstep, Waterfall)
-- **Real-time analytics**: throughput tracking, delta monitoring, demand percentages
-- **Pump tier detection**: Automatically identifies T1 (1x), T2 (16x), and T3 (256x) pumps
-- **Configurable storage targets**: Based on ME fluid cell capacities with safety margins
-- **Large display support**: Supports a matrix of 6 T3 Screens (2 high-3 wide)
+## Files
 
-## Hardware Requirements
+| File | What it is |
+|---|---|
+| `autoPump.lua` | the program you run — main loop and boot sequence |
+| `config.lua` | **the only file you edit**: fluids, targets, tunables |
+| `pumps.lua` | hardware, per-pump state machine, work assignment |
+| `ui.lua` | the dashboard |
+| `scheduler.lua` | cooperative task engine (shared with space-miner) |
+| `logger.lua` | logging (shared with space-miner) |
+| `install-pump.lua` | one-shot downloader |
 
-### Minimum Setup
-- **OpenComputers computer** (case, CPU, RAM, hard drive)
-- **ME Controller** with interface to network
-- **Internet Card** (to download via wget the script from here on GitHub)
-- **1x Space Pumping Module T1** minimum
-- **Graphics Card T3**
-- **Adapters mapped to each Space Pumping Module and ME Controller for Fluid Subnet**  
+> **Upgrading from `autoPump-LargeScreen.lua`?** It has been replaced by the
+> files above. Run `install-pump`, then start `autoPump` instead. Your
+> `config.lua` keeps the same `config.master` layout, so copy your
+> `{planet, slot}` pairs across; everything else in it is new.
 
-### Optimal Setup
-- **Computer with T3 CPU or T3 APU**
-- **2x Tier 3.5 Memory Cards**
-- **Multiple pump tiers** (T1 + T2 + T3 for max flexibility)
-- **T3 Screen** 
+---
 
-## Installation
+## What you need
 
-1. **Copy scripts to OpenComputers hard drive using wget:**
-   ```
-   /space-pumping/config.lua
-   /space-pumping/autoPump-LargeScreen.lua
-   ```
+**One OpenComputers computer**
 
-2. **Configure your setup** in `config.lua`:
-   - Update `currentCellType` to match your ME fluid storage cells
-   - Adjust `safetyMargin` (0.20 = 20% buffer before cell full)
-   - If you aren't testing, make sure to set the config.maxTargetOverride value to 0
-   - Rates already calculated based on Wiki (pre-configured values / 20 to convert to L/tick)
+| Part | Minimum | Comfortable |
+|---|---|---|
+| CPU | Tier 2 | Tier 3 or APU |
+| RAM | 2× Tier 2 | 2× Tier 3.5 |
+| GPU | Tier 2 | Tier 3 |
+| Screen | Tier 2 | Tier 3, 3 wide × 2 tall |
+| Other | HDD, keyboard, **Internet Card** (for `wget`) | |
 
-3. **Run the script:**
-   ```
-   autoPump-LargeScreen.lua
-   ```
+**Adapters — one per thing the computer talks to**
 
-## Configuration Guide
+- One **Adapter** touching each Space Pumping Module's **controller block**.
+  Each appears as a `gt_machine` component, and the script reads its tier from
+  `getName()`.
+- One **Adapter** touching the **ME Controller of the fluid subnet the pumps
+  output into**. This is where every stock figure comes from. Point it at the
+  network that actually holds your fluid cells — if you point it at the main
+  base network instead, every fill percentage on the dashboard will be wrong and
+  the array will pump the wrong things.
 
-### Core Settings (config.lua)
+All adapters must be on the same OpenComputers cable network as the computer.
+
+Supported modules, out of the box:
+
+| `getName()` | Tier | Threads | Multiplier |
+|---|---|---|---|
+| `projectmodulepumpt1` | T1 | 1 | 4× |
+| `projectmodulepumpt2` | T2 | 4 | 16× |
+| `projectmodulepumpt3` | T3 | 4 | 256× |
+
+Anything else on the network is ignored. To add a modded tier, put a row in
+`config.tiers`.
+
+---
+
+## Install
+
+Check the computer can see the hardware first:
+
+```
+components
+```
+
+You want exactly one `me_controller` and one `gt_machine` per pumping module. If
+a module is missing, its Adapter is not touching the controller block.
+
+Then:
+
+```
+wget https://raw.githubusercontent.com/jdlovins/GTNH-Miner/main/space-pumping/install-pump.lua /home/install-pump.lua
+```
+
+```
+install-pump
+```
+
+It pulls every file into `/home/`. Re-running it refreshes the program files and
+**leaves your `config.lua` alone** — your planet/slot layout is not something to
+overwrite by accident. Delete `config.lua` first if you do want the shipped
+defaults back.
+
+---
+
+## Configure
+
+Everything lives in `/home/config.lua`.
+
+### 1. Storage target
 
 ```lua
-config.currentCellType = "16384k"    -- ME cell size you're using
-config.safetyMargin = 0.20            -- Stop collecting at 80% full
-config.maxTargetOverride = 1000000000 -- Override target (use 0 to disable)
+config.currentCellType   = "16384k"   -- the ME fluid cell size backing this subnet
+config.safetyMargin      = 0.20       -- fill to 80%; 0.15-0.25 is the sane band
+config.maxTargetOverride = 0          -- 0 = derive from the cell type
 ```
 
-**Cell Capacities:**
-Pre-configured for AE2 fluid cells. If using different cells, update the `CELL_CAPACITIES` table with your cell sizes in liters.
+`maxTargetOverride` forces a flat target in litres, for testing at small scales.
+Leave it at `0` in normal use — a non-zero value silently ignores your cell
+choice.
 
-### Fluid Master List
+### 2. The fluid list — the part that actually matters
 
-Each fluid entry requires:
-- **priority**: 0-5 (higher = pump sooner when below target)
-- **setting**: `{planet, output_slot}` - coordinates on space station
-- **rate**: L/s from Wiki ÷ 20 (for liters per tick)
-
-Example:
 ```lua
-['Hydrogen'] = {priority=5, amount=0, setting={8,1}, rate=78400}
+config.master = {
+  ['Hydrogen'] = {priority=5, setting={8,1}, rate=78400},
+  ...
+}
 ```
 
-**Rates Explained:**
-- Wiki states rates in L/s (liters per second)
-- Divide by 20 to get liters per tick (OC clock)
-- T1 pumps: ×4 multiplier
-- T2 pumps: ×16 multiplier  
-- T3 pumps: ×256 multiplier
+- **`setting = {planet, slot}`** must match **your** space station's layout. This
+  is the single most common misconfiguration: with the wrong pair the module
+  runs happily and nothing arrives.
+- **`priority`** 0–5. Higher is pumped sooner among fluids that are below target.
+  Use 4–5 for whatever is gating your current progression.
+- **`rate`** is a wiki-sourced estimate used **only** for the throughput figure
+  shown beside a working pump. It does not affect what gets pumped or how fast.
 
-## Operating Modes
+To add a fluid, add a row. To stop pumping one, comment the row out.
 
-Press **N**, **S**, or **W** while running to switch modes. **Q** to quit.
+### 3. Tunables (optional)
 
-### Normal Mode
-- Prioritize any fluid below target (100%)
-- Within those, pump higher-priority items first
-- Then by lowest stored amount
-- **Best for:** Balanced filling, especially with priority-4/5 items
+`config.tuning` holds every interval, timeout and threshold, all in **real
+seconds**. The defaults are fine; the ones worth knowing about:
 
-### Stairstep Mode
-- Pump anything below 10% first
-- Then 10-50%, then 50%+
-- Respects priority within each tier
-- **Best for:** Rapid recovery from empty tanks, dramatic catch-up
+| Key | Default | What it does |
+|---|---|---|
+| `pollInterval` | 1.0 | how often the ME network is re-read |
+| `uiInterval` | 0.25 | dashboard repaint cadence |
+| `snapshotInterval` | 6.0 | window the flow rates are measured over |
+| `armTimeout` | 5.0 | how long to wait for a module to confirm it started |
+| `rescanInterval` | 30.0 | how often new modules are picked up |
+| `minDeficitFraction` | 0.002 | ignore a fluid less than 0.2% short |
 
-### Waterfall Mode
-- All pumps focus on the single lowest-stocked item
-- Pump it to full capacity
-- Then move to next in queue
-- **Best for:** Sequential completions, avoiding scatter
+### 4. Logging (optional)
 
-## Dashboard Explanation
+```lua
+config.logging.enabled = true    -- INFO/DEBUG as well as errors
+```
+
+With `enabled = false` (the default) errors and warnings are still written to
+`/tmp/spacepump.log`, so a failure always leaves a trail. Note that OpenComputers'
+`/tmp` is a RAM disk and is wiped on reboot.
+
+---
+
+## Run
 
 ```
-GTNH SPACE-GAS LOGISTICS TERMINAL - UEV TIER CONTROL
-CELL: 16384k | SAFE: 80% | MAX: 27.28 GL
+autoPump
+```
 
-║ PUMP ARRAY STATUS
-[1] | T3 | WORKING | Hydrogen | 20.06 ML/t
-[2] | T2 | IDLE    | None     | ---
-[3] | T1 | WORKING | Deuterium| 1.57 ML/t
+Boot goes: discover modules → close every work gate → wait for the array to go
+quiet → dashboard.
 
-║ FLUID DEMAND QUEUE
-Hydrogen      | 85.4321% | 23.13 GL
-Deuterium     | 45.6789% | 12.36 GL
+Check the PUMP ARRAY panel lists every module at the right tier before walking
+away.
+
+**Autostart:** add a line reading `autoPump` to `/home/.shrc`.
+
+---
+
+## Operating modes
+
+Press a key while it is running.
+
+| Key | Mode | Behaviour |
+|---|---|---|
+| `N` | Normal | anything below target, highest priority first, then emptiest first. Balanced. |
+| `S` | Stairstep | everything under 10% first, then under 50%, then the rest. Fastest recovery from empty. |
+| `W` | Waterfall | the whole array on one fluid until it is full, then the next. Sequential. |
+| `Q` | quit | stops every module and exits cleanly. |
+
+In Normal and Stairstep the array never doubles up: fluids already being pumped
+are skipped, and the biggest module is offered the deepest shortfall. Waterfall
+deliberately overrides that — pointing everything at one fluid is the whole idea.
+
+---
+
+## Dashboard
+
+```
+================================ GTNH SPACE-GAS LOGISTICS TERMINAL ================================
+  CELL: 16384k   SAFE: 80%   MAX: 27.28 GL          ME: OK      MODE: Normal
+
+PUMP ARRAY STATUS
+---------------------------------------------------------------------------------------------------
+a3f1 T3   RUNNING  Hydrogen             20.06 ML/t     b7c2 T2   RUNNING  Deuterium    1.25 ML/t
+c910 T1   IDLE     None                 ---            d4e8 T2   ERROR    did not start within 5.0s
+
+FLUID DEMAND QUEUE
+---------------------------------------------------------------------------------------------------
+Hydrogen          85.432%     23.13 GL   Oxygen            12.004%      3.27 GL   ...
 ...
 
-║ NET DELTAS (Throughput: 150.23 ML)
-TOP GROWTH:
-Hydrogen      : +15.2341%
-Deuterium     : +8.9234%
+NET FLOW   (total in: 42.10 ML/s)
+---------------------------------------------------------------------------------------------------
+TOP INFLOW:                                  TOP OUTFLOW:
+Hydrogen           +18.20 ML/s               Heavy Oil        -2.10 ML/s
 
-TOP REDUCTIONS:
-Heavy Oil     : -3.4521%
-
-TARGET: 27.28 GL
-[N]ormal  [S]tairstep  [W]aterfall
+TARGET: 27.28 GL                         >[N]ormal   [S]tairstep   [W]aterfall   [Q]uit
 ```
 
-**Color Coding:**
-- **Red** (<50%): Critical shortage
-- **Orange** (50-95%): Ramping up
-- **Green** (95-110%): Target achieved
-- **Magenta** (>110%): Overflow (space exists)
+**Fill colours:** red under 50%, orange 50–95%, green 95–110%, magenta above 110%
+(over target, which is harmless — it just means there is headroom).
 
-**Throughput:** Net liters gained in the last 30 seconds across all fluids.
+**NET FLOW** is litres per second, measured over the last `snapshotInterval`.
+It is a rate, not a percentage — an absolute rate has no blind spot for a fluid
+that started empty, and it is the number you can actually compare against a
+module's throughput.
+
+**Pump states:** `IDLE` waiting for work · `ARMING` starting a cycle ·
+`RUNNING` pumping · `ERROR` faulted, retrying after a cooldown.
+
+---
 
 ## Troubleshooting
 
-### Pumps Won't Start
-- Check ME Controller address in logs (should auto-detect)
-- Ensure they're connected to the adapter
-- Is the Space Elevator powered?
-- Do you have enough computation for the module?
-- Ensure planet/slot settings match actual space station layout
-- Run `findPumps()` debug function to list detected modules
+**No modules found at boot.** The Adapter must touch the module's *controller*
+block. Run `components` and look for `gt_machine`. If one is listed but not
+adopted, its `getName()` is not in `config.tiers` — add it there.
 
-### Storage Filling Unexpectedly
-- Lower `safetyMargin` (e.g., 0.10 for 10% buffer)
-- Disable low-priority items (set rate=0)
-- Use Waterfall mode to focus on fewer fluids at once
+**`ME: DOWN` in the header.** No `me_controller` on the network, or the call
+failed (chunk unloaded, adapter removed). The program keeps running and
+re-acquires the controller on its own; it just will not assign new work while
+the stock figures are unknown.
 
-### High CPU Usage
-- Reduce monitor resolution if possible
-- Disable color formatting (edit `drawUI()`)
-- Increase `snapshotInterval` (line 17, default 30 = 30 ticks)
+**A module sits in ERROR: "did not start within 5.0s".** It accepted the
+parameters but never became active. Usual causes: the Space Elevator is not
+powered, there is not enough computation allocated to the module, or the
+`{planet, slot}` pair for that fluid does not exist on your station. The module
+retries automatically after `errorCooldown`.
 
-### Changing config.lua values don't take effect
-- Reboot the Space Pumping computer, sometimes values don't take effect until reboot.
+**Pumps run but nothing arrives in the ME.** Almost always a wrong
+`setting = {planet, slot}`. Check it against your actual station layout.
 
-## Architecture
+**Storage overfilling.** Lower `safetyMargin`, or comment out low-value fluids.
 
-- **Hardware Detection:** Auto-scans for GT machines, identifies pump tiers
-- **Fluid Tracking:** Snapshots ME network every 30 ticks, calculates deltas
-- **Demand Sorting:** Three algorithms (Normal/Stairstep/Waterfall) for assignment
-- **Pump Control:** Sets planet/slot parameters, gates work with enable/disable
-- **UI Rendering:** Multi-column layout with color-coded demand and live throughput
+**Config changes not taking effect.** `config.lua` is read once at startup.
+Restart `autoPump`.
 
-## Advanced Customization
+**Everything looks slow.** Raise `uiInterval` and `pollInterval`. The row cache
+means an unchanged dashboard costs almost nothing, so this is rarely the problem
+— check for a module stuck in an arm/error loop in `/tmp/spacepump.log` instead.
 
-### Add a New Fluid
-1. Look up the fluid on the GTNH Wiki
-2. Find extraction rate (L/s)
-3. Add to `config.master`:
-   ```lua
-   ['NewFluid'] = {priority=2, amount=0, setting={planet,slot}, rate=rateValue},
-   ```
+---
 
-### Change Pump Behavior
-- Edit `tierLogic` table (line 22) to add new pump types
-- Adjust multipliers if using modded tiers
-- Modify sorting logic in `updateFluids()` for custom prioritization
+## How it works
 
-### Customize Display
-- Edit color values in `drawUI()` (hex format like `0xFF6666`)
-- Change column layout calculations if using different monitor size
-- Adjust fluid list length with `if i > 30 then break end` (line 149)
+- **Discovery** scans for `gt_machine` components, matches `getName()` against
+  `config.tiers`, and sorts the array by capacity so the biggest module gets the
+  deepest shortfall. Re-run every 30s, matching by address, so a module added
+  mid-run joins without disturbing anything in flight.
+- **Demand** is rebuilt each second from `getFluidsInNetwork()`, sorted by the
+  current mode. The comparators end in a label tie-break so the queue does not
+  reshuffle between frames when nothing has changed.
+- **Assignment** claims the fluids that running modules already hold, then walks
+  idle modules against the need queue.
+- **Arming** runs as a scheduler task: write the parameters, open the work gate,
+  then wait for `isMachineActive()` to confirm the cycle actually started before
+  closing the gate again. Confirming beats sleeping a guess — instant on a fast
+  server, patient on a laggy one.
+- **Every component call is wrapped.** An adapter pulled out puts one module in
+  ERROR with a cooldown; the rest of the array keeps pumping.
+- **One clock.** Everything is measured against `computer.uptime()` in real
+  seconds. No world ticks anywhere.
 
-## Notes
+---
 
-- **First run:** System performs 5-second pre-launch check to ensure all pumps idle
-- **Snapshot interval:** Every 30 ticks (1.5 seconds) for delta calculations
-- **Thread model:** Each pump tier has fixed thread count (T1=1, T2=4, T3=4)
-- **Safety margin:** Prevents overflow; recommend 0.15-0.25 (15-25% buffer)
+## License & credits
 
-## License & Credits
-
-Created for GTNH community. Based on OpenComputers Space Pumping script located at https://wiki.gtnewhorizons.com/wiki/Open_Computers_Space_Pumping
+Built for the GTNH community. Descended from the OpenComputers Space Pumping
+script on the [GTNH wiki](https://wiki.gtnewhorizons.com/wiki/Open_Computers_Space_Pumping).
