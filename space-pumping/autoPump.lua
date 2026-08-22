@@ -92,8 +92,16 @@ local function preLaunch()
   while true do
     local idle = pumps.allIdle()
     local lines = { "Waiting for " .. found .. " module(s) to finish their current cycle...", "" }
+    local anyError = false
     for _, p in ipairs(pumps.list()) do
-      lines[#lines + 1] = string.format("  %-5s %-3s  %s", p.short, p.tier, p.bootStatus or "?")
+      lines[#lines + 1] = string.format("  %-5s %-3s  %-8s %s",
+        p.short, p.tier, p.bootStatus or "?", p.bootError or "")
+      if p.bootError then anyError = true end
+    end
+    if anyError then
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = "A module is not answering isMachineActive(). Run 'diag' to see"
+      lines[#lines + 1] = "which methods its Adapter actually exposes."
     end
     ui.drawBoot(lines)
     if idle then break end
@@ -107,6 +115,32 @@ local function preLaunch()
 end
 
 if not preLaunch() then return end
+
+-- Say something about the fluid source before the dashboard takes over. ME:DOWN
+-- in a header corner is easy to miss, and without stock figures the array cannot
+-- decide anything at all -- so it is worth a line you have to look at.
+do
+  pumps.refreshFluids(pumps.getTarget())
+  if not pumps.state.meOk then
+    log:error("ME source unavailable: " .. tostring(pumps.state.meError))
+    ui.drawBoot({
+      "NO FLUID SOURCE - the array cannot decide what to pump.",
+      "",
+      "  " .. tostring(pumps.state.meError),
+      "",
+      "  Tried, in order: " .. table.concat(config.meComponents or {}, ", "),
+      "",
+      "  Needs an Adapter on a component that answers getFluidsInNetwork() for",
+      "  the network holding your fluid cells. Run 'diag' to see what this",
+      "  computer can actually reach.",
+      "",
+      "  Starting anyway - the source is picked up on its own if it appears.",
+    })
+    os.sleep(6)
+  else
+    log:info("fluid source: " .. tostring(pumps.state.meKind))
+  end
+end
 
 -- ---------------------------------------------------------------------------
 -- MAIN LOOP

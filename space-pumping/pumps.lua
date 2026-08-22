@@ -526,13 +526,19 @@ function pumps.allIdle()
   for _, p in ipairs(list) do
     local ok, active = hw(p, "isMachineActive")
     if not ok then
+      -- Keep the REASON, not just the fact. A boot screen that says "ERR" and
+      -- nothing else tells you a module is unhappy and gives you no way to find
+      -- out why -- which is exactly the situation you are in when you read it.
       p.bootStatus = "ERR"
+      p.bootError  = tostring(active)
       allIdle = false
     elseif active then
       p.bootStatus = "BUSY"
+      p.bootError  = nil
       allIdle = false
     else
       p.bootStatus = "CLEARED"
+      p.bootError  = nil
     end
   end
   return allIdle
