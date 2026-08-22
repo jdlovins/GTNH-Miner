@@ -823,8 +823,6 @@ local function dispatchBatch()
   local needs = findNeedsList()
   if #needs == 0 then return end
 
-  local neededAsteroids = {}
-  for _, need in ipairs(needs) do neededAsteroids[need.asteroid] = need end
 
   -- Per-asteroid usage: start from what's already committed (including pinned
   -- modules dispatched just above), count up as we go, and never exceed the cap.
@@ -834,37 +832,60 @@ local function dispatchBatch()
   local astCount       = activeAsteroidCounts()
   brokerState.cap      = cap   -- surfaced on the hardware panel
 
-  for _, droneKey in ipairs(config.droneKeyOrder) do
-    if (avail[droneKey] or 0) > 0 then
-      local droneTier = config.droneTierKeys[droneKey]
-      local drillKey  = config.droneDrillMap[droneTier]
+  -- Assign in NEED order, one module per need per pass.
+  --
+  -- findNeedsList() sorts by priority -- lowest stock ratio first under
+  -- threshold mode -- and that ordering used to be discarded, kept only as a
+  -- membership set. The loop walked drones from the highest tier down and, for
+  -- each, scanned config.asteroids in pairs() order taking whatever happened to
+  -- be needed. So the best drone in stock claimed every idle module for whatever
+  -- it could reach, and a need only reachable by a LOWER tier never got one.
+  --
+  -- Concretely: six MK-IX and twelve MK-I, Nether Star sitting at 0%. Its
+  -- asteroid is Gem Ores, maxDrone 6, so only the MK-I can mine it -- but the
+  -- MK-IX emptied the pool first, every pass, forever. The most starved item on
+  -- the board was the one guaranteed never to be mined.
+  --
+  -- One module per need per pass rather than filling a need to its cap before
+  -- moving on, so every need gets a module before any gets a second.
+  local function assignOne(need)
+    local asteroidName = need.asteroid
+    local asteroidData = config.asteroids[asteroidName]
+    if not asteroidData then return false end
+    if (astCount[asteroidName] or 0) >= cap then return false end
 
-      -- Need both a free drone AND enough kits for a full load.
-      if drillKey and (availKit[drillKey] or 0) >= minKitsForLoad then
-        for asteroidName, asteroidData in pairs(config.asteroids) do
-          -- Stop scanning once we've exhausted this drone or its kits.
-          if (avail[droneKey] or 0) <= 0 or (availKit[drillKey] or 0) < minKitsForLoad then break end
-          if droneTier >= asteroidData.minDrone and droneTier <= asteroidData.maxDrone then
-            -- Eligible if it's a current need AND under its module cap.
-            if neededAsteroids[asteroidName] and (astCount[asteroidName] or 0) < cap then
-              local assigned = false
-              for idx = #pool, 1, -1 do
-                local mod = pool[idx]
-                if tryDispatch(mod, asteroidName, droneKey) then
-                  astCount[asteroidName] = (astCount[asteroidName] or 0) + 1
-                  avail[droneKey]        = avail[droneKey] - 1                 -- consume a drone
-                  availKit[drillKey]     = availKit[drillKey] - minKitsForLoad -- consume kits for this load
-                  table.remove(pool, idx)
-                  assigned = true
-                  break
-                end
+    for _, droneKey in ipairs(config.droneKeyOrder) do
+      if (avail[droneKey] or 0) > 0 then
+        local droneTier = config.droneTierKeys[droneKey]
+        if droneTier >= asteroidData.minDrone and droneTier <= asteroidData.maxDrone then
+          local drillKey = config.droneDrillMap[droneTier]
+          if drillKey and (availKit[drillKey] or 0) >= minKitsForLoad then
+            for idx = #pool, 1, -1 do
+              local mod = pool[idx]
+              if tryDispatch(mod, asteroidName, droneKey) then
+                astCount[asteroidName] = (astCount[asteroidName] or 0) + 1
+                avail[droneKey]        = avail[droneKey] - 1
+                availKit[drillKey]     = availKit[drillKey] - minKitsForLoad
+                table.remove(pool, idx)
+                return true
               end
-              if assigned and #pool == 0 then return end
             end
           end
         end
       end
     end
+    return false
+  end
+
+  while #pool > 0 do
+    local assigned = false
+    for _, need in ipairs(needs) do
+      if #pool == 0 then break end
+      if assignOne(need) then assigned = true end
+    end
+    -- A pass that placed nothing will place nothing next time either: the pool,
+    -- the drones and the kits are all unchanged.
+    if not assigned then break end
   end
 end
 
