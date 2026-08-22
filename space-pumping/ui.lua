@@ -73,16 +73,19 @@ end
 local function fresh(y, key) return cache[y] == key end
 
 -- cells = { {x, text, fg}, ... }, painted left to right over a cleared row.
-local function paint(y, key, cells)
+-- `bg` is optional and defaults to black; the editor uses it for the selection
+-- highlight. It is part of the row's identity, so the caller folds it into `key`.
+local function paint(y, key, cells, bg)
   if cache[y] == key then return end
   cache[y] = key
-  setBG(0x000000)
+  setBG(bg or 0x000000)
   gpu.fill(1, y, W, 1, " ")
   for i = 1, #cells do
     local c = cells[i]
     setFG(c[3])
     gpu.set(c[1], y, c[2])
   end
+  if bg then setBG(0x000000) end
 end
 
 function ui.invalidate()
@@ -236,8 +239,18 @@ local function drawQueue(fluids)
       if not f then
         keyParts[#keyParts + 1] = "-"
       else
-        local text = string.format("%-16s %7.3f%% %11s",
-          f.label:sub(1, 16), f.perc, ui.formatFluid(f.amount))
+        -- Show the ceiling alongside the stock when the column is wide enough.
+        -- With per-fluid amounts a bare "23.13 GL" no longer tells you whether
+        -- that is nearly full or barely started, and the percentage alone hides
+        -- how much fluid the number actually represents.
+        local text
+        if L.queueColW >= 54 then
+          text = string.format("%-16s %7.3f%% %11s /%11s",
+            f.label:sub(1, 16), f.perc, ui.formatFluid(f.amount), ui.formatFluid(f.target or 0))
+        else
+          text = string.format("%-16s %7.3f%% %11s",
+            f.label:sub(1, 16), f.perc, ui.formatFluid(f.amount))
+        end
         keyParts[#keyParts + 1] = text
         cells[#cells + 1] = { c * L.queueColW + 2, text, fillColor(f.perc) }
       end
@@ -309,8 +322,8 @@ local function drawFooter(target)
 
   local cells = { { 2, "TARGET: " .. ui.formatFluid(target), 0xAAAAAA } }
   local labels = { { "[N]ormal", "Normal" }, { "[S]tairstep", "Stairstep" },
-                   { "[W]aterfall", "Waterfall" }, { "[Q]uit", nil } }
-  local x = math.max(30, W - 56)
+                   { "[W]aterfall", "Waterfall" }, { "[E]dit", nil }, { "[Q]uit", nil } }
+  local x = math.max(30, W - 70)
   for _, m in ipairs(labels) do
     local selected = (m[2] ~= nil and mode == m[2])
     cells[#cells + 1] = { x, (selected and ">" or " ") .. m[1],
@@ -360,6 +373,13 @@ function ui.shutdown(message)
 end
 
 function ui.size() return W, H end
+
+-- Shared with editor.lua so there is ONE row cache and ONE idea of what is
+-- physically on screen. Two caches over one screen would each believe rows the
+-- other had painted over were still theirs.
+ui.paint = paint
+ui.fresh = fresh
+function ui.gpu() return gpu end
 
 function ui.init(deps)
   config = deps.config

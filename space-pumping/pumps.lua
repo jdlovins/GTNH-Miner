@@ -165,22 +165,60 @@ function pumps.count() return #list end
 -- ---------------------------------------------------------------------------
 local me = nil
 
+-- Walk config.meComponents in order and take the first type present that
+-- actually answers getFluidsInNetwork(). Presence is not enough: an Adapter can
+-- expose a component whose network has no fluid storage behind it, and finding
+-- that out here beats discovering it as a permanently empty dashboard.
 local function meProxy()
   if me then return me end
-  if component.isAvailable("me_controller") then
-    local ok, proxy = pcall(function() return component.me_controller end)
-    if ok then me = proxy end
+  for _, kind in ipairs(config.meComponents or { "me_interface", "me_controller" }) do
+    if component.isAvailable(kind) then
+      local ok, proxy = pcall(function() return component[kind] end)
+      if ok and proxy and type(proxy.getFluidsInNetwork) == "function" then
+        me = proxy
+        pumps.state.meKind = kind
+        return me
+      end
+    end
   end
-  return me
+  return nil
 end
 
--- The storage ceiling, in litres.
+-- The GLOBAL storage ceiling, in litres. Used for any fluid without an amount
+-- of its own, and shown in the dashboard header as the default.
 function pumps.getTarget()
   if config.maxTargetOverride and config.maxTargetOverride > 0 then
     return config.maxTargetOverride
   end
   local cap = config.CELL_CAPACITIES[config.currentCellType] or 0
   return cap * (1 - config.safetyMargin)
+end
+
+-- True when the user has chosen an explicit set of fluids to stock.
+--
+-- An empty config.wanted in the SHIPPED file means "all of them", which is how
+-- this program behaved before per-fluid amounts existed, so an untouched install
+-- is unaffected. But once the editor has saved, an empty list is a deliberate
+-- "stock nothing" — config.wantedExplicit is what tells the two apart. Without
+-- it, unticking the last fluid would silently re-enable all forty.
+function pumps.hasWantedList()
+  if config.wantedExplicit then return true end
+  for _ in pairs(config.wanted or {}) do return true end
+  return false
+end
+
+-- Is this fluid one we are stocking at all?
+function pumps.isWanted(label)
+  if not pumps.hasWantedList() then return true end
+  return (config.wanted or {})[label] ~= nil
+end
+
+-- How much of `label` to maintain. A number in config.wanted is that fluid's own
+-- ceiling; `true` (or no list at all) means follow the global one.
+function pumps.targetFor(label, globalTarget)
+  local w = (config.wanted or {})[label]
+  if type(w) == "number" and w > 0 then return w end
+  return globalTarget
 end
 
 -- Re-read the ME network and rebuild the demand list.
@@ -238,19 +276,27 @@ function pumps.refreshFluids(target)
     end
   end
 
-  local floor = target * (config.tuning.minDeficitFraction or 0)
-  local out = {}
+  -- Each fluid is measured against ITS OWN ceiling, so `perc` stays comparable
+  -- across fluids you want very different amounts of — which is the whole point
+  -- of per-fluid amounts, and what the sort below then orders by.
+  local frac = config.tuning.minDeficitFraction or 0
+  local out  = {}
   for label, data in pairs(config.master) do
-    local amount = amounts[label] or 0
-    out[#out + 1] = {
-      label    = label,
-      amount   = amount,
-      priority = data.priority or 0,
-      setting  = data.setting,
-      rate     = st.rates[label] or 0,
-      perc     = (target > 0) and (amount / target) * 100 or 0,
-      deficit  = math.max(0, target - amount),
-    }
+    if pumps.isWanted(label) then
+      local amount = amounts[label] or 0
+      local cap    = pumps.targetFor(label, target)
+      out[#out + 1] = {
+        label    = label,
+        amount   = amount,
+        priority = data.priority or 0,
+        setting  = data.setting,
+        rate     = st.rates[label] or 0,
+        target   = cap,
+        perc     = (cap > 0) and (amount / cap) * 100 or 0,
+        deficit  = math.max(0, cap - amount),
+        floor    = cap * frac,
+      }
+    end
   end
 
   -- Sorting is by mode. Every comparator ends in a label tie-break: pairs()
@@ -283,8 +329,6 @@ function pumps.refreshFluids(target)
     end)
   end
 
-  -- Stash the deficit floor so assign() and the UI agree on what counts as needy.
-  st.deficitFloor = floor
   return out
 end
 
@@ -422,7 +466,6 @@ end
 -- ---------------------------------------------------------------------------
 function pumps.assign(needs, target)
   local st    = pumps.state
-  local floor = st.deficitFloor or 0
   local armed = 0
 
   local claimed = {}
@@ -439,7 +482,7 @@ function pumps.assign(needs, target)
   if st.mode == "Waterfall" then
     local head
     for _, f in ipairs(needs) do
-      if f.deficit > floor then head = f; break end
+      if f.deficit > (f.floor or 0) then head = f; break end
     end
     if not head then return 0 end
     for _, p in ipairs(idle) do
@@ -454,7 +497,7 @@ function pumps.assign(needs, target)
     while n <= #needs do
       local f = needs[n]
       n = n + 1
-      if f.deficit > floor and not claimed[f.label] then picked = f; break end
+      if f.deficit > (f.floor or 0) and not claimed[f.label] then picked = f; break end
     end
     if not picked then break end
     claimed[picked.label] = true
@@ -513,7 +556,7 @@ function pumps.init(deps)
   st.amounts, st.rates, st.snapshot = {}, {}, {}
   st.lastSnapshotAt, st.throughput  = nil, 0
   st.meOk, st.meError               = false, nil
-  st.lastRescanAt, st.deficitFloor  = 0, 0
+  st.lastRescanAt, st.meKind        = 0, nil
   return pumps
 end
 

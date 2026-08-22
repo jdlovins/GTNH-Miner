@@ -24,6 +24,7 @@ local FILES = {
   "logger.lua",
   "pumps.lua",
   "ui.lua",
+  "editor.lua",
   "autoPump.lua",
 }
 

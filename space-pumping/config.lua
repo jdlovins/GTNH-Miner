@@ -36,6 +36,19 @@ config.CELL_CAPACITIES = {
   ["Quantum"] = 275000000000, -- 275G L
 }
 
+-- ===================== ME NETWORK SOURCE ====================================
+-- Where stock figures come from. Each entry is an OpenComputers component type
+-- exposing getFluidsInNetwork(); the first one present on the network wins.
+--
+-- The normal setup is an Adapter touching a DUAL ME INTERFACE on the fluid
+-- subnet — the same block the miner's loader drives. An Adapter on an ME
+-- Controller works too and is listed as a fallback, which matters only if you
+-- would rather query the controller directly.
+--
+-- Whichever you use, it must belong to the network holding your fluid cells.
+-- Point it at the main base network and every fill percentage will be wrong.
+config.meComponents = { "me_interface", "me_controller" }
+
 -- ===================== PUMP TIERS ===========================================
 -- Keyed by the module's getName(). Add a row here to support a modded tier — an
 -- unrecognised gt_machine is ignored rather than guessed at.
@@ -188,5 +201,64 @@ config.master = {
   ['Radon']             = {priority=5, setting={8,6},  rate=3200},
   ['Molten Tin']        = {priority=0, setting={8,7},  rate=33600},
 }
+
+-- ===================== WHAT TO KEEP STOCKED =================================
+-- config.master above is the MAPPING: where each fluid comes from. This is the
+-- PREFERENCE: which of them you actually want, and how much of each.
+--
+-- Same split as the miner's dustTargets/conditions, and for the same reason —
+-- "Hydrogen comes from planet 8 slot 1" stays true whether or not you currently
+-- want Hydrogen right now.
+--
+--   key   : a label from config.master
+--   value : litres to maintain, or `true` to use the global cell-derived target
+--
+-- AN EMPTY TABLE MEANS "everything in config.master, at the global target" —
+-- what this program did before per-fluid amounts existed. So a fresh install
+-- behaves exactly as it always has until you choose otherwise.
+--
+-- Edit this in game: press E on the dashboard. That writes /home/user_config.lua
+-- rather than this file, so your choices survive re-running install-pump.
+config.wanted = {}
+config.wantedExplicit = false
+
+--------------------------------------------------------------------------------
+-- USER OVERLAY
+--
+-- Everything above this line is SHIPPED data and gets refreshed wholesale by
+-- install-pump, so nothing you change in game may live here.
+--
+-- Your choices live in /home/user_config.lua, which only the in-game editor ever
+-- writes. One writer per file, so the two can never clobber each other. The
+-- overlay is optional — with no user_config.lua the shipped defaults are used.
+--
+--   wanted  REPLACED by yours if present. What you stock is entirely your call.
+--   master  MERGED per fluid, so a {planet, slot} you corrected in game wins
+--           while every fluid you have not touched keeps following this file.
+--------------------------------------------------------------------------------
+do
+  local ok, user = pcall(dofile, "/home/user_config.lua")
+  if ok and type(user) == "table" then
+    if type(user.master) == "table" then
+      for label, m in pairs(user.master) do
+        if type(m) == "table" then
+          local base = config.master[label] or {}
+          config.master[label] = {
+            priority = m.priority or base.priority or 0,
+            setting  = m.setting  or base.setting,
+            rate     = m.rate     or base.rate or 0,
+          }
+        end
+      end
+    end
+    if type(user.wanted) == "table" then
+      config.wanted = user.wanted
+      -- The presence of the file is the choice, not the size of the table. An
+      -- empty list here means "stock nothing"; the empty default above means
+      -- "stock everything". See pumps.hasWantedList().
+      config.wantedExplicit = true
+    end
+  end
+end
 
 return config

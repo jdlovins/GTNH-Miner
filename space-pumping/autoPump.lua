@@ -27,7 +27,7 @@
 --   Each part runs at its own cadence, from config.tuning: UI ~4x/second,
 --   ME read and assignment once a second, hardware rescan every 30s.
 --
--- Controls:  N normal   S stairstep   W waterfall   Q quit
+-- Controls:  N normal   S stairstep   W waterfall   E edit fluids   Q quit
 -- =============================================================================
 
 local computer = require("computer")
@@ -43,6 +43,7 @@ local sched   = load("scheduler.lua")
 local logging = load("logger.lua")
 local pumps   = load("pumps.lua")
 local ui      = load("ui.lua")
+local editor  = load("editor.lua")
 
 assert(logging and logging.createLogger, "logger.lua not loaded")
 local log = logging.createLogger("autopump")
@@ -51,6 +52,7 @@ log:info("========== AUTOPUMP STARTUP ==========")
 
 pumps.init({ config = config, sched = sched, logger = log })
 ui.init({ config = config, pumps = pumps })
+editor.init({ config = config, pumps = pumps, ui = ui, logger = log })
 
 -- A crashed task must not leave a pump stuck in ARMING forever.
 sched.onError = function(name, err)
@@ -126,6 +128,7 @@ local KEYS = {
   [110] = "Normal",    [78] = "Normal",
   [115] = "Stairstep", [83] = "Stairstep",
   [119] = "Waterfall", [87] = "Waterfall",
+  [101] = "edit",      [69] = "edit",
   [113] = "quit",      [81] = "quit",
 }
 
@@ -134,10 +137,25 @@ local function mainLoop()
     -- 1. Service one event. The timeout is short so the loop keeps spinning;
     --    it is a yield, not a wait.
     local ev = { event.pull(0.05) }
-    if ev[1] == "key_down" then
+
+    if editor.isOpen() then
+      -- The editor owns INPUT while it is up, but only input. Execution falls
+      -- through to sched.tick() and pumps.step() below, so an arm already in
+      -- flight still completes while you edit. That is the whole reason this is
+      -- a UI mode rather than a separate blocking program.
+      if ev[1] then
+        editor.handle(ev)
+        -- A closing editor leaves the dashboard's row cache describing a screen
+        -- that is no longer there, so redraw the frame from scratch.
+        if not editor.isOpen() then ui.drawStaticFrame(); lastUIDraw = 0 end
+      end
+
+    elseif ev[1] == "key_down" then
       local action = KEYS[ev[3]]
       if action == "quit" then
         running = false
+      elseif action == "edit" then
+        editor.open()
       elseif action then
         if action ~= pumps.state.mode then
           pumps.setMode(action)
@@ -152,7 +170,14 @@ local function mainLoop()
     local now = computer.uptime()
 
     -- 2. Redraw first. See the header for why this comes before the work.
-    if now - lastUIDraw >= config.tuning.uiInterval then
+    if editor.isOpen() then
+      -- Event-driven: the editor repaints when something it owns changed, plus a
+      -- slow forced tick so live HAVE figures still refresh while you look at
+      -- them. Repainting a full-screen list four times a second is pure churn.
+      local force = (now - lastUIDraw >= 2.0)
+      editor.draw(force)
+      if force then lastUIDraw = now end
+    elseif now - lastUIDraw >= config.tuning.uiInterval then
       ui.draw(fluids, target)
       lastUIDraw = now
     end
@@ -168,8 +193,11 @@ local function mainLoop()
       lastPoll = now
     end
 
-    -- 5. Hand idle pumps work.
-    if now - lastAssign >= config.tuning.assignInterval then
+    -- 5. Hand idle pumps work -- unless the editor is open. Existing work is
+    --    never interrupted; we simply stop starting more, so the array drains to
+    --    idle rather than arming pumps against a list you are halfway through
+    --    changing.
+    if not editor.isOpen() and now - lastAssign >= config.tuning.assignInterval then
       -- Only dispatch against figures we actually have. A failed ME read leaves
       -- every amount at zero, and assigning off that would point the whole array
       -- at whatever sorts first while the real stock is unknown.

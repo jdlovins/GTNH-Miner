@@ -14,12 +14,17 @@ Modules. The two share `scheduler.lua` and `logger.lua` verbatim.
 | File | What it is |
 |---|---|
 | `autoPump.lua` | the program you run — main loop and boot sequence |
-| `config.lua` | **the only file you edit**: fluids, targets, tunables |
+| `config.lua` | shipped data: where each fluid comes from, plus every tunable |
 | `pumps.lua` | hardware, per-pump state machine, work assignment |
 | `ui.lua` | the dashboard |
+| `editor.lua` | the in-game fluid editor (press **E**) |
 | `scheduler.lua` | cooperative task engine (shared with space-miner) |
 | `logger.lua` | logging (shared with space-miner) |
 | `install-pump.lua` | one-shot downloader |
+
+Plus one file the program writes rather than ships: `/home/user_config.lua`, which
+the editor owns. Nothing else writes it and `install-pump` never touches it, so
+your choices survive an update.
 
 > **Upgrading from `autoPump-LargeScreen.lua`?** It has been replaced by the
 > files above. Run `install-pump`, then start `autoPump` instead. Your
@@ -45,11 +50,16 @@ Modules. The two share `scheduler.lua` and `logger.lua` verbatim.
 - One **Adapter** touching each Space Pumping Module's **controller block**.
   Each appears as a `gt_machine` component, and the script reads its tier from
   `getName()`.
-- One **Adapter** touching the **ME Controller of the fluid subnet the pumps
+- One **Adapter** touching a **dual ME Interface on the fluid subnet the pumps
   output into**. This is where every stock figure comes from. Point it at the
   network that actually holds your fluid cells — if you point it at the main
   base network instead, every fill percentage on the dashboard will be wrong and
   the array will pump the wrong things.
+
+  An Adapter on an **ME Controller** works equally well and is tried as a
+  fallback. `config.meComponents` sets the order; the first type present wins.
+  The interface is the better default because a small fluid subnet often has no
+  controller block at all, and then there is nothing for an Adapter to expose.
 
 All adapters must be on the same OpenComputers cable network as the computer.
 
@@ -74,8 +84,9 @@ Check the computer can see the hardware first:
 components
 ```
 
-You want exactly one `me_controller` and one `gt_machine` per pumping module. If
-a module is missing, its Adapter is not touching the controller block.
+You want one `gt_machine` per pumping module, plus an `me_interface` (or an
+`me_controller`) for the fluid subnet. If a module is missing, its Adapter is not
+touching the controller block.
 
 Then:
 
@@ -110,7 +121,47 @@ config.maxTargetOverride = 0          -- 0 = derive from the cell type
 Leave it at `0` in normal use — a non-zero value silently ignores your cell
 choice.
 
-### 2. The fluid list — the part that actually matters
+### 2. What to stock — do this in game
+
+Press **E** on the dashboard. That is the whole feature: a list of every fluid,
+tick the ones you want, set how much of each to keep.
+
+```
+FLUID EDITOR    3 of 40 stocked    * unsaved
+global target 27.28 GL
+
+FLUID                  MAINTAIN        HAVE            FILL      PRI
+------------------------------------------------------------------------
+ [x] Hydrogen          5.00 GL         4.21 GL         84.2%     p5
+ [x] Deuterium         global          19.80 GL        72.5%     p5
+ [ ] Krypton           --              0.00  L         --        p0
+```
+
+| Key | Does |
+|---|---|
+| up/down, pgup/pgdn, home/end | move |
+| `space` | start / stop stocking the selected fluid |
+| `enter` | type an amount — `5g`, `500m`, `250000`. Blank means "use the global target" |
+| `t` | cycle through common amounts without typing |
+| `a` / `n` | stock / unstock everything currently shown |
+| `/` | filter the list by name |
+| `s` | save |
+| `esc` | close (asks once if you have unsaved changes) |
+
+`a` and `n` apply to what the filter is showing, not all forty — so `/oil` then
+`a` stocks just the oils.
+
+Saving writes `/home/user_config.lua` and applies immediately; no restart. While
+the editor is open no *new* work is handed out, so the array drains to idle
+rather than arming pumps against a list you are halfway through changing. Work
+already in flight finishes normally.
+
+**Two defaults worth knowing.** With no `user_config.lua` the array stocks
+everything in `config.master` at the global target — what it did before per-fluid
+amounts existed. Once you have saved, the list is exactly what you chose, and an
+empty list genuinely means "stock nothing" rather than reverting to everything.
+
+### 3. The fluid list — where each fluid comes from
 
 ```lua
 config.master = {
@@ -127,9 +178,11 @@ config.master = {
 - **`rate`** is a wiki-sourced estimate used **only** for the throughput figure
   shown beside a working pump. It does not affect what gets pumped or how fast.
 
-To add a fluid, add a row. To stop pumping one, comment the row out.
+To add a fluid the station can reach, add a row here. To stop *stocking* one,
+untick it in the editor — leave the mapping alone, since where it comes from is
+still true.
 
-### 3. Tunables (optional)
+### 4. Tunables (optional)
 
 `config.tuning` holds every interval, timeout and threshold, all in **real
 seconds**. The defaults are fine; the ones worth knowing about:
@@ -143,7 +196,7 @@ seconds**. The defaults are fine; the ones worth knowing about:
 | `rescanInterval` | 30.0 | how often new modules are picked up |
 | `minDeficitFraction` | 0.002 | ignore a fluid less than 0.2% short |
 
-### 4. Logging (optional)
+### 5. Logging (optional)
 
 ```lua
 config.logging.enabled = true    -- INFO/DEBUG as well as errors
@@ -180,6 +233,7 @@ Press a key while it is running.
 | `N` | Normal | anything below target, highest priority first, then emptiest first. Balanced. |
 | `S` | Stairstep | everything under 10% first, then under 50%, then the rest. Fastest recovery from empty. |
 | `W` | Waterfall | the whole array on one fluid until it is full, then the next. Sequential. |
+| `E` | edit | opens the fluid editor. |
 | `Q` | quit | stops every module and exits cleanly. |
 
 In Normal and Stairstep the array never doubles up: fluids already being pumped
@@ -201,7 +255,7 @@ c910 T1   IDLE     None                 ---            d4e8 T2   ERROR    did no
 
 FLUID DEMAND QUEUE
 ---------------------------------------------------------------------------------------------------
-Hydrogen          85.432%     23.13 GL   Oxygen            12.004%      3.27 GL   ...
+Hydrogen          85.432%     23.13 GL /   27.28 GL   Oxygen     12.004%   3.27 GL /  27.28 GL
 ...
 
 NET FLOW   (total in: 42.10 ML/s)
@@ -209,11 +263,13 @@ NET FLOW   (total in: 42.10 ML/s)
 TOP INFLOW:                                  TOP OUTFLOW:
 Hydrogen           +18.20 ML/s               Heavy Oil        -2.10 ML/s
 
-TARGET: 27.28 GL                         >[N]ormal   [S]tairstep   [W]aterfall   [Q]uit
+TARGET: 27.28 GL                    >[N]ormal   [S]tairstep   [W]aterfall   [E]dit   [Q]uit
 ```
 
 **Fill colours:** red under 50%, orange 50–95%, green 95–110%, magenta above 110%
-(over target, which is harmless — it just means there is headroom).
+(over target, which is harmless — it just means there is headroom). The percentage
+is against **that fluid's own** ceiling, so it stays comparable across fluids you
+keep very different amounts of.
 
 **NET FLOW** is litres per second, measured over the last `snapshotInterval`.
 It is a rate, not a percentage — an absolute rate has no blind spot for a fluid
@@ -231,10 +287,11 @@ module's throughput.
 block. Run `components` and look for `gt_machine`. If one is listed but not
 adopted, its `getName()` is not in `config.tiers` — add it there.
 
-**`ME: DOWN` in the header.** No `me_controller` on the network, or the call
-failed (chunk unloaded, adapter removed). The program keeps running and
-re-acquires the controller on its own; it just will not assign new work while
-the stock figures are unknown.
+**`ME: DOWN` in the header.** Nothing in `config.meComponents` is on the network,
+or the call failed (chunk unloaded, adapter removed). The most common cause is an
+Adapter on a fluid subnet with no ME Controller *and* no ME Interface for it to
+attach to. The program keeps running and re-acquires on its own; it just will not
+assign new work while the stock figures are unknown.
 
 **A module sits in ERROR: "did not start within 5.0s".** It accepted the
 parameters but never became active. Usual causes: the Space Elevator is not
@@ -245,10 +302,12 @@ retries automatically after `errorCooldown`.
 **Pumps run but nothing arrives in the ME.** Almost always a wrong
 `setting = {planet, slot}`. Check it against your actual station layout.
 
-**Storage overfilling.** Lower `safetyMargin`, or comment out low-value fluids.
+**Storage overfilling.** Lower `safetyMargin`, give the offending fluid a smaller
+amount in the editor, or untick it.
 
-**Config changes not taking effect.** `config.lua` is read once at startup.
-Restart `autoPump`.
+**Config changes not taking effect.** `config.lua` is read once at startup, so
+restart `autoPump` after editing it by hand. Changes made in the **E** editor
+apply the moment you save — no restart.
 
 **Everything looks slow.** Raise `uiInterval` and `pollInterval`. The row cache
 means an unchanged dashboard costs almost nothing, so this is rarely the problem
@@ -262,7 +321,8 @@ means an unchanged dashboard costs almost nothing, so this is rarely the problem
   `config.tiers`, and sorts the array by capacity so the biggest module gets the
   deepest shortfall. Re-run every 30s, matching by address, so a module added
   mid-run joins without disturbing anything in flight.
-- **Demand** is rebuilt each second from `getFluidsInNetwork()`, sorted by the
+- **Demand** is rebuilt each second from `getFluidsInNetwork()`, measured against
+  each fluid's own ceiling so the percentages stay comparable, then sorted by the
   current mode. The comparators end in a label tie-break so the queue does not
   reshuffle between frames when nothing has changed.
 - **Assignment** claims the fluids that running modules already hold, then walks
