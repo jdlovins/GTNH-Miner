@@ -59,14 +59,26 @@ local MODES = { Normal = true, Stairstep = true, Waterfall = true }
 -- SAFE HARDWARE CALLS
 -- ---------------------------------------------------------------------------
 
--- Call `name` on a pump's proxy. Returns (true, results...) or (false, message).
--- Nothing in this file calls a proxy method any other way.
+-- Does this component actually have `name`? Straight from the driver, which is
+-- the only trustworthy answer.
+local function hasMethod(addr, name)
+  local ok, m = pcall(component.methods, addr)
+  return ok and type(m) == "table" and m[name] ~= nil
+end
+
+-- Call `name` on a pump. Returns (true, results...) or (false, message).
+-- Nothing in this file calls a component any other way.
+--
+-- USES component.invoke, NOT proxy indexing, and this is not a style choice.
+-- The previous version fetched `p.module[name]` and rejected it unless
+-- `type(fn) == "function"`. OpenComputers proxy methods are callable TABLES --
+-- that is how `tostring(component.gpu.set)` can return its documentation -- so
+-- that guard rejected every method on every component. Every module went ERR at
+-- boot and the ME source was discarded as unusable, from one wrong type check.
+-- invoke() is the primitive underneath the proxy and has no such trap.
 local function hw(p, name, ...)
-  local fn = p.module and p.module[name]
-  if type(fn) ~= "function" then
-    return false, name .. ": not available on this component"
-  end
-  local r = table.pack(pcall(fn, ...))
+  if not p.addr then return false, "pump has no address" end
+  local r = table.pack(pcall(component.invoke, p.addr, name, ...))
   if not r[1] then return false, tostring(r[2]) end
   return true, table.unpack(r, 2, r.n)
 end
@@ -102,7 +114,7 @@ function pumps.findPumps()
   for address in iter do
     local okProxy, module = pcall(component.proxy, address)
     if okProxy and module then
-      local okName, name = pcall(function() return module.getName() end)
+      local okName, name = pcall(component.invoke, address, "getName")
       local tier = okName and name and config.tiers[name]
       if tier then
         seen[address] = true
@@ -125,9 +137,27 @@ function pumps.findPumps()
         -- back a new proxy object for the same address.
         p.module   = module
         p.tier     = tier.label
-        p.threads  = tier.threads
         p.mult     = tier.mult
-        p.capacity = tier.mult * tier.threads
+
+        -- How many recipe slots does this module really have? Ask it, rather
+        -- than trusting the tier table. getParameters() returns keys shaped
+        -- "recipe0.planetType", "recipe1.gasType", ... so the highest index
+        -- present is the answer. A T1 has one; setting recipe1.* on it would
+        -- throw. The tier table is only the fallback.
+        local okP, params = pcall(component.invoke, address, "getParameters")
+        local slots = 0
+        if okP and type(params) == "table" then
+          for key in pairs(params) do
+            local n = tostring(key):match("^recipe(%d+)%.")
+            if n then slots = math.max(slots, tonumber(n) + 1) end
+          end
+        end
+        p.threads  = (slots > 0) and slots or tier.threads
+        p.capacity = tier.mult * p.threads
+        if slots > 0 and slots ~= tier.threads then
+          log:info(string.format("[PUMP %s] %d recipe slot(s), config.tiers says %d -- using the machine",
+            p.short, slots, tier.threads))
+        end
       end
     end
   end
@@ -163,24 +193,42 @@ function pumps.count() return #list end
 -- controller that goes away (chunk unload, adapter removed) is picked back up
 -- on its own once it returns, without a restart.
 -- ---------------------------------------------------------------------------
-local me = nil
+local meAddr = nil
 
--- Walk config.meComponents in order and take the first type present that
--- actually answers getFluidsInNetwork(). Presence is not enough: an Adapter can
--- expose a component whose network has no fluid storage behind it, and finding
--- that out here beats discovering it as a permanently empty dashboard.
-local function meProxy()
-  if me then return me end
-  for _, kind in ipairs(config.meComponents or { "me_interface", "me_controller" }) do
-    if component.isAvailable(kind) then
-      local ok, proxy = pcall(function() return component[kind] end)
-      if ok and proxy and type(proxy.getFluidsInNetwork) == "function" then
-        me = proxy
+-- Find something that can tell us what fluid is in the network.
+--
+-- Two stages, and the second one matters. First try the component types named
+-- in config.meComponents. If none of them answer, SCAN EVERY COMPONENT for one
+-- that has getFluidsInNetwork.
+--
+-- Name-guessing alone is how this went wrong: the shipped list said
+-- me_interface and me_controller, the real component on a GTNH dual interface
+-- is called `fluid_interface`, and the header just said ME: DOWN. A capability
+-- probe cannot be wrong about a name it never has to know.
+local function findMeAddr()
+  if meAddr and hasMethod(meAddr, "getFluidsInNetwork") then return meAddr end
+  meAddr = nil
+
+  for _, kind in ipairs(config.meComponents or {}) do
+    for addr in component.list(kind) do
+      if hasMethod(addr, "getFluidsInNetwork") then
+        meAddr = addr
         pumps.state.meKind = kind
-        return me
+        return meAddr
       end
     end
   end
+
+  for addr, kind in component.list() do
+    if hasMethod(addr, "getFluidsInNetwork") then
+      meAddr = addr
+      pumps.state.meKind = kind
+      log:info("fluid source found by capability scan: " .. tostring(kind) ..
+               " (add it to config.meComponents to skip the scan)")
+      return meAddr
+    end
+  end
+
   return nil
 end
 
@@ -230,15 +278,16 @@ function pumps.refreshFluids(target)
   local amounts = {}
   for label in pairs(config.master) do amounts[label] = 0 end
 
-  local proxy = meProxy()
-  if not proxy then
-    st.meOk, st.meError = false, "no me_controller on the component network"
+  local addr = findMeAddr()
+  if not addr then
+    st.meOk, st.meError = false,
+      "nothing on this network answers getFluidsInNetwork() -- run 'diag me'"
   else
-    local ok, fluids = pcall(function() return proxy.getFluidsInNetwork() end)
+    local ok, fluids = pcall(component.invoke, addr, "getFluidsInNetwork")
     if not ok then
-      -- Drop the proxy so the next pass re-acquires it.
-      me, st.meOk, st.meError = nil, false, tostring(fluids)
-      log:warn("ME read failed: " .. tostring(fluids))
+      -- Drop the address so the next pass re-acquires it.
+      meAddr, st.meOk, st.meError = nil, false, tostring(fluids)
+      log:warn("fluid read failed: " .. tostring(fluids))
     else
       for _, f in ipairs(fluids or {}) do
         if f.label and amounts[f.label] ~= nil then amounts[f.label] = f.amount or 0 end
@@ -350,18 +399,32 @@ local function armTask(p, fluid)
   return function()
     local t = config.tuning
 
-    for i = 1, (p.threads or 1) do
-      local base = 2 * (i - 1)
-      local ok, err = hw(p, "setParameters", base, 0, fluid.setting[1])
-      if not ok then p.armResult = { ok = false, err = "setParameters planet: " .. err }; return end
-      ok, err = hw(p, "setParameters", base, 1, fluid.setting[2])
-      if not ok then p.armResult = { ok = false, err = "setParameters slot: " .. err }; return end
+    -- NAMED parameters, one recipe slot at a time.
+    --
+    -- The module exposes setParameter(key, value) with keys shaped
+    -- "recipe0.planetType" / "recipe0.gasType" / "recipe0.parallel", plus a
+    -- top-level "batch". The indexed setParameters(i, j, value) this script used
+    -- to call does not exist on these machines at all -- GTNH replaced it, and
+    -- the old call simply failed, which is why nothing ever armed. Confirmed by
+    -- reading getParameters() off a live module rather than guessing.
+    for i = 0, (p.threads or 1) - 1 do
+      local slot = string.format(config.paramKeys.recipe, i)
+      local ok, err = hw(p, "setParameter", slot .. config.paramKeys.planet, fluid.setting[1])
+      if not ok then p.armResult = { ok = false, err = "planetType: " .. err }; return end
+      ok, err = hw(p, "setParameter", slot .. config.paramKeys.gas, fluid.setting[2])
+      if not ok then p.armResult = { ok = false, err = "gasType: " .. err }; return end
+      if t.parallel and t.parallel > 0 then
+        ok, err = hw(p, "setParameter", slot .. config.paramKeys.parallel, t.parallel)
+        if not ok then p.armResult = { ok = false, err = "parallel: " .. err }; return end
+      end
     end
 
-    local ok, err = hw(p, "setParameters", 9, 1, t.cycleCount)
-    if not ok then p.armResult = { ok = false, err = "setParameters cycles: " .. err }; return end
+    if t.batch and t.batch > 0 then
+      local ok, err = hw(p, "setParameter", config.paramKeys.batch, t.batch)
+      if not ok then p.armResult = { ok = false, err = "batch: " .. err }; return end
+    end
 
-    ok, err = hw(p, "setWorkAllowed", true)
+    local ok, err = hw(p, "setWorkAllowed", true)
     if not ok then p.armResult = { ok = false, err = "setWorkAllowed(true): " .. err }; return end
 
     -- Confirm the cycle actually started rather than sleeping a guess. See the
@@ -554,7 +617,7 @@ function pumps.init(deps)
   sched  = deps.sched
   log    = deps.logger
   list   = {}
-  me     = nil
+  meAddr = nil
   -- Reset runtime state too. Otherwise a second init inherits the previous
   -- run's snapshot timestamp, and the first delta window is measured against a
   -- baseline that belongs to a different session.

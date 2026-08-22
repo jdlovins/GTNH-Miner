@@ -51,15 +51,19 @@ your choices survive an update.
   Each appears as a `gt_machine` component, and the script reads its tier from
   `getName()`.
 - One **Adapter** touching a **dual ME Interface on the fluid subnet the pumps
-  output into**. This is where every stock figure comes from. Point it at the
-  network that actually holds your fluid cells — if you point it at the main
-  base network instead, every fill percentage on the dashboard will be wrong and
-  the array will pump the wrong things.
+  output into** — it registers as the `fluid_interface` component. This is where
+  every stock figure comes from. Point it at the network that actually holds
+  your fluid cells; aim it at the main base network instead and every fill
+  percentage will be wrong.
 
-  An Adapter on an **ME Controller** works equally well and is tried as a
-  fallback. `config.meComponents` sets the order; the first type present wins.
-  The interface is the better default because a small fluid subnet often has no
-  controller block at all, and then there is nothing for an Adapter to expose.
+  An **ME Controller** works too. `config.meComponents` lists the types to try,
+  but it is only a shortcut: if none match, the program scans every component
+  for one that answers `getFluidsInNetwork()` and uses whatever it finds,
+  logging the type name so you can add it. A wrong list costs a scan, not a
+  failure.
+
+  An Adapter reads only the block it is **physically touching**, face to face.
+  Same cable is not enough, and neither is being beside it.
 
 All adapters must be on the same OpenComputers cable network as the computer.
 
@@ -84,9 +88,20 @@ Check the computer can see the hardware first:
 components
 ```
 
-You want one `gt_machine` per pumping module, plus an `me_interface` (or an
+You want one `gt_machine` per pumping module, plus a `fluid_interface` (or an
 `me_controller`) for the fluid subnet. If a module is missing, its Adapter is not
 touching the controller block.
+
+Better still, use the bundled diagnostic, which calls each component rather than
+just naming it:
+
+```
+diag
+```
+
+`diag pumps` dumps each module's live parameter list; `diag me` hunts for
+anything that can report fluid stock; `diag full` lists every method of every
+component.
 
 Then:
 
@@ -170,9 +185,10 @@ config.master = {
 }
 ```
 
-- **`setting = {planet, slot}`** must match **your** space station's layout. This
-  is the single most common misconfiguration: with the wrong pair the module
-  runs happily and nothing arrives.
+- **`setting = {planetType, gasType}`** — the two values written to the module's
+  recipe slot as `recipe0.planetType` and `recipe0.gasType`. They must match your
+  station: with the wrong pair the module runs happily and nothing arrives. Set
+  one module by hand in game, then read the pair back with `diag pumps`.
 - **`priority`** 0–5. Higher is pumped sooner among fluids that are below target.
   Use 4–5 for whatever is gating your current progression.
 - **`rate`** is a wiki-sourced estimate used **only** for the throughput figure
@@ -293,11 +309,13 @@ Adapter on a fluid subnet with no ME Controller *and* no ME Interface for it to
 attach to. The program keeps running and re-acquires on its own; it just will not
 assign new work while the stock figures are unknown.
 
-**A module sits in ERROR: "did not start within 5.0s".** It accepted the
-parameters but never became active. Usual causes: the Space Elevator is not
-powered, there is not enough computation allocated to the module, or the
-`{planet, slot}` pair for that fluid does not exist on your station. The module
-retries automatically after `errorCooldown`.
+**A module sits in ERROR.** The message names the failing step. `did not start
+within 5.0s` means it accepted its parameters but never became active — usually
+an unpowered Space Elevator, not enough computation allocated to the module, or a
+`{planetType, gasType}` pair that does not exist on your station. A message
+naming a parameter (`planetType: ...`) means the key itself was rejected; check
+`config.paramKeys` against what `diag pumps` reports. Either way the module
+retries after `errorCooldown` and the rest of the array keeps working.
 
 **Pumps run but nothing arrives in the ME.** Almost always a wrong
 `setting = {planet, slot}`. Check it against your actual station layout.
@@ -335,6 +353,13 @@ means an unchanged dashboard costs almost nothing, so this is rarely the problem
   ERROR with a cooldown; the rest of the array keeps pumping.
 - **One clock.** Everything is measured against `computer.uptime()` in real
   seconds. No world ticks anywhere.
+- **Component calls go through `component.invoke`,** never proxy indexing.
+  OpenComputers exposes proxy methods as callable *tables* rather than functions
+  — that is how `tostring(component.gpu.set)` returns its documentation — so a
+  `type(fn) == "function"` guard silently rejects every method on every
+  component. That mistake once made the whole array report ERR and the fluid
+  source report DOWN at the same time. `invoke` is the primitive underneath the
+  proxy and has no such trap.
 
 ---
 

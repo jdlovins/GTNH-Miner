@@ -41,13 +41,16 @@ config.CELL_CAPACITIES = {
 -- exposing getFluidsInNetwork(); the first one present on the network wins.
 --
 -- The normal setup is an Adapter touching a DUAL ME INTERFACE on the fluid
--- subnet — the same block the miner's loader drives. An Adapter on an ME
--- Controller works too and is listed as a fallback, which matters only if you
--- would rather query the controller directly.
+-- subnet, which registers as `fluid_interface`. An ME Controller works too.
+--
+-- If none of these match, the program SCANS every component for one that has
+-- getFluidsInNetwork() and uses it, logging what it found so you can add the
+-- name here. This list is an optimisation, not a requirement — a name that is
+-- merely wrong costs a scan, not a failure.
 --
 -- Whichever you use, it must belong to the network holding your fluid cells.
 -- Point it at the main base network and every fill percentage will be wrong.
-config.meComponents = { "me_interface", "me_controller" }
+config.meComponents = { "fluid_interface", "me_interface", "me_controller" }
 
 -- ===================== PUMP TIERS ===========================================
 -- Keyed by the module's getName(). Add a row here to support a modded tier — an
@@ -62,6 +65,30 @@ config.tiers = {
   ["projectmodulepumpt1"] = { label = "T1", threads = 1, mult = 4   },
   ["projectmodulepumpt2"] = { label = "T2", threads = 4, mult = 16  },
   ["projectmodulepumpt3"] = { label = "T3", threads = 4, mult = 256 },
+}
+
+-- ===================== MODULE PARAMETER KEYS ================================
+-- How to address a pumping module's settings. Read off a live T1 with
+-- getParameters(), which returned exactly:
+--
+--   batch                1
+--   recipe0.gasType      1
+--   recipe0.parallel     4
+--   recipe0.planetType   1
+--
+-- `recipe` is a format string taking the zero-based slot index. A T1 has one
+-- slot, higher tiers have more; the real count is read from the machine at
+-- discovery rather than assumed from the tier.
+--
+-- These exist as config because GTNH has already renamed this API once: the
+-- indexed setParameters(i, j, value) the original script used is simply gone.
+-- If it is renamed again, this table is the only thing that needs to change.
+config.paramKeys = {
+  recipe   = "recipe%d",
+  planet   = ".planetType",
+  gas      = ".gasType",
+  parallel = ".parallel",
+  batch    = "batch",
 }
 
 -- ===================== TUNING (all real seconds) ============================
@@ -99,9 +126,15 @@ config.tuning = {
   -- (or a chunk reloaded) is picked up without a restart.
   rescanInterval     = 30.0,
 
-  -- Cycle count written to the module's duration parameter. This is the old
-  -- script's hardcoded setParameters(9, 1, 30).
-  cycleCount         = 30,
+  -- Written to the module's `batch` parameter on each arm. The original script
+  -- pushed 30 through the old indexed API; `batch` is the only non-recipe
+  -- parameter the machine exposes, so this is its successor. Set to 0 to leave
+  -- whatever the module already has.
+  batch              = 30,
+
+  -- Written to every recipe slot's `parallel`. Modules ship with a sensible
+  -- value already (a T1 reads 4), so the default is 0 = do not touch it.
+  parallel           = 0,
 
   -- A fluid short by less than this fraction of the target is not worth
   -- occupying a pump with; a genuinely empty one gets the pump instead.
@@ -143,9 +176,11 @@ config.logging = {
 -- One row per fluid this station can pump.
 --
 --   priority : 0-5. Higher is pumped sooner among fluids that are below target.
---   setting  : {planet, slot} on YOUR space station. These MUST match your
---              actual layout — a wrong pair means the pump runs and nothing
---              arrives. It is the most common misconfiguration by a distance.
+--   setting  : {planetType, gasType} — the two values written to the module's
+--              recipe slot. Both are the indices the module itself uses, and
+--              they MUST match your station: a wrong pair means the module runs
+--              happily and nothing arrives. Read the current pair off a module
+--              you have set by hand with `diag pumps`.
 --   rate     : throughput estimate, used ONLY for the "/t" figure shown beside a
 --              working pump. It does not affect what gets pumped or how fast.
 --              Sourced from the GTNH wiki; treat it as indicative, not exact.
