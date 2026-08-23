@@ -2990,6 +2990,19 @@ config.asteroidCap = nil
 config.tipsPerLoad = 128
 config.rodsPerLoad = 128
 
+-- How much has to be in the bus before the module STARTS. The rest of the
+-- buffer above is filled while it is already mining.
+--
+-- Waiting for the full 128 of each meant 256 items through the ME before a drill
+-- that was ready to work would turn on, and six modules do that at once. One
+-- stack is one interface configuration slot, which is the fastest delivery the
+-- ME can make.
+--
+-- Set these equal to tipsPerLoad/rodsPerLoad to go back to filling completely
+-- before starting.
+config.tipsToStart = 64
+config.rodsToStart = 64
+
 -- Par levels for drill consumables. The broker publishes this table to the hw
 -- telem node (DRILL_PAR on config.ports.hardware); the node compares it against
 -- its own live ME scan and auto-crafts anything below par.

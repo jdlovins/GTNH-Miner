@@ -159,6 +159,9 @@ local cycleStats = {
   doneTime  = 0,     -- seconds spent returning items
   idleTime  = 0,     -- seconds spent IDLE waiting for a job
   loadMax   = 0,
+  spins     = 0,     -- gate-open -> machine-running samples
+  spinTime  = 0,
+  spinMax   = 0,
   startedAt = 0,     -- set once telemetry is ready and work can actually begin
 }
 
@@ -357,6 +360,9 @@ local function pollLoad(mod)
     end
 
     mod.adapter.setWorkAllowed(true)
+    mod.enabledAt     = computer.uptime()
+    mod.spinupDone    = false
+    mod.lastSpinPollAt = 0
   else
     mod.status = "ERROR"
     mod.lastError = tostring(r.err)
@@ -364,11 +370,16 @@ local function pollLoad(mod)
   end
 end
 
--- Top a pinned module's input bus back up to full while it runs. Reuses the db
--- fingerprints written by the initial load (still valid — we never cleared those
--- slots), so the interface can restock tips/rods by identity. Runs as a task, so
--- it yields while waiting for items to arrive and never blocks the main loop.
-local function restockPinned(mod)
+-- Top a running module's input bus back up to full. Reuses the db fingerprints
+-- written by the initial load (still valid — we never cleared those slots), so
+-- the interface can restock tips/rods by identity. Runs as a task, so it yields
+-- while waiting for items to arrive and never blocks the main loop.
+--
+-- This began as a pinned-module feature, to stop a permanently-assigned module
+-- cycling through DONE/reload. It now runs for EVERY module, because the loader
+-- deliberately starts on one stack instead of the full buffer -- so carrying a
+-- module the rest of the way up is the normal path, not a special case.
+local function restockRunning(mod)
   if mod.status ~= "RUNNING" or not mod.job then return end
   local drill = config.drills[mod.job.drillKey]
   if not drill then return end
@@ -461,13 +472,32 @@ local function stepRunning(mod)
   -- short cooperative task on an interval that refills tips/rods from the ME via
   -- the interface + transposer. The drone (bus slot 1) isn't consumed, so only
   -- tips (slot 2) and rods (slot 3) are refreshed.
-  if mod.pinnedAsteroid and mod.job then
+  if mod.job then
     if (not mod.restockHandle or mod.restockHandle.done()) and now >= (mod.nextRestockAt or 0) then
       mod.nextRestockAt = now + PIN_RESTOCK_INTERVAL
       mod.restockHandle = sched.spawn(function()
-        local ok, err = pcall(restockPinned, mod)
-        if not ok then logger:warn("[PIN] M" .. mod.index .. " restock error: " .. tostring(err)) end
+        local ok, err = pcall(restockRunning, mod)
+        if not ok then logger:warn("[RESTOCK] M" .. mod.index .. " error: " .. tostring(err)) end
       end, "restock-M" .. mod.index)
+    end
+  end
+
+  -- SPIN-UP: how long between enabling the work gate and the machine actually
+  -- running. Measured separately from load time because they have different
+  -- causes and only one of them is ours -- if loads are fast and spin-up is
+  -- seconds, the remaining delay is GregTech's, not this broker's.
+  if mod.enabledAt and not mod.spinupDone then
+    if now - (mod.lastSpinPollAt or 0) >= 0.25 then
+      mod.lastSpinPollAt = now
+      local okS, active = pcall(mod.adapter.isMachineActive)
+      if okS and active then
+        local spin = now - mod.enabledAt
+        mod.spinupDone = true
+        cycleStats.spinTime = (cycleStats.spinTime or 0) + spin
+        cycleStats.spins    = (cycleStats.spins or 0) + 1
+        if spin > (cycleStats.spinMax or 0) then cycleStats.spinMax = spin end
+        logger:info(string.format("[SPINUP] M%d running %.2fs after enable", mod.index, spin))
+      end
     end
   end
 
@@ -1281,6 +1311,10 @@ local function drawHWPanel()
         duty >= 80 and 0x00FF00 or duty >= 60 and 0xFFAA00 or 0xFF4444)
     put(string.format("  LOAD avg %.1fs  max %.1fs",
         cycleStats.loadTime / cycleStats.cycles, cycleStats.loadMax), 0x668866)
+    if (cycleStats.spins or 0) > 0 then
+      put(string.format("  SPINUP avg %.1fs  max %.1fs",
+          cycleStats.spinTime / cycleStats.spins, cycleStats.spinMax), 0x668866)
+    end
     put(string.format("  WAIT idle %.0fs  return %.0fs",
         cycleStats.idleTime, cycleStats.doneTime), 0x666666)
   else

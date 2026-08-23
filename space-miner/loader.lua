@@ -117,6 +117,23 @@ function loader.run(mod, job, deps)
   local TIPS_PER = config.tipsPerLoad or TIPS_PER_DEFAULT
   local RODS_PER = config.rodsPerLoad or RODS_PER_DEFAULT
 
+  -- HOW MUCH IS ENOUGH TO START.
+  --
+  -- The load used to block until the FULL buffer was in the bus. At the shipped
+  -- 128 tips and 128 rods that is 256 items through the ME per module, with six
+  -- modules pulling at once -- seconds of a drill sitting fully stocked enough to
+  -- work while it waits for stock it will not touch for minutes.
+  --
+  -- A module needs a working buffer, not a full one. Drain to the start amount,
+  -- start mining, and let the broker's top-up task carry it the rest of the way
+  -- while it runs -- the same mechanism pinned modules have always used.
+  --
+  -- Defaults to one stack, which is one interface configuration slot and so the
+  -- fastest thing the ME can deliver. Set tipsToStart = tipsPerLoad to get the
+  -- old fill-completely-then-start behaviour back.
+  local TIPS_START = math.min(config.tipsToStart or STACK_DEFAULT, TIPS_PER)
+  local RODS_START = math.min(config.rodsToStart or STACK_DEFAULT, RODS_PER)
+
   local droneName  = config.drones[job.droneKey]
   local drillEntry = config.drills[job.drillKey]
 
@@ -422,17 +439,20 @@ function loader.run(mod, job, deps)
                   ", got " .. (droneStack and droneStack.label or "empty")
   end
   local ok, shortLabel = drain({
-    { label = drillEntry.tip, target = TIPS_PER },
-    { label = drillEntry.rod, target = RODS_PER },
+    { label = drillEntry.tip, target = TIPS_START },
+    { label = drillEntry.rod, target = RODS_START },
   })
   if not ok then
-    local target = (shortLabel == drillEntry.tip) and TIPS_PER or RODS_PER
+    local target = (shortLabel == drillEntry.tip) and TIPS_START or RODS_START
     local kind   = (shortLabel == drillEntry.tip) and "tip" or "rod"
     clearInterfaceSlots(mod)
     return false, kind .. " shortfall: got " .. busTotal(shortLabel) .. "/" .. target
   end
 
   clearInterfaceSlots(mod)
+  -- Tell the caller what is still owed, so it knows to keep topping up.
+  stats.startedWith = { tips = TIPS_START, rods = RODS_START }
+  stats.bufferTarget = { tips = TIPS_PER, rods = RODS_PER }
   return true, stats
 end
 
