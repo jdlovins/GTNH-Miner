@@ -400,7 +400,12 @@ function pumps.refreshFluids(target)
       local bn = (b.perc < 100) and 1 or 0
       if an ~= bn then return an > bn end
       if a.priority ~= b.priority then return a.priority > b.priority end
-      if a.amount ~= b.amount then return a.amount < b.amount end
+      -- Emptiest FIRST, by fill fraction rather than by raw litres. Absolute
+      -- amounts stopped being comparable the moment each fluid got its own
+      -- ceiling: 0.9 GL of something you want 1 GL of is nearly done, while
+      -- 1 GL of something you want 100 GL of has barely started, yet by litres
+      -- the nearly-done one sorted first.
+      if a.perc ~= b.perc then return a.perc < b.perc end
       return a.label < b.label
     end)
   end
