@@ -145,6 +145,30 @@ local brokerState = {
   priorityMode = "threshold", -- "threshold" (lowest fill first) | "rarity" (dust priority first)
 }
 
+-- CYCLE ACCOUNTING
+--
+-- "Did last night produce less ore?" is unanswerable by watching the dashboard,
+-- and one night's yield is a noisy sample anyway. What IS measurable is where a
+-- module's time goes: mining is the productive part and everything else --
+-- loading, returning, waiting for a job -- is overhead. Duty cycle makes that a
+-- number you can compare between runs instead of a feeling.
+local cycleStats = {
+  cycles    = 0,     -- completed load->mine->return cycles
+  loadTime  = 0,     -- seconds spent LOADING
+  runTime   = 0,     -- seconds spent RUNNING (the only productive state)
+  doneTime  = 0,     -- seconds spent returning items
+  idleTime  = 0,     -- seconds spent IDLE waiting for a job
+  loadMax   = 0,
+  startedAt = 0,     -- set once telemetry is ready and work can actually begin
+}
+
+local function statsDuty()
+  local total = cycleStats.loadTime + cycleStats.runTime
+             + cycleStats.doneTime + cycleStats.idleTime
+  if total <= 0 then return 0 end
+  return cycleStats.runTime / total * 100
+end
+
 local drillKeyOrder = {
   "steel", "titanium", "tungstensteel", "naquadah",
   "naquadahAlloy", "neutronium", "cosmicNeutronium", "infinity", "transcendentMetal"
@@ -178,15 +202,30 @@ local PW = P2 - 2
 -- it is fully shown; without this the overflow was simply invisible.
 local dustScroll = 0
 
+-- Every interval from here down is REAL SECONDS against computer.uptime().
+-- They used to be compared against os.time(), which in OpenOS is world time, not
+-- real time -- so "0.2" and "10" were in a unit nobody had established and the
+-- waits they produced were whatever they happened to be. The scheduler's own
+-- header says not to mix the two; the lifecycle was doing it anyway.
 local DISPATCH_INTERVAL = 0.2
 local lastDispatchCheck = 0
-local ERROR_TIMEOUT = 10
+local ERROR_TIMEOUT = 5      -- before a faulted module is recovered and reused
 local lastErrorTime = {}
+local DONE_SETTLE = 0.25     -- let the return transfers land before reloading
+local JOB_STALE   = 300      -- housekeeping only
 
 -- RUNNING watchdog tuning (real seconds via computer.uptime).
 -- Require brief startup grace plus repeated inactive polls before DONE.
 local RUN_STARTUP_GRACE = 3.0
-local RUN_POLL_INTERVAL = 0.5
+-- How quickly we notice a module has finished, and therefore how long it sits
+-- idle before it can be reloaded. Confirmations x interval is pure dead time at
+-- the end of EVERY cycle: at 0.5s x 3 that was about 1.5s per module per cycle.
+--
+-- 0.25s costs six modules about 12 extra isMachineActive calls a second, which
+-- was not affordable when the dashboard was spending ~890 calls/s and is now
+-- trivially so. The confirmation count stays at 3, because the point of it is to
+-- survive an unlucky poll, and that is unchanged by polling more often.
+local RUN_POLL_INTERVAL = 0.25
 local RUN_INACTIVE_CONFIRM = 3
 local RUN_HEARTBEAT_INTERVAL = 120
 local RUN_WARN_COOLDOWN = 60
@@ -226,6 +265,13 @@ end
 -- Spawn a cooperative load task for a module. The task runs concurrently with
 -- every other module's load AND with the UI/telemetry loop.
 local function beginLoad(mod)
+  -- Time spent IDLE is the cost of not having a job ready: no drone, no kits,
+  -- nothing below threshold, or dispatch simply not getting round to it. It is
+  -- the overhead that does not show up as a slow load.
+  if mod.idleSince then
+    cycleStats.idleTime = cycleStats.idleTime + (computer.uptime() - mod.idleSince)
+    mod.idleSince = nil
+  end
   mod.loadResult = nil
   mod.loadStart = computer.uptime() -- real seconds, for elapsed readout
   -- Hard-stop the module before loading. If work is still enabled (e.g. after an
@@ -263,6 +309,8 @@ local function pollLoad(mod)
     local s = r.stats or {}
     local cp = s.confirmPolls or {}
     local elapsed = mod.loadStart and (computer.uptime() - mod.loadStart) or 0
+    cycleStats.loadTime = cycleStats.loadTime + elapsed
+    if elapsed > cycleStats.loadMax then cycleStats.loadMax = elapsed end
     -- Compact on-screen diagnostic: time to load + read-back poll counts.
     -- "db" = max polls any fingerprint needed (low => store() reliable here),
     -- "buf" = polls waiting for items to arrive in the interface buffer.
@@ -279,7 +327,7 @@ local function pollLoad(mod)
     mod.inactiveSinceAt = nil
     mod.nextHeartbeatAt = computer.uptime() + RUN_HEARTBEAT_INTERVAL
     mod.lastRunWarnAt = 0
-    mod.job.startTime = os.time()
+    mod.job.startTime = computer.uptime()
     logger:info(string.format(
       "[HEALTH] M%d started asteroid=%s dist=%s x%s",
       mod.index,
@@ -483,20 +531,26 @@ local function stepRunning(mod)
     "[HEALTH] M%d marking DONE after %.1fs inactive confirmation",
     mod.index,
     now - (mod.inactiveSinceAt or now)))
+  cycleStats.runTime = cycleStats.runTime + (now - (mod.runStartedAt or now))
   mod.status = "DONE"
   mod.adapter.setWorkAllowed(false)
 end
 
 local function stepDone(mod)
   if not mod.doneTime then
-    mod.doneTime = os.time()
+    mod.doneTime = computer.uptime()
     returnItemsToME(mod)
     clearInterfaceSlots(mod)
     mod.adapter.setWorkAllowed(false)
-  elseif os.time() - mod.doneTime >= 1 then
+  elseif computer.uptime() - mod.doneTime >= DONE_SETTLE then
     if mod.job and brokerState.jobs[mod.job.jobId] then
       brokerState.jobs[mod.job.jobId] = nil
     end
+    cycleStats.doneTime = cycleStats.doneTime + (computer.uptime() - mod.doneTime)
+    cycleStats.cycles   = cycleStats.cycles + 1
+    mod.idleSince = computer.uptime()
+    logger:info(string.format("[CYCLE] M%d done (%d total, duty %.0f%%)",
+      mod.index, cycleStats.cycles, statsDuty()))
     mod.job = nil
     mod.status = "IDLE"
     mod.doneTime = nil
@@ -506,7 +560,7 @@ local function stepDone(mod)
     mod.inactiveSinceAt = nil
     mod.nextHeartbeatAt = 0
     mod.lastRunWarnAt = 0
-    lastDispatchCheck = os.time() - DISPATCH_INTERVAL
+    lastDispatchCheck = computer.uptime() - DISPATCH_INTERVAL
   end
 end
 
@@ -530,9 +584,9 @@ end
 -- bookkeeping entry doesn't linger). The per-asteroid cap reads live module
 -- status, not this table, so this is just housekeeping.
 local function pruneStaleJobs()
-  local now = os.time()
+  local now = computer.uptime()
   for jobId, job in pairs(brokerState.jobs) do
-    if now - job.startTime > 300 then brokerState.jobs[jobId] = nil end
+    if now - job.startTime > JOB_STALE then brokerState.jobs[jobId] = nil end
   end
 end
 
@@ -564,7 +618,7 @@ end
 
 local function getIdleModules()
   local idle = {}
-  local now = os.time()
+  local now = computer.uptime()
   for i, mod in ipairs(modules) do
     if mod.status == "IDLE" then
       idle[#idle + 1] = mod
@@ -611,8 +665,8 @@ local function tryDispatch(mod, asteroid, droneKey)
   local minKits = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
   if not drill or (drill.kits or 0) < minKits then return false end
 
-  local jobId = nodeId .. "-" .. os.time() .. "-M" .. mod.index
-  mod.lastDispatchAt = os.time()   -- fairness ordering, see dispatchBatch
+  local jobId = nodeId .. "-" .. math.floor(computer.uptime() * 1000) .. "-M" .. mod.index
+  mod.lastDispatchAt = computer.uptime()   -- fairness ordering, see dispatchBatch
   mod.status = "LOADING"
   mod.job = {
     jobId = jobId,
@@ -621,12 +675,12 @@ local function tryDispatch(mod, asteroid, droneKey)
     drillKey = drillKey,
     -- When this commitment was made, so availableDrones/availableKits can tell
     -- whether the last telemetry sweep has seen it leave the ME network yet.
-    dispatchedAt = os.time(),
+    dispatchedAt = computer.uptime(),
     distance = getOptimalDistance(mod.tier, asteroid, droneKey),
     parallels = config.moduleTiers[mod.tier].maxParallels,
-    startTime = os.time(),
+    startTime = computer.uptime(),
   }
-  brokerState.jobs[jobId] = { moduleIndex = mod.index, asteroid = asteroid, startTime = os.time() }
+  brokerState.jobs[jobId] = { moduleIndex = mod.index, asteroid = asteroid, startTime = computer.uptime() }
   brokerState.nextTarget = { asteroid = asteroid, reason = "dispatched" }
 
   beginLoad(mod) -- non-blocking: spawns the cooperative load task
@@ -907,6 +961,12 @@ end
 local edGen = 0
 local function edTouch() edGen = edGen + 1 end
 
+-- Bumped whenever the hardware node's picture changes. The HW panel caches its
+-- sorted restock list against this, the same way the dust panel uses edGen:
+-- brokerState.crafting is replaced wholesale on every HW_UPDATE, so re-sorting
+-- it per frame was re-deriving an answer that only changes every ten seconds.
+local hwGen = 0
+
 local function processMessage(evType, _, _, _, _, rawMsg)
   if evType ~= "modem_message" then return end
   local ok, msg = pcall(serial.unserialize, rawMsg)
@@ -924,13 +984,13 @@ local function processMessage(evType, _, _, _, _, rawMsg)
       if d then d.stock = entry.stock or 0 end
     end
     edTouch()   -- HAVE column is derived from this
-    brokerState.lastDustSyncTime = os.time()
+    brokerState.lastDustSyncTime = computer.uptime()
     brokerState.lastDustSync = os.date("%X")
   elseif msg.payloadType == "FLUID_UPDATE" and msg.data.plasmas then
     for name, amount in pairs(msg.data.plasmas) do
       if brokerState.plasma[name] ~= nil then brokerState.plasma[name] = amount end
     end
-    brokerState.lastFluidSyncTime = os.time()
+    brokerState.lastFluidSyncTime = computer.uptime()
     brokerState.lastFluidSync = os.date("%X")
   elseif msg.payloadType == "HW_UPDATE" then
     if msg.data.drones then for k, v in pairs(msg.data.drones) do brokerState.drones[k] = v end end
@@ -940,7 +1000,8 @@ local function processMessage(evType, _, _, _, _, rawMsg)
     -- lets a resolved entry clear itself -- merging would pin a "nopattern"
     -- warning on screen forever after you added the pattern.
     brokerState.crafting = (type(msg.data.crafting) == "table") and msg.data.crafting or {}
-    brokerState.lastHWSyncTime = os.time()
+    hwGen = hwGen + 1
+    brokerState.lastHWSyncTime = computer.uptime()
     brokerState.lastHWSync = os.date("%X")
   end
 end
@@ -951,7 +1012,7 @@ end
 
 local function getSyncColor(t)
   if not t or t == 0 then return 0x555555 end
-  local ago = (os.time() - t) / 20
+  local ago = computer.uptime() - t   -- real seconds now, no tick conversion
   if ago < 60 then return 0x00FF00 elseif ago < 120 then return 0xFFAA00 else return 0xFF4444 end
 end
 
@@ -1070,8 +1131,17 @@ local function drawModulePanel()
   for r = row, H do dashBlank("M" .. r, P1 + 1, PW, r) end
 end
 
-local function drawDustPanel()
-  local row = 6
+-- The sorted dust list, rebuilt only when the underlying stock actually changes.
+--
+-- This used to be rebuilt AND table.sort'ed on every frame. That was tolerable
+-- at four frames a second and became the dominant per-frame cost once the row
+-- cache made everything else free -- the panel was sorting the whole condition
+-- list to discover that nothing had moved. edGen already ticks whenever dust
+-- stock changes (processMessage bumps it), so it is exactly the right key.
+local dustList, dustListGen = {}, -1
+
+local function dustSorted()
+  if dustListGen == edGen then return dustList end
   local list = {}
   for _, cond in ipairs(config.conditions) do
     local name      = cond.itemName
@@ -1079,7 +1149,20 @@ local function drawDustPanel()
     local ratio     = stock / cond.amountToMaintain
     list[#list + 1] = { name = name, stock = stock, threshold = cond.amountToMaintain, ratio = ratio }
   end
-  table.sort(list, function(a, b) return a.ratio < b.ratio end)
+  -- Ends in a name tie-break: pairs order is not involved here, but equal ratios
+  -- are common (everything at zero before telemetry lands) and table.sort makes
+  -- no promise about their relative order between calls.
+  table.sort(list, function(a, b)
+    if a.ratio ~= b.ratio then return a.ratio < b.ratio end
+    return a.name < b.name
+  end)
+  dustList, dustListGen = list, edGen
+  return dustList
+end
+
+local function drawDustPanel()
+  local row = 6
+  local list = dustSorted()
 
   -- Two rows per entry, so this is how many entries actually fit.
   local capacity  = math.floor((H - row + 1) / 2)
@@ -1116,6 +1199,33 @@ local function drawDustPanel()
     row = row + 1
   end
   for r = row, H do dashBlank("D" .. r, P2 + 1, PW, r) end
+end
+
+-- Restock entries, ranked and cached against hwGen.
+--
+-- Two reasons to sort. pairs() order is arbitrary and this panel repaints many
+-- times a second, so an unsorted list visibly shuffles between frames. And
+-- nopattern/failed go first because they are the entries a human has to act on:
+-- if the panel runs out of rows, the benign "crafting" lines are the ones that
+-- should be cut.
+local restockList, restockGen = {}, -1
+
+local function restockSorted()
+  if restockGen == hwGen then return restockList end
+  local list = {}
+  for label in pairs(brokerState.crafting) do list[#list + 1] = label end
+  local RANK = { nopattern = 0, failed = 0, crafting = 1, queued = 2 }
+  local function rankOf(label)
+    local o = brokerState.crafting[label]
+    return RANK[type(o) == "table" and o.state or ""] or 3
+  end
+  table.sort(list, function(a, b)
+    local ra, rb = rankOf(a), rankOf(b)
+    if ra ~= rb then return ra < rb end
+    return a < b
+  end)
+  restockList, restockGen = list, hwGen
+  return restockList
 end
 
 local function drawHWPanel()
@@ -1162,6 +1272,20 @@ local function drawHWPanel()
   skip(1)
 
   put("  TASKS RUNNING: " .. sched.count(), 0x888888)
+  -- Where module time actually goes. Duty is the share spent mining rather than
+  -- loading, returning or waiting for a job -- the number to compare between
+  -- runs when output feels off.
+  if cycleStats.cycles > 0 then
+    local duty = statsDuty()
+    put(string.format("  CYCLES: %d   DUTY: %.0f%%", cycleStats.cycles, duty),
+        duty >= 80 and 0x00FF00 or duty >= 60 and 0xFFAA00 or 0xFF4444)
+    put(string.format("  LOAD avg %.1fs  max %.1fs",
+        cycleStats.loadTime / cycleStats.cycles, cycleStats.loadMax), 0x668866)
+    put(string.format("  WAIT idle %.0fs  return %.0fs",
+        cycleStats.idleTime, cycleStats.doneTime), 0x666666)
+  else
+    put("  CYCLES: none completed yet", 0x555555)
+  end
   skip(1)
 
   -- Plasma stock (required to mine -- a module won't run without a plasma fluid).
@@ -1232,23 +1356,7 @@ local function drawHWPanel()
   -- above lists kits > 0, so a single material sitting under the 64-kit
   -- dispatch floor used to render as an ordinary blue count -- or vanish
   -- entirely at zero -- while its whole drone tier quietly stopped dispatching.
-  local restock = {}
-  for label in pairs(brokerState.crafting) do restock[#restock + 1] = label end
-  -- Two reasons to sort. pairs() order is arbitrary and this panel repaints, so
-  -- an unsorted list visibly shuffles between frames. And nopattern/failed go
-  -- first because they are the entries a human has to act on: if the panel runs
-  -- out of rows, the benign "crafting" lines are the ones that should be cut.
-  local RANK = { nopattern = 0, failed = 0, crafting = 1, queued = 2 }
-  local function rankOf(label)
-    local o = brokerState.crafting[label]
-    return RANK[type(o) == "table" and o.state or ""] or 3
-  end
-  table.sort(restock, function(a, b)
-    local ra, rb = rankOf(a), rankOf(b)
-    if ra ~= rb then return ra < rb end
-    return a < b
-  end)
-
+  local restock = restockSorted()
   if #restock > 0 then
     skip(1)
     put("  RESTOCK:", 0x888888)
@@ -1848,6 +1956,9 @@ local function edSave()
   brokerState.dust   = newDust
   dustScroll         = 0
   edRequestWatchlist = true
+  -- The dust panel caches its sorted list against edGen, and a save can change
+  -- which items exist and what their thresholds are, not just their stock.
+  edTouch()
 
   edSay(string.format("saved %d tracked, %d own mappings -> user_config.lua, applied live",
     #conds, mineCount), 0x00FF00)
@@ -2259,7 +2370,13 @@ end
 --
 -- Worst case here (every row changing on every frame) is ~800 calls/second,
 -- which is what the old code spent unconditionally. The realistic case is zero.
-local UI_INTERVAL = 0.05
+-- 0.25 was sized for 223-call repaints. Zero is now the cost of an unchanged
+-- frame, so the interval had become the only latency -- but going to 0.05 was
+-- overcorrecting: the panels still rebuild their row strings every frame, so
+-- 20fps meant five times the Lua work for a screen that mostly does not change.
+-- 0.1 is 2.5x more responsive than the original and 2.5x the CPU, on a broker
+-- whose CPU budget matters because six loaders share it.
+local UI_INTERVAL = 0.1
 local lastUIDraw  = 0
 
 -- ---------------------------------------------------------------------------
@@ -2601,7 +2718,7 @@ while true do
   -- 6. Dispatch on its own cadence -- unless we are quiescing for the editor or
   --    it is already open. Existing work is never interrupted; we simply stop
   --    starting more, so the broker drains to idle and stays there.
-  local now = os.time()
+  local now = computer.uptime()
   if brokerState.telemetryReady and not ed.open and not edPending
      and (now - lastDispatchCheck >= DISPATCH_INTERVAL) then
     dispatchBatch()
