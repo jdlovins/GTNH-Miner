@@ -554,7 +554,7 @@ local function restockRunning(mod)
     sched.await(function() return (select(1, findBuf(label))) ~= nil end, 5, 0.5)
     if mod.status ~= "RUNNING" then
       mod.iface.setInterfaceConfiguration(cfgSlot)
-      return
+      return "partial"
     end
     local src = select(1, findBuf(label))
     if src then
@@ -566,8 +566,24 @@ local function restockRunning(mod)
         if (got or 0) > 0 then movedAny = true end
       end
     end
-    mod.iface.setInterfaceConfiguration(cfgSlot) -- stop hoarding the buffer between refills
-    return (busTotal(label) >= target) and "done" or "partial"
+    if busTotal(label) >= target then
+      -- Done with this consumable: release the slot so the interface stops
+      -- holding stock we no longer need.
+      mod.iface.setInterfaceConfiguration(cfgSlot)
+      return "done"
+    end
+
+    -- LEAVE THE ORDER STANDING.
+    --
+    -- Clearing here cancelled it, and the next pass three seconds later placed
+    -- the same order again -- so a network that hands over a few items at a time
+    -- had its progress thrown away on every pass and started over. Measured in
+    -- world at 3.6 refills per cycle to move a single stack.
+    --
+    -- Standing, the interface keeps accumulating between passes and the next one
+    -- collects whatever arrived. stepDone clears every configuration slot when
+    -- the run ends, so nothing is left hoarding.
+    return "partial"
   end
 
   local tipState = refill(drill.tip, TIPS_PER, 2, slotTip)
