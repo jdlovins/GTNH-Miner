@@ -136,6 +136,12 @@ config.tuning = {
   -- value already (a T1 reads 4), so the default is 0 = do not touch it.
   parallel           = 0,
 
+  -- Once every fluid that needs a pump has one, should the pumps left over
+  -- double up on the neediest fluids rather than sit idle? Two modules on the
+  -- same gas is just more throughput, so yes by default. Set false to keep at
+  -- most one module per fluid.
+  doubleUp           = true,
+
   -- A fluid short by less than this fraction of the target is not worth
   -- occupying a pump with; a genuinely empty one gets the pump instead.
   minDeficitFraction = 0.002,   -- 0.2% of target

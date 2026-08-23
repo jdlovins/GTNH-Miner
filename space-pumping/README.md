@@ -158,6 +158,7 @@ FLUID                  MAINTAIN        HAVE            FILL      PRI
 | `space` | start / stop stocking the selected fluid |
 | `enter` | type an amount — `5g`, `500m`, `250000`. Blank means "use the global target" |
 | `t` | cycle through common amounts without typing |
+| `p` or `[` `]` | change priority 0–5; past either end it returns to the shipped default |
 | `a` / `n` | stock / unstock everything currently shown |
 | `/` | filter the list by name |
 | `s` | save |
@@ -189,8 +190,9 @@ config.master = {
   recipe slot as `recipe0.planetType` and `recipe0.gasType`. They must match your
   station: with the wrong pair the module runs happily and nothing arrives. Set
   one module by hand in game, then read the pair back with `diag pumps`.
-- **`priority`** 0–5. Higher is pumped sooner among fluids that are below target.
-  Use 4–5 for whatever is gating your current progression.
+- **`priority`** 0–5, the shipped default. Higher is pumped sooner among fluids
+  below target. Override it per fluid in the editor with `p` — a priority you set
+  shows with a `*` and wins over this value.
 - **`rate`** is a wiki-sourced estimate used **only** for the throughput figure
   shown beside a working pump. It does not affect what gets pumped or how fast.
 
@@ -251,6 +253,12 @@ Press a key while it is running.
 | `W` | Waterfall | the whole array on one fluid until it is full, then the next. Sequential. |
 | `E` | edit | opens the fluid editor. |
 | `Q` | quit | stops every module and exits cleanly. |
+
+In Normal and Stairstep, modules spread across the needy fluids first — one each,
+biggest module to deepest shortfall. Once every needy fluid has one, any modules
+left over **double up** on the neediest rather than idle, so a single stocked
+fluid still uses the whole array. Two modules on the same gas is just more
+throughput. Set `config.tuning.doubleUp = false` for at most one module per fluid.
 
 In Normal and Stairstep the array never doubles up: fluids already being pumped
 are skipped, and the biggest module is offered the deepest shortfall. Waterfall

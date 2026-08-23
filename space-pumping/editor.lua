@@ -25,6 +25,7 @@
 --
 -- KEYS: up/down/pgup/pgdn/home/end  move
 --       space  track / untrack        enter or t  set amount
+--       p      cycle priority         [ ]         priority down / up
 --       /      filter                 a / n       track / untrack all shown
 --       s      save                   esc         close
 -- =============================================================================
@@ -52,6 +53,7 @@ local ed = {
   input     = nil,      -- { label, buffer, onCommit } while typing
   enabled   = {},       -- working copy: label -> true
   amount    = {},       -- working copy: label -> litres, or nil for "global"
+  priority  = {},       -- working copy: label -> 0-5, or nil for the default
   dirty     = false,    -- unsaved changes
   repaint   = true,     -- screen needs a repaint
   msg       = "",
@@ -73,7 +75,7 @@ local function listRows() return math.max(1, H - 7) end
 -- ---------------------------------------------------------------------------
 
 local function load()
-  ed.enabled, ed.amount = {}, {}
+  ed.enabled, ed.amount, ed.priority = {}, {}, {}
   local explicit = pumps.hasWantedList()
   for label in pairs(config.master) do
     if not explicit then
@@ -83,14 +85,23 @@ local function load()
       ed.enabled[label] = true
     end
   end
-  for label, v in pairs(config.wanted or {}) do
+  for label in pairs(config.wanted or {}) do
     if config.master[label] then
       ed.enabled[label] = true
-      if type(v) == "number" and v > 0 then ed.amount[label] = v end
+      local e = pumps.wantedEntry(label) or {}
+      if type(e.amount)   == "number" and e.amount > 0 then ed.amount[label]   = e.amount end
+      if type(e.priority) == "number" then ed.priority[label] = e.priority end
     end
   end
   ed.dirty = false
   ed.confirmClose = false
+end
+
+-- The priority actually in force, and whether it is yours or the shipped one.
+local function effectivePriority(label)
+  local p = ed.priority[label]
+  if p then return p, true end
+  return (config.master[label] or {}).priority or 0, false
 end
 
 local function matchesFilter(s)
@@ -173,6 +184,23 @@ local function cycleAmount(label)
   ed.repaint = true
 end
 
+-- 0..5 and then back to "follow the shipped default", which is a real setting
+-- rather than a dead end at either end of the range.
+local function cyclePriority(label, delta)
+  touch()
+  local cur = ed.priority[label]
+  if cur == nil then
+    ed.priority[label] = (delta > 0) and 0 or 5
+  else
+    local nxt = cur + delta
+    if nxt < 0 or nxt > 5 then ed.priority[label] = nil else ed.priority[label] = nxt end
+  end
+  ed.enabled[label] = true
+  local p, own = effectivePriority(label)
+  say(label .. " priority " .. p .. (own and "" or "  (shipped default)"), 0x00FF00)
+  ed.repaint = true
+end
+
 local function prompt(label, onCommit, initial)
   ed.input = { label = label, buffer = initial or "", onCommit = onCommit }
   ed.repaint = true
@@ -240,7 +268,10 @@ local function save()
   out[#out + 1] = "--"
   out[#out + 1] = "--   wanted   which fluids to keep stocked, and how much of each."
   out[#out + 1] = "--            A number is that fluid's own ceiling in litres;"
-  out[#out + 1] = "--            `true` means follow the global cell-derived target."
+  out[#out + 1] = "--            `true` means follow the global cell-derived target;"
+  out[#out + 1] = "--            { amount = N, priority = P } sets either or both."
+  out[#out + 1] = "--            priority is 0-5, higher pumped sooner; omit it to"
+  out[#out + 1] = "--            follow the default in config.lua."
   out[#out + 1] = "--"
   out[#out + 1] = "-- An empty `wanted` here still means \"stock nothing\" -- it is an"
   out[#out + 1] = "-- explicit choice, unlike the empty default in config.lua."
@@ -248,9 +279,19 @@ local function save()
   out[#out + 1] = "return {"
   out[#out + 1] = "  wanted = {"
   for _, label in ipairs(labels) do
-    local amt = ed.amount[label]
-    out[#out + 1] = string.format("    [%s%s%s] = %s,",
-      QUOTE, label, QUOTE, amt and string.format("%d", amt) or "true")
+    local amt, pri = ed.amount[label], ed.priority[label]
+    local value
+    -- Keep the common cases readable: the table form appears only when a fluid
+    -- carries a custom priority, so a hand-edited file is not full of braces.
+    if pri then
+      value = string.format("{ amount = %s, priority = %d }",
+        amt and string.format("%d", amt) or "nil", pri)
+    elseif amt then
+      value = string.format("%d", amt)
+    else
+      value = "true"
+    end
+    out[#out + 1] = string.format("    [%s%s%s] = %s,", QUOTE, label, QUOTE, value)
   end
   out[#out + 1] = "  },"
   out[#out + 1] = "}"
@@ -265,7 +306,12 @@ local function save()
 
   -- Apply live.
   local fresh = {}
-  for _, label in ipairs(labels) do fresh[label] = ed.amount[label] or true end
+  for _, label in ipairs(labels) do
+    local amt, pri = ed.amount[label], ed.priority[label]
+    if pri      then fresh[label] = { amount = amt, priority = pri }
+    elseif amt  then fresh[label] = amt
+    else             fresh[label] = true end
+  end
   config.wanted = fresh
   -- Saving is what makes the list explicit: from here on an empty list means
   -- "stock nothing", not "stock everything".
@@ -335,12 +381,12 @@ local function draw()
       local cap   = amt or globalTarget
       local have  = amounts[label] or 0
       local perc  = (cap > 0) and (have / cap) * 100 or 0
-      local pri   = (config.master[label] or {}).priority or 0
+      local pri, ownPri = effectivePriority(label)
       local isSel = (idx == ed.sel)
 
       local key = table.concat({ label, tostring(on), tostring(amt or "g"),
                                  string.format("%.1f", have), string.format("%.2f", perc),
-                                 pri, tostring(isSel) }, "~")
+                                 pri, tostring(ownPri), tostring(isSel) }, "~")
       if not fresh(y, key) then
         local nameColor = on and 0xFFFFFF or 0x666666
         local amtText   = amt and ui.formatFluid(amt) or "global"
@@ -356,7 +402,8 @@ local function draw()
           { X_AMT,  amtText,               amt and 0xAAAAAA or 0x666666 },
           { X_HAVE, ui.formatFluid(have),  on and 0xAAAAAA or 0x555555 },
           { X_PCT,  on and string.format("%.1f%%", perc) or "--", pctColor },
-          { X_PRI,  "p" .. pri,            0x666666 },
+          { X_PRI,  "p" .. pri .. (ownPri and "*" or ""),
+                                           ownPri and 0xFFCC33 or 0x666666 },
         }, isSel and 0x1A3A5A or nil)
       end
     end
@@ -383,7 +430,7 @@ local function draw()
   end
   paint(H - 1, "m|" .. tostring(line) .. tostring(color), { { 2, tostring(line):sub(1, W - 3), color } })
 
-  local hints = "space track  |  enter/t amount  |  a all  n none  |  / find  |  s save  |  esc close"
+  local hints = "space track | enter/t amount | p priority | a all  n none | / find | s save | esc close"
   paint(H, "k|" .. hints, { { 2, hints, 0x555555 } })
 end
 
@@ -487,6 +534,12 @@ function editor.handle(ev)
       local row = selected(); if row then toggle(row.label) end
     elseif ch == 116 or ch == 84 then                      -- t / T
       local row = selected(); if row then cycleAmount(row.label) end
+    elseif ch == 112 or ch == 80 then                      -- p / P
+      local row = selected(); if row then cyclePriority(row.label, 1) end
+    elseif ch == 91 then                                   -- [
+      local row = selected(); if row then cyclePriority(row.label, -1) end
+    elseif ch == 93 then                                   -- ]
+      local row = selected(); if row then cyclePriority(row.label, 1) end
     elseif ch == 97  or ch == 65 then action("all")        -- a / A
     elseif ch == 110 or ch == 78 then action("none")       -- n / N
     elseif ch == 47             then action("find")        -- /
@@ -501,6 +554,10 @@ end
 function editor.open()
   W, H = ui.size()
   layoutButtons()
+  -- Start clean. A filter left over from last time silently hides most of the
+  -- list, and `a`/`n` scope themselves to what is shown -- so a stale filter
+  -- turns a bulk action into a surprise. Same for half-finished text entry.
+  ed.filter, ed.filtering, ed.input = nil, false, nil
   load()
   build()
   ed.sel, ed.scroll = 1, 0

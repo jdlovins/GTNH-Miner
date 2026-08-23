@@ -199,17 +199,27 @@ local function drawPumpPanel()
             (p.status == "RUNNING" and 0x00FF00) or
             (p.status == "ARMING"  and 0xFFCC33) or
             (p.status == "ERROR"   and 0xFF4444) or 0x777777
-          local detail
+          -- An ERROR gets the rest of the row, because the reason is the whole
+          -- point of showing it. Truncating to the task column's 20 characters
+          -- cut "arm failed on Xenon: <reason>" off exactly where the reason
+          -- started -- a message that tells you only what you already knew.
+          local detail, detailWidth
           if p.status == "ERROR" then
-            detail = (p.lastError or "error"):sub(1, math.max(8, L.pumpColX[2] - x - 34))
+            detailWidth = (c < L.pumpCols) and (L.pumpColX[c + 1] - x - 20) or (W - x - 18)
+            detailWidth = math.max(12, detailWidth)
+            detail = tostring(p.lastError or "error")
           else
+            detailWidth = 20
             detail = tostring(p.task or "None")
           end
+          detail = detail:sub(1, detailWidth)
           keyParts[#keyParts + 1] = table.concat({ p.short, p.tier, p.status, detail, rate }, "~")
           cells[#cells + 1] = { x,      string.format("%-4s %-3s", p.short, p.tier), 0xFFFFFF }
           cells[#cells + 1] = { x + 9,  string.format("%-8s", p.status),             statusColor }
-          cells[#cells + 1] = { x + 18, string.format("%-20s", detail:sub(1, 20)),   0xCCCCCC }
-          cells[#cells + 1] = { x + 39, rate,                                        0x668866 }
+          cells[#cells + 1] = { x + 18, detail,                                      0xCCCCCC }
+          if p.status ~= "ERROR" then
+            cells[#cells + 1] = { x + 39, rate,                                      0x668866 }
+          end
         end
       end
       local key = table.concat(keyParts, "||")

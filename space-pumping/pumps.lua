@@ -255,18 +255,45 @@ function pumps.hasWantedList()
   return false
 end
 
+-- A config.wanted value in normalised form, or nil when the fluid is not
+-- stocked. Three shapes are accepted, because the file is hand-editable and the
+-- simple cases should stay simple:
+--
+--   ["Xenon"]  = true                            follow the global target
+--   ["Xenon"]  = 5000000                         its own ceiling
+--   ["Xenon"]  = { amount = 5e6, priority = 4 }  ceiling and/or priority
+local function wantedEntry(label)
+  local w = (config.wanted or {})[label]
+  if type(w) == "table"  then return w end
+  if type(w) == "number" then return { amount = w } end
+  if w == true           then return {} end
+  return nil
+end
+pumps.wantedEntry = wantedEntry
+
 -- Is this fluid one we are stocking at all?
 function pumps.isWanted(label)
   if not pumps.hasWantedList() then return true end
-  return (config.wanted or {})[label] ~= nil
+  return wantedEntry(label) ~= nil
 end
 
--- How much of `label` to maintain. A number in config.wanted is that fluid's own
--- ceiling; `true` (or no list at all) means follow the global one.
+-- How much of `label` to maintain. Its own ceiling if it has one, otherwise the
+-- global target.
 function pumps.targetFor(label, globalTarget)
-  local w = (config.wanted or {})[label]
-  if type(w) == "number" and w > 0 then return w end
+  local e = wantedEntry(label)
+  if e and type(e.amount) == "number" and e.amount > 0 then return e.amount end
   return globalTarget
+end
+
+-- How urgently to pump it. Yours if you set one, otherwise the shipped default.
+--
+-- Priority is editable even though config.master carries a default, because it
+-- is a preference -- how badly you want the fluid -- not a fact about where the
+-- fluid comes from. Only the latter belongs to the shipped mapping.
+function pumps.priorityFor(label)
+  local e = wantedEntry(label)
+  if e and type(e.priority) == "number" then return e.priority end
+  return (config.master[label] or {}).priority or 0
 end
 
 -- Re-read the ME network and rebuild the demand list.
@@ -337,7 +364,7 @@ function pumps.refreshFluids(target)
       out[#out + 1] = {
         label    = label,
         amount   = amount,
-        priority = data.priority or 0,
+        priority = pumps.priorityFor(label),
         setting  = data.setting,
         rate     = st.rates[label] or 0,
         target   = cap,
@@ -554,7 +581,10 @@ function pumps.assign(needs, target)
     return armed
   end
 
-  local n = 1
+  -- First pass: spread. One pump per needy fluid, walking the queue in need
+  -- order against pumps in capacity order, so the biggest module gets the
+  -- deepest shortfall and nothing is worked on twice while something else waits.
+  local n, leftover = 1, {}
   for _, p in ipairs(idle) do
     local picked
     while n <= #needs do
@@ -562,10 +592,40 @@ function pumps.assign(needs, target)
       n = n + 1
       if f.deficit > (f.floor or 0) and not claimed[f.label] then picked = f; break end
     end
-    if not picked then break end
-    claimed[picked.label] = true
-    if arm(p, picked) then armed = armed + 1 end
+    if picked then
+      claimed[picked.label] = true
+      if arm(p, picked) then armed = armed + 1 end
+    else
+      leftover[#leftover + 1] = p
+    end
   end
+
+  -- Second pass: double up rather than idle.
+  --
+  -- Once every needy fluid has a pump, a pump with nothing left to claim used to
+  -- just sit there -- so with one fluid stocked, one module worked and the rest
+  -- of the array did nothing. Two modules on the same gas is not a conflict the
+  -- way two miners on one asteroid is; it is simply twice the throughput. This
+  -- is the miner's no-double-up rule, which does not apply here.
+  --
+  -- Extra pumps go back to the top of the need queue, so the deepest shortfall
+  -- collects them first.
+  if #leftover > 0 and config.tuning.doubleUp ~= false then
+    local pool = {}
+    for _, f in ipairs(needs) do
+      if f.deficit > (f.floor or 0) then pool[#pool + 1] = f end
+    end
+    if #pool > 0 then
+      local i = 1
+      for _, p in ipairs(leftover) do
+        local f = pool[i]
+        if arm(p, f) then armed = armed + 1 end
+        i = i + 1
+        if i > #pool then i = 1 end
+      end
+    end
+  end
+
   return armed
 end
 
