@@ -3003,6 +3003,15 @@ config.rodsPerLoad = 128
 config.tipsToStart = 64
 config.rodsToStart = 64
 
+-- How long after a module starts the broker may keep finishing its buffer.
+--
+-- Only unpinned modules use this, and only until the buffer is complete. It is
+-- a backstop: without it, a module the ME cannot supply would be topped up for
+-- its entire run, and a module that is always topped up never runs dry, never
+-- reaches DONE, and is never re-dispatched -- which quietly pins it to whatever
+-- asteroid it first picked up. Pinned modules top up forever by design.
+config.topUpWindow = 30
+
 -- Par levels for drill consumables. The broker publishes this table to the hw
 -- telem node (DRILL_PAR on config.ports.hardware); the node compares it against
 -- its own live ME scan and auto-crafts anything below par.

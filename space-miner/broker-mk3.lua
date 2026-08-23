@@ -374,6 +374,7 @@ local function pollLoad(mod)
 
     mod.adapter.setWorkAllowed(true)
     mod.enabledAt     = computer.uptime()
+    mod.bufferFilled  = false
     mod.spinupDone    = false
     mod.lastSpinPollAt = 0
   else
@@ -388,10 +389,17 @@ end
 -- the interface can restock tips/rods by identity. Runs as a task, so it yields
 -- while waiting for items to arrive and never blocks the main loop.
 --
--- This began as a pinned-module feature, to stop a permanently-assigned module
--- cycling through DONE/reload. It now runs for EVERY module, because the loader
--- deliberately starts on one stack instead of the full buffer -- so carrying a
--- module the rest of the way up is the normal path, not a special case.
+-- Two callers with different intent, and the difference matters:
+--
+--   PINNED modules top up forever. That is the point of pinning -- the module
+--   stays on one asteroid and should never cycle through DONE/reload.
+--
+--   Every other module tops up ONCE, to finish the buffer the loader
+--   deliberately did not wait for, and then stops. It has to stop: a module
+--   with consumables never goes idle, never reaches DONE, and is therefore
+--   never re-dispatched -- so topping up forever silently pins every module to
+--   whatever asteroid it first picked up and the broker stops responding to
+--   what is actually low. Returns true once the buffer is full.
 local function restockRunning(mod)
   if mod.status ~= "RUNNING" or not mod.job then return end
   local drill = config.drills[mod.job.drillKey]
@@ -475,6 +483,10 @@ local function restockRunning(mod)
 
   refill(drill.tip, TIPS_PER, 2, slotTip)
   refill(drill.rod, RODS_PER, 3, slotRod)
+
+  -- Full enough to stop asking? Re-read rather than trusting what refill moved:
+  -- the module has been consuming throughout.
+  return busTotal(drill.tip) >= TIPS_PER and busTotal(drill.rod) >= RODS_PER
 end
 
 local function stepRunning(mod)
@@ -485,12 +497,23 @@ local function stepRunning(mod)
   -- short cooperative task on an interval that refills tips/rods from the ME via
   -- the interface + transposer. The drone (bus slot 1) isn't consumed, so only
   -- tips (slot 2) and rods (slot 3) are refreshed.
-  if mod.job then
+  -- Pinned modules top up for as long as they run. Everyone else only until the
+  -- initial buffer is complete, or until the window closes -- after that the
+  -- module is allowed to run dry, finish, and be given a different job.
+  local topUpWanted = mod.pinnedAsteroid
+      or (not mod.bufferFilled
+          and (now - (mod.runStartedAt or now)) < (config.topUpWindow or 30))
+  if mod.job and topUpWanted then
     if (not mod.restockHandle or mod.restockHandle.done()) and now >= (mod.nextRestockAt or 0) then
       mod.nextRestockAt = now + PIN_RESTOCK_INTERVAL
       mod.restockHandle = sched.spawn(function()
-        local ok, err = pcall(restockRunning, mod)
-        if not ok then logger:warn("[RESTOCK] M" .. mod.index .. " error: " .. tostring(err)) end
+        local ok, full = pcall(restockRunning, mod)
+        if not ok then
+          logger:warn("[RESTOCK] M" .. mod.index .. " error: " .. tostring(full))
+        elseif full and not mod.pinnedAsteroid then
+          mod.bufferFilled = true
+          logger:info("[RESTOCK] M" .. mod.index .. " buffer complete, letting it run down")
+        end
       end, "restock-M" .. mod.index)
     end
   end
