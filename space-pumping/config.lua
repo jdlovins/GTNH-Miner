@@ -136,6 +136,15 @@ config.tuning = {
   -- value already (a T1 reads 4), so the default is 0 = do not touch it.
   parallel           = 0,
 
+  -- Never run more than this many modules at once, however much work there is.
+  -- 0 = no limit.
+  --
+  -- Set this to 1 (or 2) if your Space Elevator also carries Mining Modules.
+  -- Pumping and mining draw on the same elevator, so an unbounded pump array
+  -- starves the miners -- and nothing on the pumping dashboard shows it, because
+  -- every pump reports perfectly healthy while ore output drops.
+  maxActivePumps     = 0,
+
   -- Once every fluid that needs a pump has one, should the pumps left over
   -- double up on the neediest fluids rather than sit idle? Two modules on the
   -- same gas is just more throughput, so yes by default. Set false to keep at

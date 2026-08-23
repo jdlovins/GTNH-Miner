@@ -565,14 +565,33 @@ function pumps.assign(needs, target)
 
   local claimed = {}
   local idle    = {}
+  local active  = 0
   for _, p in ipairs(list) do
     if p.status == "RUNNING" or p.status == "ARMING" then
+      active = active + 1
       if p.task then claimed[p.task] = true end
     elseif p.status == "IDLE" then
       idle[#idle + 1] = p
     end
   end
   if #idle == 0 then return 0 end
+
+  -- CONCURRENCY CAP.
+  --
+  -- Pumping Modules and Mining Modules share one Space Elevator, so running the
+  -- whole pump array is not free -- it is taken out of whatever the miners were
+  -- getting. This program cannot see that cost from its own side: every pump
+  -- reports healthy while ore output quietly falls.
+  --
+  -- So the budget is declared rather than discovered. Trimming the idle list
+  -- here bounds every path below it at once -- spread, double-up and waterfall
+  -- alike -- instead of each needing its own guard.
+  local cap = config.tuning.maxActivePumps or 0
+  if cap > 0 then
+    local budget = cap - active
+    if budget <= 0 then return 0 end
+    while #idle > budget do table.remove(idle) end
+  end
 
   if st.mode == "Waterfall" then
     local head
