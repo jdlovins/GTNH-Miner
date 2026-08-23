@@ -980,6 +980,28 @@ local function moduleHolds(mod, droneKey, drillKey)
      and h.droneKey == droneKey and h.drillKey == drillKey
 end
 
+-- Which idle module should take this drone?
+--
+-- The pool is ordered by module tier then least-recently-used, which decides
+-- WHO deserves work. It says nothing about who can start fastest -- and a module
+-- already holding this exact drone can skip the whole fetch, while one holding a
+-- different drone has to hand its own back and wait for this one.
+--
+-- Ignoring that produced pointless swaps: the UHV job handed to a module holding
+-- a ZPM while the module holding a UHV took the ZPM job. Both then paid a full
+-- reload to end up doing what the other was already equipped for.
+--
+-- So: among the modules that can take this job, prefer one already holding the
+-- drone. Falls straight back to pool order when none is, so the fairness
+-- ordering is untouched whenever there is nothing to gain.
+local function preferHolder(pool, droneKey)
+  for idx = #pool, 1, -1 do
+    local h = pool[idx].holding
+    if h and h.droneKey == droneKey then return idx end
+  end
+  return nil
+end
+
 local function tryDispatch(mod, asteroid, droneKey)
   local asteroidData = config.asteroids[asteroid]
   if not asteroidData then return false end
@@ -1328,9 +1350,17 @@ local function dispatchBatch()
         if droneTier >= asteroidData.minDrone and droneTier <= asteroidData.maxDrone then
           local drillKey = config.droneDrillMap[droneTier]
           if drillKey and (availKit[drillKey] or 0) >= minKitsForLoad then
+            -- Try whoever already holds this drone first, then everyone else
+            -- in pool order.
+            local first = preferHolder(pool, droneKey)
+            local order = {}
+            if first then order[#order + 1] = first end
             for idx = #pool, 1, -1 do
+              if idx ~= first then order[#order + 1] = idx end
+            end
+            for _, idx in ipairs(order) do
               local mod = pool[idx]
-              if tryDispatch(mod, asteroidName, droneKey) then
+              if mod and tryDispatch(mod, asteroidName, droneKey) then
                 astCount[asteroidName] = (astCount[asteroidName] or 0) + 1
                 avail[droneKey]        = avail[droneKey] - 1
                 availKit[drillKey]     = availKit[drillKey] - minKitsForLoad
