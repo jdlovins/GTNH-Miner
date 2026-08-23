@@ -1051,13 +1051,13 @@ local function drawModulePanel()
       local droneName = config.drones[mod.job.droneKey] or "?"
       local lvl = droneName:match("MK%-(.+)") or "?"
       dashRow("M" .. row, P1 + 1, PW, row,
-        string.format("    dist=%d  drone=MK-%s", mod.job.distance or 0, lvl), 0xCCCCCC)
+        string.format("  dist=%d  drone=MK-%s", mod.job.distance or 0, lvl), 0xCCCCCC)
       row = row + 1
 
       -- Load diagnostic from the most recent load of this module:
       -- "loaded 0.4s  db:1 buf:3" -- time taken + read-back poll counts.
       if mod.lastLoad and row <= H then
-        dashRow("M" .. row, P1 + 1, PW, row, "    " .. mod.lastLoad, 0x668866)
+        dashRow("M" .. row, P1 + 1, PW, row, "  " .. mod.lastLoad, 0x668866)
         row = row + 1
       end
 
@@ -2249,7 +2249,17 @@ local function edHandle(ev)
   return false
 end
 
-local UI_INTERVAL = 0.25 -- seconds between full UI repaints
+-- Seconds between dashboard repaints.
+--
+-- This was 0.25 when every repaint cost 223 component calls and spanned several
+-- ticks -- the panels painted progressively, which is why the screen looked
+-- continuously busy. With the row cache an unchanged frame costs nothing, so the
+-- interval stopped being a throttle and became the only source of latency:
+-- updates arrived in four visible steps a second with nothing moving between.
+--
+-- Worst case here (every row changing on every frame) is ~800 calls/second,
+-- which is what the old code spent unconditionally. The realistic case is zero.
+local UI_INTERVAL = 0.05
 local lastUIDraw  = 0
 
 -- ---------------------------------------------------------------------------
