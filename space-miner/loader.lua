@@ -75,13 +75,58 @@ local function confirmFingerprint(db, slot, expectedLabel)
   end, CONFIRM_TIMEOUT)
 end
 
+-- ---------------------------------------------------------------------------
+-- ONE CALL PER INVENTORY, NOT ONE PER SLOT
+--
+-- getStackInSlot costs a metered component call every time, and the load path
+-- was full of per-slot loops: clearing the bus, checking the buffer had drained,
+-- hunting for the drone, and two full rescans on every drain pass.
+--
+-- Measured in world with six modules loading at once, that is the whole cost of
+-- a load. A drain that moved items on EVERY pass -- never once waiting on the ME
+-- -- still took four seconds, and the loads around it ran 28-44s with only about
+-- eight of that accounted for by the phases we timed. The missing time was call
+-- latency: six modules' worth of per-slot reads against one computer's per-tick
+-- budget.
+--
+-- getAllStacks returns an entire side in a single call. Its table is 0-based in
+-- OpenComputers and empty slots arrive as tables with no label rather than nil,
+-- so both are normalised here. Falls back to per-slot reads if a transposer does
+-- not offer it, so nothing breaks on an older setup -- it just stays slow.
+-- ---------------------------------------------------------------------------
+local useGetAll = true
+
+local function snapshotSide(mod, side, from, to)
+  if useGetAll then
+    local ok, all = pcall(function()
+      local arr = mod.transposer.getAllStacks(side)
+      return arr and arr.getAll and arr.getAll() or nil
+    end)
+    if ok and type(all) == "table" then
+      local base = (all[0] ~= nil) and 0 or 1
+      local snap = {}
+      for s = from, to do
+        local st = all[base + s - 1]
+        -- An empty slot is {} or a zero-size entry, not nil.
+        if type(st) == "table" and st.label and (st.size or 0) > 0 then snap[s] = st end
+      end
+      return snap
+    end
+    useGetAll = false   -- do not pay for the failed attempt on every call
+  end
+  local snap = {}
+  for s = from, to do snap[s] = mod.transposer.getStackInSlot(side, s) end
+  return snap
+end
+
 -- Clear the input bus back into the ME interface buffer (recover stale items).
 local function clearInputBus(mod)
   local busSize = mod.transposer.getInventorySize(mod.conf.inputBusSide) or 16
+  local snap = snapshotSide(mod, mod.conf.inputBusSide, 1, busSize)
   for slot = 1, busSize do
-    local size = mod.transposer.getSlotStackSize(mod.conf.inputBusSide, slot) or 0
-    if size > 0 then
-      mod.transposer.transferItem(mod.conf.inputBusSide, mod.conf.interfaceSide, size, slot)
+    local st = snap[slot]
+    if st and (st.size or 0) > 0 then
+      mod.transposer.transferItem(mod.conf.inputBusSide, mod.conf.interfaceSide, st.size, slot)
     end
   end
 end
@@ -157,10 +202,9 @@ function loader.run(mod, job, deps)
   -- as the "drone". Confirm slots 1-3 are empty before stocking fresh items.
   local preDrainAt = computer.uptime()
   local drained = pollUntil(function()
+    local snap = snapshotSide(mod, mod.conf.interfaceSide, 1, 3)
     for s = 1, 3 do
-      if (mod.transposer.getSlotStackSize(mod.conf.interfaceSide, s) or 0) > 0 then
-        return false
-      end
+      if snap[s] and (snap[s].size or 0) > 0 then return false end
     end
     return true
   end, ARRIVE_TIMEOUT)
@@ -239,8 +283,9 @@ function loader.run(mod, job, deps)
   --    1/2/3, so search the whole buffer by label.
   local ibufSize = mod.transposer.getInventorySize(mod.conf.interfaceSide) or 9
   local function bufferHas(label, minSize)
+    local snap = snapshotSide(mod, mod.conf.interfaceSide, 1, ibufSize)
     for s = 1, ibufSize do
-      local stack = mod.transposer.getStackInSlot(mod.conf.interfaceSide, s)
+      local stack = snap[s]
       if stack and stack.label == label and (stack.size or 0) >= minSize then
         return true
       end
@@ -270,8 +315,9 @@ function loader.run(mod, job, deps)
 
   -- Find the buffer slot whose item matches `label` with at least `minSize`.
   local function findSlot(label, minSize)
+    local snap = snapshotSide(mod, mod.conf.interfaceSide, 1, busSize)
     for s = 1, busSize do
-      local stack = mod.transposer.getStackInSlot(mod.conf.interfaceSide, s)
+      local stack = snap[s]
       if stack and stack.label == label and (stack.size or 0) >= minSize then
         return s
       end
@@ -321,11 +367,7 @@ function loader.run(mod, job, deps)
   -- what made loading slow -- and it capped how tight the poll interval could
   -- sensibly be.
   local function scanSide(side, from, count)
-    local snap = {}
-    for s = from, count do
-      snap[s] = mod.transposer.getStackInSlot(side, s)
-    end
-    return snap
+    return snapshotSide(mod, side, from, count)
   end
 
   local function totalIn(snap, from, to, label)
