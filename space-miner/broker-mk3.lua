@@ -160,6 +160,7 @@ local cycleStats = {
   idleTime  = 0,     -- seconds spent IDLE waiting for a job
   loadMax   = 0,
   loads     = 0,     -- completed loads; a cycle can contain more than one
+  refills   = 0,     -- top-ups that actually moved consumables
   spins     = 0,     -- gate-open -> machine-running samples
   spinTime  = 0,
   spinMax   = 0,
@@ -426,6 +427,7 @@ local function pollLoad(mod)
 
     mod.adapter.setWorkAllowed(true)
     mod.enabledAt     = computer.uptime()
+    mod.refills       = 0
     mod.bufferFilled  = false
     mod.spinupDone    = false
     mod.lastSpinPollAt = 0
@@ -522,14 +524,28 @@ local function restockRunning(mod)
     return nil, 0
   end
 
+  -- Did this pass actually move anything? A top-up that moves nothing is the ME
+  -- not delivering, not a refill, and counting it would make the stat lie.
+  local movedAny = false
+
   -- Refill one consumable in the bus back up to `target` from the ME interface.
+  --
+  -- Returns "done" when at target, "nofit" when the bus has no room for more,
+  -- and "partial" otherwise. The caller needs the difference: "nofit" is not a
+  -- failure to retry, it is the bus being physically full, and retrying it every
+  -- three seconds for the whole top-up window achieves nothing.
   local function refill(label, target, cfgSlot, dbSlot)
-    if mod.status ~= "RUNNING" then return end
+    if mod.status ~= "RUNNING" then return "partial" end
     local have = busTotal(label)
     local deficit = target - have
-    if deficit <= 0 then return end
+    if deficit <= 0 then return "done" end
     local dst, room = destFor(label)
-    if not dst then return end
+    if not dst then
+      -- Nowhere to put it. 128 of each needs two slots per consumable plus one
+      -- for the drone, so a bus with fewer than five usable slots simply cannot
+      -- hold a full buffer of both.
+      return "nofit"
+    end
     -- One stack at a time: that is all an interface buffer slot holds.
     mod.iface.setInterfaceConfiguration(cfgSlot, dbAddr, dbSlot, math.min(deficit, 64))
     -- Half a second between checks, not a fifth. Each check is one call now
@@ -545,19 +561,42 @@ local function restockRunning(mod)
       -- Re-pick the destination: the module has been consuming while we waited.
       local d, r = destFor(label)
       if d then
-        mod.transposer.transferItem(mod.conf.interfaceSide, mod.conf.inputBusSide,
-                                    math.min(deficit, r), src, d)
+        local got = mod.transposer.transferItem(mod.conf.interfaceSide,
+                      mod.conf.inputBusSide, math.min(deficit, r), src, d)
+        if (got or 0) > 0 then movedAny = true end
       end
     end
     mod.iface.setInterfaceConfiguration(cfgSlot) -- stop hoarding the buffer between refills
+    return (busTotal(label) >= target) and "done" or "partial"
   end
 
-  refill(drill.tip, TIPS_PER, 2, slotTip)
-  refill(drill.rod, RODS_PER, 3, slotRod)
+  local tipState = refill(drill.tip, TIPS_PER, 2, slotTip)
+  local rodState = refill(drill.rod, RODS_PER, 3, slotRod)
 
-  -- Full enough to stop asking? Re-read rather than trusting what refill moved:
-  -- the module has been consuming throughout.
-  return busTotal(drill.tip) >= TIPS_PER and busTotal(drill.rod) >= RODS_PER
+  -- Stop asking once each consumable is either at target or cannot fit. Waiting
+  -- for both to reach target meant a bus too small for two full stacks retried
+  -- for the entire window and never finished -- which looked like "sometimes it
+  -- does not top up at all".
+  if movedAny then
+    mod.refills      = (mod.refills or 0) + 1
+    cycleStats.refills = (cycleStats.refills or 0) + 1
+  end
+
+  local settled = (tipState ~= "partial") and (rodState ~= "partial")
+  if settled then
+    local tips, rods = busTotal(drill.tip), busTotal(drill.rod)
+    logger:info(string.format(
+      "[RESTOCK] M%d settled at tips %d/%d (%s), rods %d/%d (%s)",
+      mod.index, tips, TIPS_PER, tipState, rods, RODS_PER, rodState))
+    if tipState == "nofit" or rodState == "nofit" then
+      logger:warn(string.format(
+        "[RESTOCK] M%d input bus has no room for a full buffer -- it needs %d free slots " ..
+        "(drone + %d stacks of tips + %d stacks of rods)",
+        mod.index, 1 + math.ceil(TIPS_PER / 64) + math.ceil(RODS_PER / 64),
+        math.ceil(TIPS_PER / 64), math.ceil(RODS_PER / 64)))
+    end
+  end
+  return settled
 end
 
 local function stepRunning(mod)
@@ -1355,7 +1394,8 @@ local function drawModulePanel()
       local droneName = config.drones[mod.job.droneKey] or "?"
       local lvl = droneName:match("MK%-(.+)") or "?"
       dashRow("M" .. row, P1 + 1, PW, row,
-        string.format("  dist=%d  drone=MK-%s", mod.job.distance or 0, lvl), 0xCCCCCC)
+        string.format("  dist=%d  drone=MK-%s  refills=%d",
+          mod.job.distance or 0, lvl, mod.refills or 0), 0xCCCCCC)
       row = row + 1
 
       -- Load diagnostic from the most recent load of this module:
@@ -1531,6 +1571,9 @@ local function drawHWPanel()
           cycleStats.loadTime / cycleStats.loads, cycleStats.loadMax,
           cycleStats.loads), 0x668866)
     end
+    put(string.format("  REFILLS: %d   %.1f/cycle",
+        cycleStats.refills or 0, (cycleStats.refills or 0) / cycleStats.cycles),
+        0x668866)
     if (cycleStats.spins or 0) > 0 then
       put(string.format("  SPINUP avg %.1fs  max %.1fs",
           cycleStats.spinTime / cycleStats.spins, cycleStats.spinMax), 0x668866)
