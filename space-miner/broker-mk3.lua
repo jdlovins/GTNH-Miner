@@ -682,6 +682,13 @@ local function findNeedsList()
   return needs
 end
 
+-- How many modules are mid-load right now.
+local function loadingCount()
+  local n = 0
+  for _, m in ipairs(modules) do if m.status == "LOADING" then n = n + 1 end end
+  return n
+end
+
 local function getIdleModules()
   local idle = {}
   local now = computer.uptime()
@@ -880,6 +887,33 @@ local function tryDispatchPinned(mod, avail, availKit, minKitsForLoad)
   return false
 end
 
+-- CONCURRENT LOADS
+--
+-- MK3's headline change was removing a fixed ten-second stagger and letting all
+-- six modules load at once. That was right to do -- the stagger was a magic
+-- sleep -- but "all at once" turned out to be the wrong replacement, because
+-- the loads do not actually run in parallel. They share one computer's
+-- component-call budget, which OpenComputers meters at roughly one indirect
+-- call per tick.
+--
+-- Measured in world: one module loading alone took 3 seconds. The same load
+-- with five siblings took 22-30. The work did not get slower, it got queued --
+-- and running them together means every module finishes late instead of one
+-- finishing early.
+--
+-- For six loads of ~90 calls against ~20 calls a second, the budget is ~27
+-- seconds either way. Run them together and all six start mining at 27s, for
+-- 162 module-seconds of idling. Run two at a time and they start staggered,
+-- for roughly 95 -- the last module is no worse off and every earlier one is
+-- mining sooner.
+--
+-- 0 disables the limit and restores load-everything-at-once.
+local function loadSlotsFree()
+  local cap = config.maxConcurrentLoads or 2
+  if cap <= 0 then return math.huge end
+  return cap - loadingCount()
+end
+
 local function dispatchBatch()
   pruneStaleJobs()
 
@@ -888,6 +922,14 @@ local function dispatchBatch()
 
   local idleModules = getIdleModules()
   if #idleModules == 0 then return end
+
+  -- Only hand out as many jobs as there are free load slots. Trimming here
+  -- bounds every path below it -- pinned, needs-based and fallback alike --
+  -- rather than each needing its own check. Modules that miss out stay IDLE and
+  -- are picked up on the next batch, a fraction of a second later.
+  local slots = loadSlotsFree()
+  if slots <= 0 then return end
+  while #idleModules > slots do table.remove(idleModules) end
 
   -- Working pools we can still hand out this batch: drones and drill kits.
   local avail          = availableDrones()

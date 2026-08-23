@@ -3012,6 +3012,18 @@ config.rodsToStart = 64
 -- asteroid it first picked up. Pinned modules top up forever by design.
 config.topUpWindow = 30
 
+-- How many modules may be LOADING at the same time. 0 = no limit.
+--
+-- Loads do not really run in parallel: they share one computer's component-call
+-- budget, which OpenComputers meters at roughly one indirect call per tick.
+-- Measured in game, a module loading alone took 3 seconds and the same load
+-- alongside five siblings took 22-30 -- the work was not slower, it was queued.
+--
+-- Since the total budget is the same either way, staggering means early modules
+-- start mining sooner and the last one is no worse off. Raise it if your loads
+-- are already fast; lower it to 1 if they are not.
+config.maxConcurrentLoads = 2
+
 -- Par levels for drill consumables. The broker publishes this table to the hw
 -- telem node (DRILL_PAR on config.ports.hardware); the node compares it against
 -- its own live ME scan and auto-crafts anything below par.
