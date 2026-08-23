@@ -129,6 +129,9 @@ local brokerState = {
   -- resolves itself (a craft lands, a pattern gets added) disappears on its own.
   crafting = {},
   jobs = {},
+  -- itemName -> asteroid, for needs no drone in stock can reach. Rebuilt every
+  -- dispatch so it clears itself the moment a suitable drone appears.
+  blocked = {},
   cooldowns = {},
   lastDustSyncTime = 0,
   lastFluidSyncTime = 0,
@@ -1318,7 +1321,64 @@ local function dispatchBatch()
   -- modules dispatched just above), count up as we go, and never exceed the cap.
   -- This is what frees module slots for lower-tier needs (e.g. Uranium-Plutonium)
   -- instead of one asteroid eating them all.
-  local cap            = asteroidCap(#needs)
+  -- Can anything we own actually mine this need?
+  --
+  -- An asteroid accepts a drone tier range, and a need whose range we cannot
+  -- reach is not a need this array can serve -- it is a standing wish. Counting
+  -- it toward the cap reserves module slots for work that will never be
+  -- dispatched: with Ruby Dust needing tier 2-6 and only tier 1, 7 and 9 drones
+  -- in stock, four of nine modules sat idle indefinitely while one asteroid was
+  -- held at its cap.
+  -- Returns true, or false plus WHY. The reason matters: "no drone of the right
+  -- tier" and "not enough kits for the drone we do have" need different actions
+  -- from you, and a message naming the wrong one is worse than none.
+  local function reachability(need)
+    local a = config.asteroids[need.asteroid]
+    if not a then return false, "noast" end
+    local sawDrone, wantKit = false, nil
+    for key, n in pairs(avail) do
+      if (n or 0) > 0 then
+        local tier = config.droneTierKeys[key]
+        if tier and tier >= a.minDrone and tier <= a.maxDrone then
+          sawDrone = true
+          local dk = config.droneDrillMap[tier]
+          if dk then
+            wantKit = wantKit or dk
+            if (availKit[dk] or 0) >= minKitsForLoad then return true end
+          end
+        end
+      end
+    end
+    return false, sawDrone and "kits" or "drone", wantKit
+  end
+
+  -- "No drone can reach this asteroid" only means something when we HAVE drones.
+  -- With an empty stock everything looks unreachable, and saying so per item
+  -- would bury the real message -- which the hardware panel already gives as
+  -- "[ NO DRONES IN STOCK ]".
+  local haveAnyDrone = false
+  for key, n in pairs(avail) do
+    -- Only drones the config recognises. availableDrones copies whatever keys
+    -- telemetry sent, and a key with no tier cannot reach any asteroid -- so
+    -- counting it as "we have drones" would make every need look blocked.
+    if (n or 0) > 0 and config.droneTierKeys[key] then haveAnyDrone = true break end
+  end
+
+  local nReachable = 0
+  local blocked = {}
+  for _, need in ipairs(needs) do
+    local ok, why, kit = reachability(need)
+    if ok then
+      nReachable = nReachable + 1
+    elseif haveAnyDrone then
+      blocked[need.itemName] = { asteroid = need.asteroid, why = why, kit = kit }
+    end
+  end
+  -- Surfaced on the dust panel so an unmineable item says so instead of sitting
+  -- at a red percentage forever with no explanation.
+  brokerState.blocked = blocked
+
+  local cap            = asteroidCap(nReachable)
   local astCount       = activeAsteroidCounts()
   brokerState.cap      = cap   -- surfaced on the hardware panel
 
@@ -1384,6 +1444,23 @@ local function dispatchBatch()
     -- A pass that placed nothing will place nothing next time either: the pool,
     -- the drones and the kits are all unchanged.
     if not assigned then break end
+  end
+
+  -- Anything left idle now is idle because of the cap, not for want of drones,
+  -- kits or needs -- those all fail inside assignOne regardless of it. A module
+  -- mining an already-well-served asteroid still beats a module mining nothing,
+  -- so lift the cap for whatever is left rather than reserving slots for needs
+  -- that could not take them.
+  if #pool > 0 then
+    cap = #modules
+    while #pool > 0 do
+      local assigned = false
+      for _, need in ipairs(needs) do
+        if #pool == 0 then break end
+        if assignOne(need) then assigned = true end
+      end
+      if not assigned then break end
+    end
   end
 end
 
@@ -1655,15 +1732,37 @@ local function drawDustPanel()
     local item = list[i]
     if row > H then break end
     local pct = math.floor(item.ratio * 100)
-    local color = (item.ratio >= 1.0) and 0x446644 or (item.ratio < 0.25) and 0xFF4444
+    -- An item nothing in stock can mine is not "low", it is stuck. Saying so is
+    -- the difference between a number you act on and a number you stare at:
+    -- Ruby Dust sat at 10% indefinitely because its asteroid wants a drone tier
+    -- nobody owned, and nothing on screen said which.
+    local stuck = brokerState.blocked and brokerState.blocked[item.name]
+    local stuckOn = stuck and stuck.asteroid
+    local color = stuckOn and 0xFF00FF
+        or (item.ratio >= 1.0) and 0x446644 or (item.ratio < 0.25) and 0xFF4444
         or (item.ratio < 0.75) and 0xFFAA00 or 0x00FFFF
-    local mark = item.ratio < 1.0 and "!" or " "
+    local mark = stuckOn and "x" or (item.ratio < 1.0 and "!" or " ")
     dashRow("D" .. row, P2 + 1, PW, row,
       string.format("  %s %-27s %3d%%", mark, item.name, pct), color)
     row = row + 1
     if row > H then break end
-    dashRow("D" .. row, P2 + 1, PW, row,
-      string.format("      %s / %s", formatQty(item.stock), formatQty(item.threshold)), 0x666666)
+    local detail
+    if stuck then
+      local a = config.asteroids[stuck.asteroid]
+      if stuck.why == "kits" then
+        detail = string.format("      NEEDS %d %s KITS for %s",
+          math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64),
+          tostring(stuck.kit), stuck.asteroid)
+      elseif stuck.why == "noast" then
+        detail = "      NO ASTEROID MAPPING -- cannot be mined"
+      else
+        detail = string.format("      NO DRONE for %s (needs tier %d-%d)",
+          stuck.asteroid, a and a.minDrone or 0, a and a.maxDrone or 0)
+      end
+    else
+      detail = string.format("      %s / %s", formatQty(item.stock), formatQty(item.threshold))
+    end
+    dashRow("D" .. row, P2 + 1, PW, row, detail, stuckOn and 0xFF00FF or 0x666666)
     row = row + 1
   end
   for r = row, H do dashBlank("D" .. r, P2 + 1, PW, r) end
