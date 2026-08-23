@@ -3014,15 +3014,16 @@ config.topUpWindow = 30
 
 -- FAST RELOAD -- skip the unload when the next job wants the same hardware.
 --
--- Most re-dispatches send a module back to the same asteroid with the same drone
--- and drill. Returning the drone and leftover consumables to the ME and then
--- asking for identical items back costs the whole round trip, and it is what
--- creates the wait at the start of the next load: the network has to absorb what
--- we just pushed into the interface before it can stock anything new.
+-- A finished module has consumed its tips and rods -- running out is what makes
+-- it stop -- so the only thing left in the bus is the drone. And most
+-- re-dispatches send the module back to the same asteroid, wanting that same
+-- drone. Returning it to the network, waiting for the network to absorb it, and
+-- then asking for it back is a round trip per cycle that ends where it started.
+-- The wait for the network to absorb it is the `pre` phase on the module line.
 --
--- With this on, a finished module HOLDS its contents, and dispatch decides. Same
--- drone and drill -> keep everything, top up what is short, restart. Different
--- -> unload exactly as before.
+-- With this on, a finished module HOLDS the drone and dispatch decides. Same
+-- drone -> keep it, fetch consumables fresh, restart. Different -> return it
+-- exactly as before.
 --
 -- holdTimeout returns the contents if nothing claims the module, since a held
 -- drone is invisible to every other module until it is given back. Dispatch

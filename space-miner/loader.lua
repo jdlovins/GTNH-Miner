@@ -190,11 +190,13 @@ function loader.run(mod, job, deps)
 
   -- FAST RELOAD
   --
-  -- The module already holds this exact drone and drill from its previous run,
-  -- so there is nothing to unload and nothing to fetch but the consumables it is
-  -- short of. That skips the three things that dominate a normal load: emptying
-  -- the bus, waiting for the ME to absorb what we just emptied into it, and a
-  -- round trip to fetch a drone that never left.
+  -- The module still holds the drone from its previous run. Tips and rods are
+  -- always fetched fresh -- they are consumed during a run, and running out is
+  -- what ends it -- so this is not "reuse the load", it is "do not put the drone
+  -- back and immediately ask for it again".
+  --
+  -- What that skips: emptying the bus, waiting for the network to absorb what
+  -- was emptied into it, and the round trip to fetch a drone that never left.
   --
   -- The broker decides this (it knows what the module was last running); the
   -- loader only acts on it, and still verifies the drone is really there before

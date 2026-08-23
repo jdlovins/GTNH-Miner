@@ -754,13 +754,14 @@ end
 local function stepDone(mod)
   if not mod.doneTime then
     mod.doneTime = computer.uptime()
-    -- HOLD, do not unload yet.
+    -- HOLD the drone, do not unload yet.
     --
-    -- Most re-dispatches send a module back to the same asteroid with the same
-    -- drone and drill, so returning the drone and leftovers to the ME and then
-    -- asking for identical items back is pure waste -- and it is what creates
-    -- the wait at the start of the next load, since we must let the network
-    -- absorb what we just pushed before we can stock anything new.
+    -- A finished module has consumed its tips and rods -- that is why it
+    -- stopped -- so what this returns is essentially just the drone. And most
+    -- re-dispatches send the module straight back to the same asteroid, which
+    -- wants that same drone. Handing it to the network, waiting for the network
+    -- to absorb it, then asking for it back is a round trip that ends exactly
+    -- where it started, once per cycle.
     --
     -- Decide at dispatch, when the next job is actually known. Dispatch is
     -- forced immediately after this, so the hold is normally momentary; the
@@ -896,8 +897,18 @@ local function getIdleModules()
   return idle
 end
 
--- True when the module is still holding exactly the drone and drill this job
--- wants, so the load can skip the unload and the drone round trip.
+-- True when the module is still holding the drone this job wants.
+--
+-- The DRONE is the only thing that survives a run: tips and rods are consumed,
+-- and running out of them is what makes the module stop in the first place. So
+-- there is nothing to "keep topped up" across a reload -- consumables are always
+-- fetched fresh. What is saved is the drone: returning it to the network,
+-- waiting for the network to absorb it, and asking for the same one back.
+--
+-- drillKey is compared too, though it is implied: config.droneDrillMap derives
+-- the drill from the drone's tier, so a matching drone always means a matching
+-- drill. Kept explicit so this stays correct if that mapping ever stops being
+-- one-to-one.
 local function moduleHolds(mod, droneKey, drillKey)
   local h = mod.holding
   return config.fastReload and h ~= nil
@@ -959,8 +970,8 @@ local function tryDispatch(mod, asteroid, droneKey)
     pcall(returnItemsToME, mod)
   end
   if holds then
-    logger:info(string.format("[FASTLOAD] M%d keeping %s + %s for %s",
-      mod.index, tostring(config.drones[droneKey]), tostring(drillKey), asteroid))
+    logger:info(string.format("[FASTLOAD] M%d keeping %s for %s (consumables fetched fresh)",
+      mod.index, tostring(config.drones[droneKey]), asteroid))
   end
   mod.holding, mod.heldSince = nil, nil
 
