@@ -754,7 +754,26 @@ end
 local function stepDone(mod)
   if not mod.doneTime then
     mod.doneTime = computer.uptime()
-    returnItemsToME(mod)
+    -- HOLD, do not unload yet.
+    --
+    -- Most re-dispatches send a module back to the same asteroid with the same
+    -- drone and drill, so returning the drone and leftovers to the ME and then
+    -- asking for identical items back is pure waste -- and it is what creates
+    -- the wait at the start of the next load, since we must let the network
+    -- absorb what we just pushed before we can stock anything new.
+    --
+    -- Decide at dispatch, when the next job is actually known. Dispatch is
+    -- forced immediately after this, so the hold is normally momentary; the
+    -- idle backstop in stepModules covers the case where it is not.
+    if config.fastReload then
+      mod.holding = mod.job and {
+        droneKey = mod.job.droneKey,
+        drillKey = mod.job.drillKey,
+      } or nil
+      mod.heldSince = computer.uptime()
+    else
+      returnItemsToME(mod)
+    end
     clearInterfaceSlots(mod)
     mod.adapter.setWorkAllowed(false)
   elseif computer.uptime() - mod.doneTime >= DONE_SETTLE then
@@ -779,9 +798,26 @@ local function stepDone(mod)
   end
 end
 
+-- Give back consumables a module is sitting on but not using.
+--
+-- A held drone is invisible to availableDrones and held kits to availableKits,
+-- so a module that holds indefinitely starves the others. Dispatch normally
+-- claims them within a fraction of a second; this covers the case where there
+-- is no work, no plasma, or no matching need.
+local function releaseStaleHold(mod)
+  if not mod.holding or mod.status ~= "IDLE" then return end
+  if computer.uptime() - (mod.heldSince or 0) < (config.holdTimeout or 10) then return end
+  logger:info(string.format("[HOLD] M%d released after %.0fs unclaimed",
+    mod.index, computer.uptime() - (mod.heldSince or 0)))
+  pcall(returnItemsToME, mod)
+  mod.holding, mod.heldSince = nil, nil
+end
+
 local function stepModules()
   for _, mod in ipairs(modules) do
-    if mod.status == "LOADING" then
+    if mod.status == "IDLE" then
+      releaseStaleHold(mod)
+    elseif mod.status == "LOADING" then
       pollLoad(mod)
     elseif mod.status == "RUNNING" then
       stepRunning(mod)
@@ -860,10 +896,18 @@ local function getIdleModules()
   return idle
 end
 
+-- True when the module is still holding exactly the drone and drill this job
+-- wants, so the load can skip the unload and the drone round trip.
+local function moduleHolds(mod, droneKey, drillKey)
+  local h = mod.holding
+  return config.fastReload and h ~= nil
+     and h.droneKey == droneKey and h.drillKey == drillKey
+end
+
 local function tryDispatch(mod, asteroid, droneKey)
   local asteroidData = config.asteroids[asteroid]
   if not asteroidData then return false end
-  if not droneKey or (brokerState.drones[droneKey] or 0) <= 0 then return false end
+  if not droneKey then return false end
 
   local droneTier = config.droneTierKeys[droneKey]
   if droneTier < asteroidData.minDrone or droneTier > asteroidData.maxDrone then return false end
@@ -881,11 +925,17 @@ local function tryDispatch(mod, asteroid, droneKey)
   if not config.drones[droneKey] then return false end
   if not config.drills[drillKey] then return false end
 
+  -- A module still holding this exact hardware does not need the ME to have
+  -- another set: the drone never left, and the loader only fetches whatever
+  -- consumables it is actually short of.
+  local holds = moduleHolds(mod, droneKey, drillKey)
+  if not holds and (brokerState.drones[droneKey] or 0) <= 0 then return false end
+
   -- Don't dispatch if we don't have enough drill kits for a full load.
   -- The loader needs config.tipsPerLoad tips + config.rodsPerLoad rods per module.
   local drill = brokerState.drills[drillKey]
   local minKits = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
-  if not drill or (drill.kits or 0) < minKits then return false end
+  if not holds and (not drill or (drill.kits or 0) < minKits) then return false end
 
   local jobId = nodeId .. "-" .. math.floor(computer.uptime() * 1000) .. "-M" .. mod.index
   mod.lastDispatchAt = computer.uptime()   -- fairness ordering, see dispatchBatch
@@ -902,6 +952,18 @@ local function tryDispatch(mod, asteroid, droneKey)
     parallels = config.moduleTiers[mod.tier].maxParallels,
     startTime = computer.uptime(),
   }
+  mod.job.fastReload = holds
+  if config.fastReload and mod.holding and not holds then
+    -- Different hardware this time, so the hold was not useful after all.
+    -- Unload now, which is exactly what stepDone used to do unconditionally.
+    pcall(returnItemsToME, mod)
+  end
+  if holds then
+    logger:info(string.format("[FASTLOAD] M%d keeping %s + %s for %s",
+      mod.index, tostring(config.drones[droneKey]), tostring(drillKey), asteroid))
+  end
+  mod.holding, mod.heldSince = nil, nil
+
   brokerState.jobs[jobId] = { moduleIndex = mod.index, asteroid = asteroid, startTime = computer.uptime() }
   brokerState.nextTarget = { asteroid = asteroid, reason = "dispatched" }
 
@@ -1086,6 +1148,23 @@ local function dispatchBatch()
   local avail          = availableDrones()
   local availKit       = availableKits()
   local minKitsForLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
+
+  -- Count what idle modules are still holding as available, because it is: the
+  -- drone is sitting in that module and the loader will not ask the ME for
+  -- another. Without this the outer gates below see zero stock and refuse the
+  -- one dispatch that needs no stock at all.
+  --
+  -- tryDispatch still checks the real ME figures, so a phantom cannot be spent
+  -- by a DIFFERENT module -- it would fail there and the loop moves on.
+  if config.fastReload then
+    for _, m in ipairs(idleModules) do
+      local h = m.holding
+      if h then
+        avail[h.droneKey]    = (avail[h.droneKey] or 0) + 1
+        availKit[h.drillKey] = (availKit[h.drillKey] or 0) + minKitsForLoad
+      end
+    end
+  end
 
   -- Pinned modules always mine their assigned asteroid, ignoring dust thresholds
   -- and the per-asteroid cap. Handle them first and drop them from the pool so

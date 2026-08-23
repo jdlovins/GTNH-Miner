@@ -3012,6 +3012,30 @@ config.rodsToStart = 64
 -- asteroid it first picked up. Pinned modules top up forever by design.
 config.topUpWindow = 30
 
+-- FAST RELOAD -- skip the unload when the next job wants the same hardware.
+--
+-- Most re-dispatches send a module back to the same asteroid with the same drone
+-- and drill. Returning the drone and leftover consumables to the ME and then
+-- asking for identical items back costs the whole round trip, and it is what
+-- creates the wait at the start of the next load: the network has to absorb what
+-- we just pushed into the interface before it can stock anything new.
+--
+-- With this on, a finished module HOLDS its contents, and dispatch decides. Same
+-- drone and drill -> keep everything, top up what is short, restart. Different
+-- -> unload exactly as before.
+--
+-- holdTimeout returns the contents if nothing claims the module, since a held
+-- drone is invisible to every other module until it is given back. Dispatch
+-- normally claims it within a fraction of a second.
+--
+-- Off by default: it is the most invasive change to the load path, and the
+-- failure mode if the broker is wrong about what a module holds would be arming
+-- a module with the wrong hardware. The loader verifies the drone before
+-- committing, so that should fail loudly rather than silently -- but prove it on
+-- your setup before leaving it on.
+config.fastReload  = false
+config.holdTimeout = 10
+
 -- How many modules may be LOADING at the same time. 0 = no limit.
 --
 -- Loads do not really run in parallel: they share one computer's component-call

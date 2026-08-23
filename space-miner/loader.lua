@@ -188,10 +188,26 @@ function loader.run(mod, job, deps)
   local slotDrone, slotTip, slotRod = dbSlotsFor(mod.index)
   local stats = { confirmPolls = {}, arrivePolls = 0 }
 
+  -- FAST RELOAD
+  --
+  -- The module already holds this exact drone and drill from its previous run,
+  -- so there is nothing to unload and nothing to fetch but the consumables it is
+  -- short of. That skips the three things that dominate a normal load: emptying
+  -- the bus, waiting for the ME to absorb what we just emptied into it, and a
+  -- round trip to fetch a drone that never left.
+  --
+  -- The broker decides this (it knows what the module was last running); the
+  -- loader only acts on it, and still verifies the drone is really there before
+  -- trusting the claim.
+  local fast = job.fastReload == true
+  if fast then stats.fastReload = true end
+
   -- 1. Start clean: empty the input bus and wipe our db slots so we can't
   --    accidentally read a previous job's fingerprint.
-  clearInputBus(mod)
-  db.clear(slotDrone)
+  if not fast then
+    clearInputBus(mod)
+    db.clear(slotDrone)
+  end
   db.clear(slotTip)
   db.clear(slotRod)
 
@@ -200,8 +216,10 @@ function loader.run(mod, job, deps)
   -- previous job, just pushed in by clearInputBus) is still sitting in slot 1,
   -- the fresh drone could end up in the wrong slot and a tip gets transferred
   -- as the "drone". Confirm slots 1-3 are empty before stocking fresh items.
+  -- Only relevant when we have just pushed the previous run's leftovers into the
+  -- buffer. A fast reload pushed nothing, so there is nothing to wait for.
   local preDrainAt = computer.uptime()
-  local drained = pollUntil(function()
+  local drained = fast or pollUntil(function()
     local snap = snapshotSide(mod, mod.conf.interfaceSide, 1, 3)
     for s = 1, 3 do
       if snap[s] and (snap[s].size or 0) > 0 then return false end
@@ -215,10 +233,12 @@ function loader.run(mod, job, deps)
 
   -- 2. Write fingerprints, confirming each by read-back before moving on.
   local items = {
-    { slot = slotDrone, label = droneName,       tag = "drone" },
     { slot = slotTip,   label = drillEntry.tip,  tag = "tip"   },
     { slot = slotRod,   label = drillEntry.rod,  tag = "rod"   },
   }
+  if not fast then
+    table.insert(items, 1, { slot = slotDrone, label = droneName, tag = "drone" })
+  end
 
   -- Issue all three writes first, then wait for them together.
   --
@@ -268,9 +288,9 @@ function loader.run(mod, job, deps)
         mod.iface.setInterfaceConfiguration(slot, dbAddr, dbSlot, per)
       end
     end
-    mod.iface.setInterfaceConfiguration(1, dbAddr, slotDrone, 1)
-    alloc("tip", slotTip, TIPS_PER)
-    alloc("rod", slotRod, RODS_PER)
+    if not fast then mod.iface.setInterfaceConfiguration(1, dbAddr, slotDrone, 1) end
+    alloc("tip", slotTip, TIPS_START)
+    alloc("rod", slotRod, RODS_START)
   end
 
   -- 4. The DRONE is the load gate: wait only for it. Tips and rods are handled
@@ -293,9 +313,12 @@ function loader.run(mod, job, deps)
     return false
   end
 
-  local droneArrived, polls = pollUntil(function()
-    return bufferHas(droneName, 1)
-  end, ARRIVE_TIMEOUT)
+  local droneArrived, polls = true, 0
+  if not fast then
+    droneArrived, polls = pollUntil(function()
+      return bufferHas(droneName, 1)
+    end, ARRIVE_TIMEOUT)
+  end
   stats.arrivePolls = polls
 
   if not droneArrived then
@@ -327,16 +350,18 @@ function loader.run(mod, job, deps)
 
   -- Move the drone (exactly 1) into bus slot 1. It is not consumed on arrival,
   -- so once it lands it stays put while tips and rods fill in around it.
-  local droneSrc = findSlot(droneName, 1)
-  if not droneSrc then
-    clearInterfaceSlots(mod)
-    return false, "drone not found in interface buffer (" .. droneName .. ")"
-  end
-  local movedDrone = mod.transposer.transferItem(
-    mod.conf.interfaceSide, mod.conf.inputBusSide, 1, droneSrc, 1)
-  if (movedDrone or 0) < 1 then
-    clearInterfaceSlots(mod)
-    return false, "drone transfer failed"
+  if not fast then
+    local droneSrc = findSlot(droneName, 1)
+    if not droneSrc then
+      clearInterfaceSlots(mod)
+      return false, "drone not found in interface buffer (" .. droneName .. ")"
+    end
+    local movedDrone = mod.transposer.transferItem(
+      mod.conf.interfaceSide, mod.conf.inputBusSide, 1, droneSrc, 1)
+    if (movedDrone or 0) < 1 then
+      clearInterfaceSlots(mod)
+      return false, "drone transfer failed"
+    end
   end
 
   -- 6. Fill tips (bus slot 2) and rods (bus slot 3) from the interface buffer,
@@ -483,10 +508,14 @@ function loader.run(mod, job, deps)
 
   -- Verify the right drone landed before committing tips and rods (catches a
   -- cross-up before we spend ME throughput filling around a wrong drone).
+  -- Runs on both paths. On a fast reload this is the whole safety net: the
+  -- broker claimed the module still holds this drone, and if it does not, the
+  -- load must fail loudly rather than arm a module with the wrong hardware.
   local droneStack = mod.transposer.getStackInSlot(mod.conf.inputBusSide, 1)
   if not droneStack or droneStack.label ~= droneName then
     clearInterfaceSlots(mod)
-    return false, "drone mismatch in bus: expected " .. droneName ..
+    return false, (fast and "fast reload: " or "") ..
+                  "drone mismatch in bus: expected " .. droneName ..
                   ", got " .. (droneStack and droneStack.label or "empty")
   end
   local fillAt = computer.uptime()
