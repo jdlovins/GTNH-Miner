@@ -414,10 +414,24 @@ local function restockRunning(mod)
   -- Count ALL of `label` across the whole bus, not one fixed slot. If we only
   -- checked a fixed slot and the item had shifted, we'd read 0 and re-pull a full
   -- stack every cycle — silently draining the ME and starving other modules.
+  -- One call per inventory, not one per slot. These three loops ran every few
+  -- seconds for every running module, and the findBuf one ran inside a five
+  -- second await polled five times a second -- so a single refill could spend
+  -- a couple of hundred component calls doing nothing but waiting, while the
+  -- loaders were queueing for the same budget.
+  -- Falls back to per-slot reads if loader.lua predates snapshotSide, so a
+  -- half-updated /home (new broker, old loader) is slow rather than broken.
+  local snap = loader.snapshotSide or function(m, side, from, to)
+    local out = {}
+    for sl = from, to do out[sl] = m.transposer.getStackInSlot(side, sl) end
+    return out
+  end
+
   local function busTotal(label)
     local total, firstSlot = 0, nil
+    local inv = snap(mod, mod.conf.inputBusSide, 1, busSize)
     for s = 1, busSize do
-      local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, s)
+      local st = inv[s]
       if st and st.label == label then
         total = total + (st.size or 0)
         firstSlot = firstSlot or s
@@ -427,8 +441,9 @@ local function restockRunning(mod)
   end
 
   local function findBuf(label)
+    local inv = snap(mod, mod.conf.interfaceSide, 1, ibufSize)
     for s = 1, ibufSize do
-      local stack = mod.transposer.getStackInSlot(mod.conf.interfaceSide, s)
+      local stack = inv[s]
       if stack and stack.label == label then return s, stack.size or 0 end
     end
     return nil, 0
@@ -441,8 +456,9 @@ local function restockRunning(mod)
   -- nothing and the module ran dry anyway. Slot 1 is the drone; start at 2.
   local function destFor(label)
     local firstEmpty
+    local inv = snap(mod, mod.conf.inputBusSide, 1, busSize)
     for s = 2, busSize do
-      local st = mod.transposer.getStackInSlot(mod.conf.inputBusSide, s)
+      local st = inv[s]
       if not st or (st.size or 0) == 0 then
         firstEmpty = firstEmpty or s
       elseif st.label == label then
@@ -464,7 +480,10 @@ local function restockRunning(mod)
     if not dst then return end
     -- One stack at a time: that is all an interface buffer slot holds.
     mod.iface.setInterfaceConfiguration(cfgSlot, dbAddr, dbSlot, math.min(deficit, 64))
-    sched.await(function() return (select(1, findBuf(label))) ~= nil end, 5, 0.2)
+    -- Half a second between checks, not a fifth. Each check is one call now
+    -- rather than nine, but the ME is not going to answer faster for being
+    -- asked more often, and this runs concurrently with every other module.
+    sched.await(function() return (select(1, findBuf(label))) ~= nil end, 5, 0.5)
     if mod.status ~= "RUNNING" then
       mod.iface.setInterfaceConfiguration(cfgSlot)
       return

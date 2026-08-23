@@ -511,4 +511,10 @@ end
 
 loader.dbSlotsFor = dbSlotsFor  -- exported for the broker's UI/return logic
 
+-- Exported so the broker's restock path reads inventories the same cheap way.
+-- It had its own per-slot loops, which is the same mistake in a second place --
+-- and worse there, because restock runs every few seconds for every module
+-- while loads are trying to use the same call budget.
+loader.snapshotSide = snapshotSide
+
 return loader
