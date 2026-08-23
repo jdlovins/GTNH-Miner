@@ -3020,9 +3020,17 @@ config.topUpWindow = 30
 -- alongside five siblings took 22-30 -- the work was not slower, it was queued.
 --
 -- Since the total budget is the same either way, staggering means early modules
--- start mining sooner and the last one is no worse off. Raise it if your loads
--- are already fast; lower it to 1 if they are not.
-config.maxConcurrentLoads = 2
+-- start mining sooner and the last one is no worse off.
+--
+-- Set to 0 (no limit) because the reason for the cap has since gone away. Loads
+-- were ~90 metered calls each when it was introduced; after the loader and the
+-- restock path stopped reading inventories one slot at a time they are ~39, and
+-- six at once now finish in 2-7s rather than 22-37s. Staggering cheap loads only
+-- delays the modules waiting for a slot.
+--
+-- Put it back to 2 or 3 if load times climb again -- that would mean something
+-- has started competing for the call budget once more.
+config.maxConcurrentLoads = 0
 
 -- Par levels for drill consumables. The broker publishes this table to the hw
 -- telem node (DRILL_PAR on config.ports.hardware); the node compares it against

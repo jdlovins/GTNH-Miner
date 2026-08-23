@@ -946,7 +946,9 @@ end
 --
 -- 0 disables the limit and restores load-everything-at-once.
 local function loadSlotsFree()
-  local cap = config.maxConcurrentLoads or 2
+  -- Default matches config.lua: no limit. A config predating this key should
+  -- not quietly reintroduce a cap the shipped settings no longer ask for.
+  local cap = config.maxConcurrentLoads or 0
   if cap <= 0 then return math.huge end
   return cap - loadingCount()
 end
