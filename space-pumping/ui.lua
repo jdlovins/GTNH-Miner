@@ -36,6 +36,10 @@ local curFG, curBG
 -- Layout, computed in ui.init once the resolution is known.
 local L = {}
 
+-- First visible ROW of the pump panel. Only meaningful when the array is larger
+-- than the panel; clamped on every draw because rescan changes the array size.
+local pumpScroll = 0
+
 -- ---------------------------------------------------------------------------
 -- FORMATTING
 -- ---------------------------------------------------------------------------
@@ -98,13 +102,16 @@ end
 -- ---------------------------------------------------------------------------
 
 local function computeLayout()
-  local pumpRows = 4
+  local pumpRows = math.max(1, (config.ui and config.ui.pumpRows) or 4)
   L.pumpHeader   = 5
   L.pumpRule     = 6
   L.pumpFirst    = 7
   L.pumpRows     = pumpRows
-  L.pumpCols     = 2
-  L.pumpColX     = { 2, math.floor(W / 2) + 2 }
+  L.pumpCols     = math.max(1, (config.ui and config.ui.pumpCols) or 2)
+  L.pumpColX = {}
+  for c = 1, L.pumpCols do
+    L.pumpColX[c] = math.floor(W * (c - 1) / L.pumpCols) + 2
+  end
 
   L.queueHeader  = L.pumpFirst + pumpRows + 1     -- 12 at the default layout
   L.queueRule    = L.queueHeader + 1
@@ -137,8 +144,6 @@ function ui.drawStaticFrame()
   setFG(0xFFFFFF)
   gpu.set(math.max(1, math.floor((W - #title) / 2)), 1, title)
 
-  setFG(0x00AAFF)
-  gpu.set(1, L.pumpHeader, "PUMP ARRAY STATUS")
   setFG(0x555555)
   gpu.fill(1, L.pumpRule, W, 1, "-")
 
@@ -172,59 +177,100 @@ local function drawHeaderLine(target)
   })
 end
 
-local function drawPumpPanel()
-  local list = pumps.list()
-  local perCol = L.pumpRows
+-- How many pumps fit on screen at once.
+local function pumpWindow() return L.pumpRows * L.pumpCols end
 
-  for slot = 1, L.pumpRows * L.pumpCols do
-    local y = L.pumpFirst + ((slot - 1) % perCol)
-    local colIndex = math.floor((slot - 1) / perCol) + 1
-    -- Two pumps share each row (one per column), so the row's signature has to
-    -- cover both of them. Build the key for the whole row when we reach its
-    -- first column, and skip the row entirely if nothing in it moved.
-    if colIndex == 1 then
-      local keyParts, cells = {}, {}
-      for c = 1, L.pumpCols do
-        local p = list[(c - 1) * perCol + ((slot - 1) % perCol) + 1]
-        local x = L.pumpColX[c]
-        if not p then
-          keyParts[#keyParts + 1] = "-"
+-- Scroll the pump panel by `delta` rows. Clamped so you cannot scroll past
+-- either end, and a no-op when the whole array already fits.
+function ui.scrollPumps(delta)
+  local total = pumps.count()
+  local maxScroll = math.max(0, math.ceil(total / L.pumpCols) - L.pumpRows)
+  local was = pumpScroll
+  pumpScroll = math.max(0, math.min(maxScroll, pumpScroll + delta))
+  return pumpScroll ~= was
+end
+
+-- True if (x, y) lands in the pump panel, so the main loop knows whether a
+-- scroll wheel event belongs to us.
+function ui.inPumpPanel(x, y)
+  return y and y >= L.pumpFirst and y < L.pumpFirst + L.pumpRows
+end
+
+local function drawPumpPanel()
+  local list  = pumps.list()
+  local total = #list
+  local cols  = L.pumpCols
+
+  -- Re-clamp every frame: the array size changes under us on rescan, and a
+  -- scroll position left pointing past the end would show an empty panel with
+  -- no hint that the pumps are further up.
+  local maxScroll = math.max(0, math.ceil(total / cols) - L.pumpRows)
+  if pumpScroll > maxScroll then pumpScroll = maxScroll end
+
+  -- Header carries the window, so a partial view never looks like the whole
+  -- array. Without it, eight of thirty-two pumps reads exactly like eight pumps.
+  local firstShown = pumpScroll * cols + 1
+  local lastShown  = math.min(total, firstShown + pumpWindow() - 1)
+  local title
+  if total == 0 then
+    title = "PUMP ARRAY STATUS"
+  elseif total <= pumpWindow() then
+    title = string.format("PUMP ARRAY STATUS   %d pump(s)", total)
+  else
+    title = string.format("PUMP ARRAY STATUS   showing %d-%d of %d   %s%s  (scroll / up-down)",
+      firstShown, lastShown, total,
+      (pumpScroll > 0) and "^" or " ",
+      (pumpScroll < maxScroll) and "v" or " ")
+  end
+  if not fresh(L.pumpHeader, title) then
+    paint(L.pumpHeader, title, { { 1, title, 0x00AAFF } })
+  end
+
+  -- Row-major: pumps read left to right, then down. Column-major would mean one
+  -- scroll row jumped a whole column's worth of the array.
+  for r = 0, L.pumpRows - 1 do
+    local y = L.pumpFirst + r
+    local keyParts, cells = {}, {}
+    for c = 1, cols do
+      local p = list[(pumpScroll + r) * cols + c]
+      local x = L.pumpColX[c]
+      if not p then
+        keyParts[#keyParts + 1] = "-"
+      else
+        local rate = "---"
+        if p.status == "RUNNING" and p.task then
+          local m = config.master[p.task]
+          if m then rate = ui.formatFluid(m.rate * p.mult * p.threads) .. "/t" end
+        end
+        local statusColor =
+          (p.status == "RUNNING" and 0x00FF00) or
+          (p.status == "ARMING"  and 0xFFCC33) or
+          (p.status == "ERROR"   and 0xFF4444) or 0x777777
+        -- An ERROR gets the rest of the row, because the reason is the whole
+        -- point of showing it. Truncating to the task column's 20 characters
+        -- cut "arm failed on Xenon: <reason>" off exactly where the reason
+        -- started -- a message that tells you only what you already knew.
+        local detail, detailWidth
+        if p.status == "ERROR" then
+          detailWidth = (c < cols) and (L.pumpColX[c + 1] - x - 20) or (W - x - 18)
+          detailWidth = math.max(12, detailWidth)
+          detail = tostring(p.lastError or "error")
         else
-          local rate = "---"
-          if p.status == "RUNNING" and p.task then
-            local m = config.master[p.task]
-            if m then rate = ui.formatFluid(m.rate * p.mult * p.threads) .. "/t" end
-          end
-          local statusColor =
-            (p.status == "RUNNING" and 0x00FF00) or
-            (p.status == "ARMING"  and 0xFFCC33) or
-            (p.status == "ERROR"   and 0xFF4444) or 0x777777
-          -- An ERROR gets the rest of the row, because the reason is the whole
-          -- point of showing it. Truncating to the task column's 20 characters
-          -- cut "arm failed on Xenon: <reason>" off exactly where the reason
-          -- started -- a message that tells you only what you already knew.
-          local detail, detailWidth
-          if p.status == "ERROR" then
-            detailWidth = (c < L.pumpCols) and (L.pumpColX[c + 1] - x - 20) or (W - x - 18)
-            detailWidth = math.max(12, detailWidth)
-            detail = tostring(p.lastError or "error")
-          else
-            detailWidth = 20
-            detail = tostring(p.task or "None")
-          end
-          detail = detail:sub(1, detailWidth)
-          keyParts[#keyParts + 1] = table.concat({ p.short, p.tier, p.status, detail, rate }, "~")
-          cells[#cells + 1] = { x,      string.format("%-4s %-3s", p.short, p.tier), 0xFFFFFF }
-          cells[#cells + 1] = { x + 9,  string.format("%-8s", p.status),             statusColor }
-          cells[#cells + 1] = { x + 18, detail,                                      0xCCCCCC }
-          if p.status ~= "ERROR" then
-            cells[#cells + 1] = { x + 39, rate,                                      0x668866 }
-          end
+          detailWidth = 20
+          detail = tostring(p.task or "None")
+        end
+        detail = detail:sub(1, detailWidth)
+        keyParts[#keyParts + 1] = table.concat({ p.short, p.tier, p.status, detail, rate }, "~")
+        cells[#cells + 1] = { x,      string.format("%-4s %-3s", p.short, p.tier), 0xFFFFFF }
+        cells[#cells + 1] = { x + 9,  string.format("%-8s", p.status),             statusColor }
+        cells[#cells + 1] = { x + 18, detail,                                      0xCCCCCC }
+        if p.status ~= "ERROR" then
+          cells[#cells + 1] = { x + 39, rate,                                      0x668866 }
         end
       end
-      local key = table.concat(keyParts, "||")
-      if not fresh(y, key) then paint(y, key, cells) end
     end
+    local key = table.concat(keyParts, "||")
+    if not fresh(y, key) then paint(y, key, cells) end
   end
 end
 
@@ -404,6 +450,7 @@ function ui.init(deps)
     gpu.setResolution(W, H)
   end
   computeLayout()
+  pumpScroll = 0
   ui.invalidate()
   return ui
 end

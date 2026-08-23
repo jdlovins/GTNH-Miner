@@ -212,6 +212,7 @@ seconds**. The defaults are fine; the ones worth knowing about:
 | `snapshotInterval` | 6.0 | window the flow rates are measured over |
 | `armTimeout` | 5.0 | how long to wait for a module to confirm it started |
 | `rescanInterval` | 30.0 | how often new modules are picked up |
+| `doubleUp` | true | spare modules join the neediest fluid rather than idling |
 | `minDeficitFraction` | 0.002 | ignore a fluid less than 0.2% short |
 
 ### 5. Logging (optional)
@@ -272,7 +273,7 @@ deliberately overrides that — pointing everything at one fluid is the whole id
 ================================ GTNH SPACE-GAS LOGISTICS TERMINAL ================================
   CELL: 16384k   SAFE: 80%   MAX: 27.28 GL          ME: OK      MODE: Normal
 
-PUMP ARRAY STATUS
+PUMP ARRAY STATUS   showing 1-8 of 20   ^v  (scroll / up-down)
 ---------------------------------------------------------------------------------------------------
 a3f1 T3   RUNNING  Hydrogen             20.06 ML/t     b7c2 T2   RUNNING  Deuterium    1.25 ML/t
 c910 T1   IDLE     None                 ---            d4e8 T2   ERROR    did not start within 5.0s
@@ -302,6 +303,12 @@ module's throughput.
 
 **Pump states:** `IDLE` waiting for work · `ARMING` starting a cycle ·
 `RUNNING` pumping · `ERROR` faulted, retrying after a cooldown.
+
+**Scrolling the array.** The panel shows `pumpRows` x `pumpCols` modules at once
+(4 x 2 by default). With a bigger array the header says which window you are
+looking at and which way you can move — mouse wheel over the panel, or up/down
+arrows. Raise `config.ui.pumpRows` to see more at once, at the cost of rows from
+the demand queue below.
 
 ---
 
@@ -340,6 +347,19 @@ means an unchanged dashboard costs almost nothing, so this is rarely the problem
 — check for a module stuck in an arm/error loop in `/tmp/spacepump.log` instead.
 
 ---
+
+## How many modules?
+
+The logic has no limit and the cost is linear — about 3.2 component calls per
+second per module, measured from 3 up to 32. The ME read is one call per second
+whatever the array size.
+
+Your real ceiling is OpenComputers: every module needs its own Adapter, each
+Adapter is a component, and your CPU tier caps how many components a computer
+may have — shared with the GPU, screen, keyboard, disks, internet card and the
+fluid source. A plain desktop runs out of slots long before this code cares. For
+a large array use a server in a rack with component buses, the same advice the
+miner gives for the same reason.
 
 ## How it works
 

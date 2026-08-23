@@ -184,6 +184,17 @@ local function mainLoop()
         if not editor.isOpen() then ui.drawStaticFrame(); lastUIDraw = 0 end
       end
 
+    elseif ev[1] == "scroll" then
+      -- ev = { "scroll", screenAddr, x, y, direction, player }
+      -- Wheel over the pump panel walks a larger array. Direction is +1 up.
+      if ui.inPumpPanel(ev[3], ev[4]) and ui.scrollPumps(-(ev[5] or 0)) then
+        lastUIDraw = 0   -- repaint now rather than waiting out the cadence
+      end
+
+    elseif ev[1] == "key_down" and (ev[4] == 200 or ev[4] == 208) then
+      -- Up/down arrows scroll the pump panel too, for playing without a mouse.
+      if ui.scrollPumps(ev[4] == 200 and -1 or 1) then lastUIDraw = 0 end
+
     elseif ev[1] == "key_down" then
       local action = KEYS[ev[3]]
       if action == "quit" then

@@ -160,6 +160,12 @@ config.ui = {
     { under = 110,       color = 0x00FF00 },  -- at target
     { under = math.huge, color = 0xCC00FF },  -- over target (headroom, harmless)
   },
+  -- Pump panel size. rows x cols pumps are shown at once; a larger array
+  -- scrolls (mouse wheel over the panel, or up/down on the dashboard). Raising
+  -- rows takes space from the demand queue below it.
+  pumpRows     = 4,
+  pumpCols     = 2,
+
   fluidColumns = 3,     -- demand-queue column count
   maxFluidRows = 40,    -- most fluid rows to draw at all
   deltaRows    = 3,     -- entries shown under TOP GROWTH / TOP REDUCTIONS
