@@ -2015,7 +2015,7 @@ end
 --   as an ordinary event through the same loop.
 --
 -- KEYS: up/down/pgup/pgdn/home/end move   enter drill in / commit
---       space toggle   t cycle target   a add downstream item
+--       space toggle   t type amount   T step the ladder   a add downstream item
 --       / filter       s save           esc back, or close at the top level
 -- =============================================================================
 
@@ -2305,15 +2305,15 @@ local function edPrompt(label, onCommit, initial)
   ed.input = { label = label, buffer = initial or "", onCommit = onCommit }
 end
 
+-- "50m" / "2.5m" / "500k" / "1b" / "250000". g is accepted as a synonym for b,
+-- and t for trillion, so muscle memory from either convention works.
 local function parseQty(s)
   if not s then return nil end
-  local num, suffix = s:lower():gsub("%s", ""):match("^(%d+%.?%d*)([kmb]?)$")
+  local num, suffix = s:lower():gsub("%s", ""):match("^(%d+%.?%d*)([kmgbt]?)$")
   if not num then return nil end
   num = tonumber(num)
-  if suffix == "k" then return math.floor(num * 1000) end
-  if suffix == "m" then return math.floor(num * 1000000) end
-  if suffix == "b" then return math.floor(num * 1000000000) end
-  return math.floor(num)
+  local mult = ({ k = 1e3, m = 1e6, g = 1e9, b = 1e9, t = 1e12 })[suffix] or 1
+  return math.floor(num * mult)
 end
 
 local function edAddDownstream()
@@ -2351,6 +2351,38 @@ local function fmtQtyLiteral(n)
   if n >= 1000000 and n % 1000000 == 0 then return string.format("%dm", n / 1000000) end
   if n >= 1000    and n % 1000    == 0 then return string.format("%dk", n / 1000) end
   return tostring(n)
+end
+
+-- Type an amount rather than cycling to it.
+--
+-- The ladder is fine for a rough choice and useless for a specific one: getting
+-- to 37m meant pressing t past every rung and settling for whichever was
+-- closest. The current value is pre-filled in the same shorthand it prints in,
+-- so editing 50m to 37m is three keystrokes.
+--
+-- Entry is incremental, like every other prompt here -- the main loop keeps
+-- running while you type, so a load in flight is not stalled by a text field.
+local function edTypeTarget(item)
+  local cur = ed.threshold[item]
+  -- The current value goes in the LABEL, not the buffer. Pre-filling the buffer
+  -- would mean backspacing it away before typing, which is the opposite of the
+  -- point -- you would be editing a field instead of just stating a number.
+  edPrompt("keep how much " .. item .. "?" ..
+           (cur and ("  (now " .. fmtQtyLiteral(cur) .. ")") or "") ..
+           "  e.g. 50m, 2.5m, 500k",
+    function(txt)
+      if not txt or txt == "" then edSay("unchanged") return end
+      local n = parseQty(txt)
+      if not n or n <= 0 then
+        edSay("did not understand '" .. tostring(txt) .. "' -- unchanged", 0xFF4444)
+        return
+      end
+      edTouch()
+      ed.threshold[item] = n
+      ed.enabled[item]   = true
+      edSay(item .. " -> " .. formatQty(n), 0x00FF00)
+      edRebuild()
+    end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -2585,7 +2617,7 @@ local function edDraw()
   local n = 0
   for _ in pairs(ed.enabled) do n = n + 1 end
   local hint = string.format(
-    "%d tracked  |  enter=open  space=toggle  t=target  a=add  /=find  s=save  esc=back%s",
+    "%d tracked  |  space=toggle  t=type amount  T=step  a=add  /=find  s=save  esc=back%s",
     n, ed.filter and ("  |  filter: " .. ed.filter) or "")
   edPaint(2, hint, 0x000000, { { 2, hint, 0x888888 } })
 
@@ -2770,7 +2802,7 @@ local function edHandle(ev)
         if row.kind == "asteroid" then
           edOpenSelected()
         elseif x >= X_A and x < X_B then
-          edCycleTarget(row.item)
+          edTypeTarget(row.item)
         else
           edToggle(row.item, ed.mode == "detail" and ed.asteroid or
                              (ed.targets[row.item] and ed.targets[row.item].asteroid))
@@ -2836,7 +2868,10 @@ local function edHandle(ev)
       elseif row and row.kind == "asteroid" then
         edOpenSelected()
       end
-    elseif ch == 116 then
+    elseif ch == 116 then                                   -- t: type an amount
+      local row = selectedRow()
+      if row and row.kind == "item" then edTypeTarget(row.item) end
+    elseif ch == 84 then                                    -- T: step the ladder
       local row = selectedRow()
       if row and row.kind == "item" then edCycleTarget(row.item) end
     elseif ch == 97  then edAction("add")
