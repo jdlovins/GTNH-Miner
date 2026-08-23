@@ -159,6 +159,7 @@ local cycleStats = {
   doneTime  = 0,     -- seconds spent returning items
   idleTime  = 0,     -- seconds spent IDLE waiting for a job
   loadMax   = 0,
+  loads     = 0,     -- completed loads; a cycle can contain more than one
   spins     = 0,     -- gate-open -> machine-running samples
   spinTime  = 0,
   spinMax   = 0,
@@ -241,10 +242,26 @@ local PIN_RESTOCK_INTERVAL = 3.0
 -- MODULE LIFECYCLE
 -- =============================================================================
 
+-- Read the bus in one call rather than one per slot. This runs in DONE, once
+-- per cycle per module, and was measuring about two seconds of every cycle --
+-- the last per-slot scan left in the broker after the loader and restock paths
+-- were converted.
+--
+-- Defined before snapshotSide's owner is in scope, so it resolves loader lazily.
 local function returnItemsToME(mod)
   local busSize = mod.transposer.getInventorySize(mod.conf.inputBusSide) or 16
+  local inv
+  if loader and loader.snapshotSide then
+    inv = loader.snapshotSide(mod, mod.conf.inputBusSide, 1, busSize)
+  end
   for slot = 1, busSize do
-    local size = mod.transposer.getSlotStackSize(mod.conf.inputBusSide, slot) or 0
+    local size
+    if inv then
+      local st = inv[slot]
+      size = st and (st.size or 0) or 0
+    else
+      size = mod.transposer.getSlotStackSize(mod.conf.inputBusSide, slot) or 0
+    end
     if size > 0 then
       mod.transposer.transferItem(mod.conf.inputBusSide, mod.conf.interfaceSide, size, slot)
     end
@@ -313,6 +330,7 @@ local function pollLoad(mod)
     local cp = s.confirmPolls or {}
     local elapsed = mod.loadStart and (computer.uptime() - mod.loadStart) or 0
     cycleStats.loadTime = cycleStats.loadTime + elapsed
+    cycleStats.loads    = cycleStats.loads + 1
     if elapsed > cycleStats.loadMax then cycleStats.loadMax = elapsed end
     -- Compact on-screen diagnostic: time to load + read-back poll counts.
     -- "db" = max polls any fingerprint needed (low => store() reliable here),
@@ -1429,14 +1447,22 @@ local function drawHWPanel()
     local duty = statsDuty()
     put(string.format("  CYCLES: %d   DUTY: %.0f%%", cycleStats.cycles, duty),
         duty >= 80 and 0x00FF00 or duty >= 60 and 0xFFAA00 or 0xFF4444)
-    put(string.format("  LOAD avg %.1fs  max %.1fs",
-        cycleStats.loadTime / cycleStats.cycles, cycleStats.loadMax), 0x668866)
+    -- Divided by LOADS, not cycles. Dividing load seconds by completed cycles
+    -- counted the loads of modules still running against cycles that had
+    -- finished, and reported roughly double the real figure -- visibly at odds
+    -- with the per-module times on the left of the screen.
+    if cycleStats.loads > 0 then
+      put(string.format("  LOAD avg %.1fs  max %.1fs  (%d)",
+          cycleStats.loadTime / cycleStats.loads, cycleStats.loadMax,
+          cycleStats.loads), 0x668866)
+    end
     if (cycleStats.spins or 0) > 0 then
       put(string.format("  SPINUP avg %.1fs  max %.1fs",
           cycleStats.spinTime / cycleStats.spins, cycleStats.spinMax), 0x668866)
     end
-    put(string.format("  WAIT idle %.0fs  return %.0fs",
-        cycleStats.idleTime, cycleStats.doneTime), 0x666666)
+    put(string.format("  WAIT idle %.1fs/cyc  return %.1fs/cyc",
+        cycleStats.idleTime / cycleStats.cycles,
+        cycleStats.doneTime / cycleStats.cycles), 0x666666)
   else
     put("  CYCLES: none completed yet", 0x555555)
   end
