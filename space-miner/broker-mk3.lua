@@ -1160,7 +1160,28 @@ end
 -- ---------------------------------------------------------------------------
 local dashCache, dashFG = {}, nil
 
+-- Counts rows actually repainted. The quiesce box needs to know whether the
+-- panels have drawn over it, and "did anything paint" is cheaper to answer than
+-- tracking which rows.
+local dashPaints = 0
+
 local function dashInvalidate() dashCache, dashFG = {}, nil end
+
+-- Drop the cache for a band of rows only.
+--
+-- The quiesce box paints on top of the panels, so the cache is wrong for the
+-- rows underneath it -- but ONLY those rows. Dropping the whole cache turned
+-- every frame into a full repaint while the box was up, and since the box was
+-- redrawn after every repaint, the two fed each other: ~2200 component calls a
+-- second for as long as the countdown lasted, which starved the event loop that
+-- was supposed to be noticing the next keypress.
+local function dashInvalidateRows(y1, y2)
+  for y = y1, y2 do
+    dashCache["M" .. y] = nil
+    dashCache["D" .. y] = nil
+    dashCache["H" .. y] = nil
+  end
+end
 
 local function dashSetFG(c)
   if dashFG ~= c then gpu.setForeground(c); dashFG = c end
@@ -1172,6 +1193,7 @@ local function dashRow(slot, x, width, y, text, color)
   local key = tostring(color) .. "|" .. text
   if dashCache[slot] == key then return end
   dashCache[slot] = key
+  dashPaints = dashPaints + 1
   gpu.fill(x, y, width, 1, " ")
   dashSetFG(color)
   gpu.set(x, y, text)
@@ -1182,6 +1204,7 @@ end
 local function dashBlank(slot, x, width, y)
   if dashCache[slot] == "" then return end
   dashCache[slot] = ""
+  dashPaints = dashPaints + 1
   gpu.fill(x, y, width, 1, " ")
 end
 
@@ -2518,6 +2541,7 @@ local QUIESCE_GRACE   = 60
 
 local edPending = nil        -- { openAt, hardAt } while counting down
 local edPendingShown = nil   -- last text painted, so we only repaint on change
+local edPendingPaints = -1   -- dashPaints when we last drew it, to detect damage
 
 -- How many modules are still doing component-heavy work.
 --
@@ -2557,10 +2581,9 @@ local function drawQuiesce(line1, line2)
   gpu.setForeground(0x555555)
   local hint = "esc to cancel"
   gpu.set(x + math.max(0, math.floor((w - #hint) / 2)), y + 3, hint)
-  -- This box sits on top of the panels, so the rows underneath it no longer
-  -- hold what the cache believes. Drop the cache; the next full repaint puts
-  -- them back, which is also how the box gets wiped when the countdown ends.
-  dashInvalidate()
+  -- Only the rows this box covers are now misdescribed by the cache. Dropping
+  -- the whole thing here is what created the repaint loop above.
+  dashInvalidateRows(y, y + 4)
   dashFG = nil
 end
 
@@ -2789,7 +2812,6 @@ while true do
     if up - lastUIDraw >= UI_INTERVAL then
       drawUI()
       lastUIDraw = up
-      edPendingShown = nil   -- the panels just painted over the box
     end
     if edPending then
       local left = math.max(0, math.ceil(edPending.openAt - up))
@@ -2803,10 +2825,15 @@ while true do
         l1 = "WAITING FOR " .. n .. " MODULE(S) TO FINISH"
         l2 = "opens anyway in " .. math.max(0, math.ceil(edPending.hardAt - up)) .. "s"
       end
+      -- Redraw when the text changes (once a second) or when the panels have
+      -- actually painted something, which is the only way the box gets damaged.
+      -- Unchanged rows are skipped by the cache, so a settled dashboard leaves
+      -- the box alone and this costs nothing.
       local shown = l1 .. "|" .. l2
-      if edPendingShown ~= shown then
+      if edPendingShown ~= shown or edPendingPaints ~= dashPaints then
         drawQuiesce(l1, l2)
-        edPendingShown = shown
+        edPendingShown  = shown
+        edPendingPaints = dashPaints
       end
     end
   end
