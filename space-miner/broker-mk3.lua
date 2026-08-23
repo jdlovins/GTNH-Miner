@@ -965,72 +965,113 @@ local function formatQty(n)
   end
 end
 
+-- ---------------------------------------------------------------------------
+-- DASHBOARD ROW CACHE
+--
+-- The editor got this treatment (see edPaint/edFresh) and the dashboard never
+-- did, so the three panels below repainted every row of every frame, four times
+-- a second, whether or not a single number had changed. Measured on six modules
+-- with the shipped config: 223 component calls per frame, ~890 a second, for a
+-- screen whose contents change every ten seconds when telemetry lands.
+--
+-- That is not just a slow display. OpenComputers meters direct component calls
+-- per tick and serves callers in order, so those 890 calls/second were competing
+-- with six loaders doing transposer scans and ME stocking -- which is exactly
+-- why the dashboard felt worst when the miner was busiest.
+--
+-- Three changes, the same ones the editor made:
+--   1. gpu.set instead of term.setCursor + io.write -- one call rather than two,
+--      and it skips the OpenOS term layer's cursor bookkeeping.
+--   2. Colour changes are guarded, so consecutive rows sharing a colour cost one
+--      setForeground between them instead of one each.
+--   3. Rows are cached by content signature and skipped when unchanged.
+--
+-- `slot` names a row within a panel ("M12", "D12", "H12") because all three
+-- panels share the same y values on different parts of the screen.
+-- ---------------------------------------------------------------------------
+local dashCache, dashFG = {}, nil
+
+local function dashInvalidate() dashCache, dashFG = {}, nil end
+
+local function dashSetFG(c)
+  if dashFG ~= c then gpu.setForeground(c); dashFG = c end
+end
+
+-- Write one row of a panel, clearing its column strip first. Indentation is
+-- baked into `text` so every row of a panel starts at the same x.
+local function dashRow(slot, x, width, y, text, color)
+  local key = tostring(color) .. "|" .. text
+  if dashCache[slot] == key then return end
+  dashCache[slot] = key
+  gpu.fill(x, y, width, 1, " ")
+  dashSetFG(color)
+  gpu.set(x, y, text)
+end
+
+-- Blank a row: spacers between sections, and the tail wipe under a panel that
+-- shrank. Cached too, so a settled layout stops paying for its blank rows.
+local function dashBlank(slot, x, width, y)
+  if dashCache[slot] == "" then return end
+  dashCache[slot] = ""
+  gpu.fill(x, y, width, 1, " ")
+end
+
 local function drawModulePanel()
   local row = 6
-  local function clear(r) gpu.fill(P1 + 1, r, PW, 1, " ") end
-  -- No full-column pre-wipe here. Every row below clears itself before it is
-  -- written, and the tail wipe at the end of this function blanks whatever
-  -- rows the layout vacated -- so ghosts are already impossible. Blanking the
-  -- whole column up front only added a visible blank frame between the wipe
-  -- and the repaint, four times a second: that was the flicker.
+  -- No full-column pre-wipe here, and now no unconditional repaint either: each
+  -- row is written only when its content differs from what is already there.
   for _, mod in ipairs(modules) do
     if row > H then break end
-    clear(row); term.setCursor(P1 + 1, row)
     -- Pinned/reserved modules get a "*" marker so it's clear at a glance which
     -- ones are locked to a single asteroid. Same width as the normal "  " prefix.
     local pin = mod.pinnedAsteroid and " *" or "  "
+    local text, color
     if mod.status == "RUNNING" then
-      gpu.setForeground(0xFFAA00)
-      io.write(string.format("%sM%d [%-5s]  %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or "?"))
+      color = 0xFFAA00
+      text = string.format("%sM%d [%-5s]  %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or "?")
     elseif mod.status == "LOADING" then
-      gpu.setForeground(0xFFFF00)
-      io.write(string.format("%sM%d [%-5s]  LOADING %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or ""))
+      color = 0xFFFF00
+      text = string.format("%sM%d [%-5s]  LOADING %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or "")
     elseif mod.status == "ERROR" then
-      gpu.setForeground(0xFF4444)
+      color = 0xFF4444
       local errMsg = mod.lastError and (" " .. mod.lastError:sub(1, PW - 20)) or ""
-      io.write(string.format("%sM%d [%-5s]  ERROR%s", pin, mod.index, mod.tier, errMsg))
+      text = string.format("%sM%d [%-5s]  ERROR%s", pin, mod.index, mod.tier, errMsg)
     else
-      gpu.setForeground(0x555555)
+      color = 0x555555
       if mod.pinnedAsteroid then
-        io.write(string.format("%sM%d [%-5s]  IDLE (pin: %s)", pin, mod.index, mod.tier, mod.pinnedAsteroid))
+        text = string.format("%sM%d [%-5s]  IDLE (pin: %s)", pin, mod.index, mod.tier, mod.pinnedAsteroid)
       else
-        io.write(string.format("%sM%d [%-5s]  IDLE", pin, mod.index, mod.tier))
+        text = string.format("%sM%d [%-5s]  IDLE", pin, mod.index, mod.tier)
       end
     end
+    dashRow("M" .. row, P1 + 1, PW, row, text, color)
     row = row + 1
+
     if (mod.status == "RUNNING") and mod.job and row <= H then
-      clear(row); term.setCursor(P1 + 3, row)
-      gpu.setForeground(0xCCCCCC)
       local droneName = config.drones[mod.job.droneKey] or "?"
       local lvl = droneName:match("MK%-(.+)") or "?"
-      io.write(string.format("dist=%d  drone=MK-%s", mod.job.distance or 0, lvl))
+      dashRow("M" .. row, P1 + 1, PW, row,
+        string.format("    dist=%d  drone=MK-%s", mod.job.distance or 0, lvl), 0xCCCCCC)
       row = row + 1
 
       -- Load diagnostic from the most recent load of this module:
-      -- "loaded 0.4s  db:1 buf:3" — time taken + read-back poll counts.
+      -- "loaded 0.4s  db:1 buf:3" -- time taken + read-back poll counts.
       if mod.lastLoad and row <= H then
-        clear(row); term.setCursor(P1 + 3, row)
-        gpu.setForeground(0x668866) -- dim green: informational
-        io.write(mod.lastLoad)
+        dashRow("M" .. row, P1 + 1, PW, row, "    " .. mod.lastLoad, 0x668866)
         row = row + 1
       end
 
       -- Blank spacer line before the next module, per layout.
       if row <= H then
-        clear(row); row = row + 1
+        dashBlank("M" .. row, P1 + 1, PW, row); row = row + 1
       end
     end
   end
-  for r = row, H do gpu.fill(P1 + 1, r, PW, 1, " ") end
+  for r = row, H do dashBlank("M" .. r, P1 + 1, PW, r) end
 end
 
 local function drawDustPanel()
   local row = 6
-  -- No full-column pre-wipe here. Every row below clears itself before it is
-  -- written, and the tail wipe at the end of this function blanks whatever
-  -- rows the layout vacated -- so ghosts are already impossible. Blanking the
-  -- whole column up front only added a visible blank frame between the wipe
-  -- and the repaint, four times a second: that was the flicker.
   local list = {}
   for _, cond in ipairs(config.conditions) do
     local name      = cond.itemName
@@ -1047,41 +1088,42 @@ local function drawDustPanel()
   if dustScroll < 0 then dustScroll = 0 end
 
   -- Range indicator in the panel header, so a truncated list is obvious rather
-  -- than looking like the whole list.
+  -- than looking like the whole list. Painted into a fixed-width region so a
+  -- shorter tag cannot leave the tail of a longer one behind it.
   if #list > 0 then
     local tag = string.format("%d-%d/%d",
       math.min(dustScroll + 1, #list), math.min(dustScroll + capacity, #list), #list)
     if maxScroll > 0 then tag = tag .. " ^v" end
-    local tx = P3 - #tag - 1
-    gpu.fill(tx, 4, #tag + 1, 1, " ")
-    gpu.setForeground(maxScroll > 0 and 0xFFAA00 or 0x888888)
-    term.setCursor(tx, 4)
-    io.write(tag)
+    local tw = 16
+    local tx = math.max(P2 + 1, P3 - tw - 1)
+    dashRow("DTAG", tx, tw, 4, string.format("%" .. tw .. "s", tag),
+      maxScroll > 0 and 0xFFAA00 or 0x888888)
   end
 
   for i = dustScroll + 1, #list do
     local item = list[i]
     if row > H then break end
-    gpu.fill(P2 + 1, row, PW, 1, " "); term.setCursor(P2 + 1, row)
     local pct = math.floor(item.ratio * 100)
     local color = (item.ratio >= 1.0) and 0x446644 or (item.ratio < 0.25) and 0xFF4444
         or (item.ratio < 0.75) and 0xFFAA00 or 0x00FFFF
     local mark = item.ratio < 1.0 and "!" or " "
-    gpu.setForeground(color)
-    io.write(string.format("  %s %-27s %3d%%", mark, item.name, pct))
+    dashRow("D" .. row, P2 + 1, PW, row,
+      string.format("  %s %-27s %3d%%", mark, item.name, pct), color)
     row = row + 1
     if row > H then break end
-    gpu.fill(P2 + 1, row, PW, 1, " "); term.setCursor(P2 + 1, row)
-    gpu.setForeground(0x666666)
-    io.write(string.format("      %s / %s", formatQty(item.stock), formatQty(item.threshold)))
+    dashRow("D" .. row, P2 + 1, PW, row,
+      string.format("      %s / %s", formatQty(item.stock), formatQty(item.threshold)), 0x666666)
     row = row + 1
   end
-  for r = row, H do gpu.fill(P2 + 1, r, PW, 1, " ") end
+  for r = row, H do dashBlank("D" .. r, P2 + 1, PW, r) end
 end
 
 local function drawHWPanel()
   local row = 6
-  local function clear(r) gpu.fill(P3 + 1, r, PW, 1, " ") end
+  local function put(text, color)
+    if row <= H then dashRow("H" .. row, P3 + 1, PW, row, text, color) end
+    row = row + 1
+  end
 
   -- Advance past n blank rows, wiping each one.
   --
@@ -1093,146 +1135,96 @@ local function drawHWPanel()
   -- wipe below only reaches rows underneath the cursor, never these.
   local function skip(n)
     for _ = 1, (n or 1) do
-      if row <= H then clear(row) end
+      if row <= H then dashBlank("H" .. row, P3 + 1, PW, row) end
       row = row + 1
     end
   end
 
-  -- No full-column pre-wipe: blanking the whole column up front added a visible
-  -- blank frame between the wipe and the repaint, four times a second, and that
-  -- was the flicker. Every row is instead either written (and cleared first) or
-  -- passed through skip().
-
-  clear(row); term.setCursor(P3 + 1, row)
   if brokerState.nextTarget then
-    gpu.setForeground(0xFFAA00)
-    io.write("  NEXT: " .. brokerState.nextTarget.asteroid)
+    put("  NEXT: " .. brokerState.nextTarget.asteroid, 0xFFAA00)
   else
-    gpu.setForeground(0x666666); io.write("  NEXT: (idle)")
+    put("  NEXT: (idle)", 0x666666)
   end
-  row = row + 1
 
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(0x666666)
   -- Show the cap dispatch actually used, not a fresh guess: it depends on how
   -- many asteroids are currently wanted, which this panel does not recompute.
-  io.write("  PRIORITY: " .. brokerState.priorityMode:upper() ..
-           "   CAP: " .. (brokerState.cap or asteroidCap(0)) .. "/asteroid")
-  row = row + 1
+  put("  PRIORITY: " .. brokerState.priorityMode:upper() ..
+      "   CAP: " .. (brokerState.cap or asteroidCap(0)) .. "/asteroid", 0x666666)
 
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(0x666666); io.write("  TELEMETRY SYNC:")
-  row = row + 1
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(getSyncColor(brokerState.lastDustSyncTime)); io.write("  Dust:   " .. brokerState.lastDustSync)
-  row = row + 1
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(getSyncColor(brokerState.lastFluidSyncTime)); io.write("  Fluid:  " .. brokerState.lastFluidSync)
-  row = row + 1
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(getSyncColor(brokerState.lastHWSyncTime)); io.write("  HW:     " .. brokerState.lastHWSync)
-  row = row + 1
+  put("  TELEMETRY SYNC:", 0x666666)
+  put("  Dust:   " .. brokerState.lastDustSync,  getSyncColor(brokerState.lastDustSyncTime))
+  put("  Fluid:  " .. brokerState.lastFluidSync, getSyncColor(brokerState.lastFluidSyncTime))
+  put("  HW:     " .. brokerState.lastHWSync,    getSyncColor(brokerState.lastHWSyncTime))
   -- Outbound par. Grey dashes here mean this broker has never sent DRILL_PAR --
   -- almost always an older broker-mk3.lua, since the send is unconditional.
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(brokerState.lastParCount > 0 and 0x00FF00 or 0x555555)
-  io.write("  PAR TX: " .. brokerState.lastParSend ..
-           " (" .. brokerState.lastParCount .. ")")
-  row = row + 1
+  put("  PAR TX: " .. brokerState.lastParSend .. " (" .. brokerState.lastParCount .. ")",
+      brokerState.lastParCount > 0 and 0x00FF00 or 0x555555)
   skip(1)
 
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(0x888888); io.write("  TASKS RUNNING: " .. sched.count())
-  row = row + 1
+  put("  TASKS RUNNING: " .. sched.count(), 0x888888)
   skip(1)
 
-  -- Plasma stock (required to mine — a module won't run without a plasma fluid).
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(0x888888); io.write("  PLASMA STOCK:")
-  row = row + 1
+  -- Plasma stock (required to mine -- a module won't run without a plasma fluid).
+  put("  PLASMA STOCK:", 0x888888)
   local anyPlasma = false
   for _, name in ipairs(config.plasmaKeyOrder) do
     local amt = brokerState.plasma[name] or 0
     if row > H then break end
-    clear(row); term.setCursor(P3 + 1, row)
-    gpu.setForeground(amt > 0 and 0xFF00FF or 0x555555)
     local short = name:gsub(" Plasma", "")
-    io.write(string.format("  %-16s %8d mB", short, amt))
-    row = row + 1
+    put(string.format("  %-16s %8d mB", short, amt), amt > 0 and 0xFF00FF or 0x555555)
     if amt > 0 then anyPlasma = true end
   end
-  -- Clear these two rows unconditionally, not just when we write to them.
-  --
   -- This row holds the waiting/blocked line only while plasma is absent, and the
-  -- row after it is a spacer. The rest of this panel gets away with clear-as-you
-  -- -write because every row is written every frame; these two are not. On the
-  -- frame plasma first appears the branch below stops running, so whatever it
-  -- wrote last frame is never wiped -- and the tail wipe only reaches rows below
-  -- the cursor. That is how "[ waiting for fluid telemetry... ]" survives on
-  -- screen long after fluid telemetry is green and plasma is in stock.
-  if row <= H then clear(row) end
+  -- row after it is a spacer. The rest of this panel gets away with
+  -- clear-as-you-write because every row is written every frame; this one is
+  -- not. On the frame plasma first appears the branch below stops running, so
+  -- whatever it wrote last frame would never be wiped -- which is how
+  -- "[ waiting for fluid telemetry... ]" survived on screen long after fluid
+  -- telemetry was green. Writing or blanking it unconditionally settles that.
   if not anyPlasma then
-    if row > H then return end
-    term.setCursor(P3 + 1, row)
     if brokerState.lastFluidSyncTime == 0 then
-      gpu.setForeground(0xFFAA00); io.write("  [ waiting for fluid telemetry... ]")
+      put("  [ waiting for fluid telemetry... ]", 0xFFAA00)
     else
-      gpu.setForeground(0xFF4444); io.write("  [ NO PLASMA - MINING BLOCKED ]")
+      put("  [ NO PLASMA - MINING BLOCKED ]", 0xFF4444)
     end
-    row = row + 1
   end
+  -- Unconditional, and it doubles as the wipe for the line above: when plasma
+  -- appears the branch stops running, and without this the last thing it wrote
+  -- would sit there forever.
   skip(1)
 
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(0x888888); io.write("  DRONES IN STOCK:")
-  row = row + 1
+  put("  DRONES IN STOCK:", 0x888888)
   local any = false
   for _, key in ipairs(config.droneKeyOrder) do
     local count = brokerState.drones[key] or 0
     if count > 0 then
       if row > H then break end
-      clear(row); term.setCursor(P3 + 1, row)
-      gpu.setForeground(0x00FFFF)
       local droneName = config.drones[key] or ("Drone-" .. key)
       local lvl = droneName:match("MK%-(.+)") or "?"
-      io.write(string.format("  %-18s  x%d", "MK-" .. lvl, count))
-      row = row + 1; any = true
+      put(string.format("  %-18s  x%d", "MK-" .. lvl, count), 0x00FFFF)
+      any = true
     end
   end
-  if not any then
-    clear(row); term.setCursor(P3 + 1, row)
-    gpu.setForeground(0xFF4444); io.write("  [ NO DRONES IN STOCK ]")
-    row = row + 1
-  end
+  if not any then put("  [ NO DRONES IN STOCK ]", 0xFF4444) end
 
   skip(1)
 
   -- Drill kits (a "kit" = one drill tip + one rod of the same material).
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(0x888888); io.write("  DRILL KITS IN STOCK:")
-  row = row + 1
+  put("  DRILL KITS IN STOCK:", 0x888888)
   local anyDrill = false
   for _, key in ipairs(drillKeyOrder) do
     local d = brokerState.drills[key]
     local kits = (d and d.kits) or 0
     if kits > 0 then
       if row > H then break end
-      clear(row); term.setCursor(P3 + 1, row)
-      gpu.setForeground(0x00AAFF)
       -- Display the material name, stripped of " Drill Tip".
       local entry = config.drills[key]
       local name = (entry and entry.tip and entry.tip:gsub(" Drill Tip", "")) or key
-      io.write(string.format("  %-18s  x%d", name, kits))
-      row = row + 1; anyDrill = true
+      put(string.format("  %-18s  x%d", name, kits), 0x00AAFF)
+      anyDrill = true
     end
   end
-  if not anyDrill then
-    if row <= H then
-      clear(row); term.setCursor(P3 + 1, row)
-      gpu.setForeground(0xFF4444); io.write("  [ NO DRILL KITS IN STOCK ]")
-      row = row + 1
-    end
-  end
+  if not anyDrill then put("  [ NO DRILL KITS IN STOCK ]", 0xFF4444) end
 
   -- Restock: what the hw node has on order against config.drillPar.
   --
@@ -1242,11 +1234,10 @@ local function drawHWPanel()
   -- entirely at zero -- while its whole drone tier quietly stopped dispatching.
   local restock = {}
   for label in pairs(brokerState.crafting) do restock[#restock + 1] = label end
-  -- Two reasons to sort. pairs() order is arbitrary and this panel repaints four
-  -- times a second, so an unsorted list visibly shuffles between frames. And
-  -- nopattern/failed go first because they are the entries a human has to act
-  -- on: if the panel runs out of rows, the benign "crafting" lines are the ones
-  -- that should be cut.
+  -- Two reasons to sort. pairs() order is arbitrary and this panel repaints, so
+  -- an unsorted list visibly shuffles between frames. And nopattern/failed go
+  -- first because they are the entries a human has to act on: if the panel runs
+  -- out of rows, the benign "crafting" lines are the ones that should be cut.
   local RANK = { nopattern = 0, failed = 0, crafting = 1, queued = 2 }
   local function rankOf(label)
     local o = brokerState.crafting[label]
@@ -1259,12 +1250,8 @@ local function drawHWPanel()
   end)
 
   if #restock > 0 then
-    row = row + 1
-    if row <= H then
-      clear(row); term.setCursor(P3 + 1, row)
-      gpu.setForeground(0x888888); io.write("  RESTOCK:")
-      row = row + 1
-    end
+    skip(1)
+    put("  RESTOCK:", 0x888888)
     for _, label in ipairs(restock) do
       if row > H then break end
       local o     = brokerState.crafting[label]
@@ -1273,29 +1260,29 @@ local function drawHWPanel()
       -- "Naquadah Alloy Drill Tip" -> "Naquadah Alloy TIP": the material is what
       -- distinguishes these, and it is the part that gets truncated away.
       local short = label:gsub(" Drill Tip$", " TIP"):gsub(" Rod$", " ROD")
-      clear(row); term.setCursor(P3 + 1, row)
       if state == "crafting" then
-        gpu.setForeground(0xFFAA00)
-        io.write(string.format("  %-24s x%d", short:sub(1, 24), want))
+        put(string.format("  %-24s x%d", short:sub(1, 24), want), 0xFFAA00)
       elseif state == "queued" then
         -- Not a problem: below par, waiting on a crafting CPU. Dim so it reads
         -- as backlog rather than as another thing demanding attention.
-        gpu.setForeground(0x555555)
-        io.write(string.format("  %-24s queued x%d", short:sub(1, 24), want))
+        put(string.format("  %-24s queued x%d", short:sub(1, 24), want), 0x555555)
       else
-        gpu.setForeground(0xFF4444)
-        io.write(string.format("  %-24s %s", short:sub(1, 24),
-          state == "nopattern" and "NO PATTERN" or "REJECTED"))
+        put(string.format("  %-24s %s", short:sub(1, 24),
+          state == "nopattern" and "NO PATTERN" or "REJECTED"), 0xFF4444)
       end
-      row = row + 1
     end
   end
 
-  for r = row, H do clear(r) end
+  for r = row, H do dashBlank("H" .. r, P3 + 1, PW, r) end
 end
 
 local function drawStaticFrame()
   if not gpu then return end
+  -- The frame is about to overwrite everything, so the row cache is now a lie
+  -- about what is physically on screen. This is also the editor's exit path
+  -- (edAction("close") calls it), which is what keeps the dashboard from
+  -- skipping rows that still hold editor content.
+  dashInvalidate()
   term.clear()
   gpu.setForeground(0x00FF00)
   gpu.fill(1, 1, W, 1, "="); gpu.fill(1, 5, W, 1, "=")
@@ -1312,8 +1299,10 @@ end
 
 local function drawUI()
   if not gpu then return end
-  term.setCursor(W - 17, 2); gpu.setForeground(0x555555)
-  io.write("SYNC: " .. os.date("%H:%M:%S", math.floor(getUnixTime())) .. "   ")
+  -- Cached like every other row: the clock only changes once a second, and the
+  -- dashboard repaints four times a second.
+  dashRow("SYNC", W - 17, 17, 2,
+    "SYNC: " .. os.date("%H:%M:%S", math.floor(getUnixTime())), 0x555555)
   drawModulePanel(); drawDustPanel(); drawHWPanel()
 end
 
@@ -2329,6 +2318,11 @@ local function drawQuiesce(line1, line2)
   gpu.setForeground(0x555555)
   local hint = "esc to cancel"
   gpu.set(x + math.max(0, math.floor((w - #hint) / 2)), y + 3, hint)
+  -- This box sits on top of the panels, so the rows underneath it no longer
+  -- hold what the cache believes. Drop the cache; the next full repaint puts
+  -- them back, which is also how the box gets wiped when the countdown ends.
+  dashInvalidate()
+  dashFG = nil
 end
 
 -- ---------------------------------------------------------------------------
