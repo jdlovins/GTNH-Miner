@@ -44,6 +44,9 @@ local POLL_INTERVAL     = 0.1
 local TIPS_PER_DEFAULT  = 64   -- drill tips to stock (config.tipsPerLoad overrides)
 local RODS_PER_DEFAULT  = 64   -- drill rods to stock (config.rodsPerLoad overrides)
 local FILL_TIMEOUT      = 30   -- total seconds to get every consumable into the bus
+-- How long to let the interface buffer clear before loading anyway. Short: it is
+-- a courtesy to give the ME room to deliver into, not a correctness requirement.
+local PRE_DRAIN_WAIT    = 2
 local STACK_DEFAULT     = 64   -- fallback when a stack does not report maxSize
 local MAX_CFG_SLOTS     = 8    -- ME Interface configuration slots we may use
 
@@ -213,13 +216,23 @@ function loader.run(mod, job, deps)
   db.clear(slotTip)
   db.clear(slotRod)
 
-  -- Wait for the interface buffer slots we're about to use to actually drain
-  -- back into the ME network. If a leftover item (e.g. a drill tip from the
-  -- previous job, just pushed in by clearInputBus) is still sitting in slot 1,
-  -- the fresh drone could end up in the wrong slot and a tip gets transferred
-  -- as the "drone". Confirm slots 1-3 are empty before stocking fresh items.
-  -- Only relevant when we have just pushed the previous run's leftovers into the
-  -- buffer. A fast reload pushed nothing, so there is nothing to wait for.
+  -- Give the network a moment to take back what clearInputBus just pushed in,
+  -- so it has slots free to deliver into. Brief, and NOT fatal.
+  --
+  -- This used to wait fifteen seconds and then FAIL the load, on the grounds
+  -- that a leftover sitting in slot 1 could be transferred as the drone. That
+  -- hazard was real when the loader trusted slot positions; it has not existed
+  -- since it moved to resolving items by label -- bufferHas, findSlot and srcIn
+  -- all match on stack.label, so a leftover of some other item is simply
+  -- skipped. The comment was describing a bug that had already been fixed.
+  --
+  -- What is still worth a pause is space: the buffer has nine slots and the ME
+  -- needs somewhere to put the new items. So wait briefly, then get on with it.
+  -- Being wrong now costs a slower load, where before it cost a failed one and a
+  -- module sat in ERROR for the cooldown -- on every recipe change where the
+  -- network happened to be busy.
+  --
+  -- A fast reload pushed nothing into the buffer, so it skips this entirely.
   local preDrainAt = computer.uptime()
   local drained = fast or pollUntil(function()
     local snap = snapshotSide(mod, mod.conf.interfaceSide, 1, 3)
@@ -227,10 +240,13 @@ function loader.run(mod, job, deps)
       if snap[s] and (snap[s].size or 0) > 0 then return false end
     end
     return true
-  end, ARRIVE_TIMEOUT)
+  end, config.preDrainWait or PRE_DRAIN_WAIT)
   stats.preDrainSecs = computer.uptime() - preDrainAt
   if not drained then
-    return false, "interface buffer did not drain before load (stale items stuck)"
+    stats.preDrainTimedOut = true
+    logger:info("[LOAD] M" .. mod.index ..
+      " buffer still had items after " .. string.format("%.1fs", stats.preDrainSecs) ..
+      "; continuing -- items are matched by label, not slot")
   end
 
   -- 2. Write fingerprints, confirming each by read-back before moving on.

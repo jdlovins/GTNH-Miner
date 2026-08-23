@@ -3034,6 +3034,13 @@ config.topUpWindow = 30
 -- a module with the wrong hardware. The loader verifies the drone before
 -- committing, so that should fail loudly rather than silently -- but prove it on
 -- your setup before leaving it on.
+-- How long a load waits for the ME to take back what was just returned before
+-- loading anyway. It is a courtesy -- giving the network room to deliver into --
+-- not a correctness requirement, because the loader matches items by label
+-- rather than by slot. It used to wait 15s and then FAIL the load, which on a
+-- recipe change with a busy network cost a module an ERROR and a cooldown.
+config.preDrainWait = 2.0
+
 config.fastReload  = false
 config.holdTimeout = 10
 
@@ -3077,7 +3084,18 @@ config.maxConcurrentLoads = 0
 --                    0 = check at the fast rate throughout, the old behaviour.
 --   runSafeFraction  how much of the shortest observed run counts as safe.
 --                    Lower is more cautious and costs more calls.
-config.runPollIdle     = 3.0
+--
+-- Measured across six modules, poll rate against worst-case detection lag:
+--
+--   3.0    8.2 calls/s   2.41s
+--   2.0    8.9           2.32s
+--   1.5    9.6           1.38s   <- the knee, and the default
+--   1.0   11.1           1.51s
+--   0.25  23.9           0.76s   (constant fast polling)
+--
+-- 1.5 nearly halves the worst case against 3.0 for 1.4 extra calls a second.
+-- Going all the way to constant costs another fourteen for 0.6s.
+config.runPollIdle     = 1.5
 config.runSafeFraction = 0.8
 
 -- Par levels for drill consumables. The broker publishes this table to the hw
