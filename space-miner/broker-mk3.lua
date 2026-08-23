@@ -167,6 +167,43 @@ local cycleStats = {
   startedAt = 0,     -- set once telemetry is ready and work can actually begin
 }
 
+-- RECENT WINDOW
+--
+-- The figures above are lifetime totals, and a lifetime average is the wrong
+-- answer to "is it fast right now". Twice in this project a cumulative number
+-- was read as current and produced a wrong conclusion: a load average still
+-- carrying the cold start read as a regression, and a high-water max that can
+-- never come down read as an ongoing problem.
+--
+-- So keep the last few cycles as well, and show both.
+local RECENT_N = 10
+local recent, recentAt = {}, 0
+
+local function recentPush(rec)
+  recentAt = (recentAt % RECENT_N) + 1
+  recent[recentAt] = rec
+end
+
+local function recentStats()
+  local n, run, load, done, idle, refills = 0, 0, 0, 0, 0, 0
+  for _, r in pairs(recent) do
+    n       = n + 1
+    run     = run + r.run
+    load    = load + r.load
+    done    = done + r.done
+    idle    = idle + r.idle
+    refills = refills + r.refills
+  end
+  if n == 0 then return nil end
+  local total = run + load + done + idle
+  return {
+    n       = n,
+    duty    = (total > 0) and (run / total * 100) or 0,
+    load    = load / n,
+    refills = refills / n,
+  }
+end
+
 local function statsDuty()
   local total = cycleStats.loadTime + cycleStats.runTime
              + cycleStats.doneTime + cycleStats.idleTime
@@ -324,7 +361,9 @@ local function beginLoad(mod)
   -- nothing below threshold, or dispatch simply not getting round to it. It is
   -- the overhead that does not show up as a slow load.
   if mod.idleSince then
-    cycleStats.idleTime = cycleStats.idleTime + (computer.uptime() - mod.idleSince)
+    local waited = computer.uptime() - mod.idleSince
+    cycleStats.idleTime = cycleStats.idleTime + waited
+    mod.cycIdle   = waited
     mod.idleSince = nil
   end
   mod.loadResult = nil
@@ -366,6 +405,7 @@ local function pollLoad(mod)
     local elapsed = mod.loadStart and (computer.uptime() - mod.loadStart) or 0
     cycleStats.loadTime = cycleStats.loadTime + elapsed
     cycleStats.loads    = cycleStats.loads + 1
+    mod.cycLoad         = elapsed
     if elapsed > cycleStats.loadMax then cycleStats.loadMax = elapsed end
     -- Compact on-screen diagnostic: time to load + read-back poll counts.
     -- "db" = max polls any fingerprint needed (low => store() reliable here),
@@ -744,6 +784,7 @@ local function stepRunning(mod)
     now - (mod.inactiveSinceAt or now)))
   local observed = now - (mod.runStartedAt or now)
   cycleStats.runTime = cycleStats.runTime + observed
+  mod.cycRun = observed
 
   -- Remember the SHORTEST run for this configuration. Keyed on asteroid, drill
   -- and parallels because all three change how long a run lasts, and a minimum
@@ -797,8 +838,16 @@ local function stepDone(mod)
     if mod.job and brokerState.jobs[mod.job.jobId] then
       brokerState.jobs[mod.job.jobId] = nil
     end
-    cycleStats.doneTime = cycleStats.doneTime + (computer.uptime() - mod.doneTime)
+    local settle = computer.uptime() - mod.doneTime
+    cycleStats.doneTime = cycleStats.doneTime + settle
     cycleStats.cycles   = cycleStats.cycles + 1
+    recentPush({
+      run     = mod.cycRun  or 0,
+      load    = mod.cycLoad or 0,
+      done    = settle,
+      idle    = mod.cycIdle or 0,
+      refills = mod.refills or 0,
+    })
     mod.idleSince = computer.uptime()
     logger:info(string.format("[CYCLE] M%d done (%d total, duty %.0f%%)",
       mod.index, cycleStats.cycles, statsDuty()))
@@ -1666,19 +1715,26 @@ local function drawHWPanel()
   -- runs when output feels off.
   if cycleStats.cycles > 0 then
     local duty = statsDuty()
-    put(string.format("  CYCLES: %d   DUTY: %.0f%%", cycleStats.cycles, duty),
+    -- Lifetime first, then the last few cycles. The pair matters: lifetime says
+    -- how the run has gone, recent says how it is going, and reading one as the
+    -- other has produced a wrong conclusion here more than once.
+    local r = recentStats()
+    put(string.format("  CYCLES: %d   DUTY: %.0f%%%s", cycleStats.cycles, duty,
+        r and string.format("   last%d %.0f%%", r.n, r.duty) or ""),
         duty >= 80 and 0x00FF00 or duty >= 60 and 0xFFAA00 or 0xFF4444)
     -- Divided by LOADS, not cycles. Dividing load seconds by completed cycles
     -- counted the loads of modules still running against cycles that had
     -- finished, and reported roughly double the real figure -- visibly at odds
     -- with the per-module times on the left of the screen.
     if cycleStats.loads > 0 then
-      put(string.format("  LOAD avg %.1fs  max %.1fs  (%d)",
-          cycleStats.loadTime / cycleStats.loads, cycleStats.loadMax,
-          cycleStats.loads), 0x668866)
+      put(string.format("  LOAD avg %.1fs%s  max %.1fs  (%d)",
+          cycleStats.loadTime / cycleStats.loads,
+          r and string.format("  last%d %.1fs", r.n, r.load) or "",
+          cycleStats.loadMax, cycleStats.loads), 0x668866)
     end
-    put(string.format("  REFILLS: %d   %.1f/cycle",
-        cycleStats.refills or 0, (cycleStats.refills or 0) / cycleStats.cycles),
+    put(string.format("  REFILLS: %d   %.1f/cycle%s",
+        cycleStats.refills or 0, (cycleStats.refills or 0) / cycleStats.cycles,
+        r and string.format("   last%d %.1f", r.n, r.refills) or ""),
         0x668866)
     if (cycleStats.spins or 0) > 0 then
       put(string.format("  SPINUP avg %.1fs  max %.1fs",
