@@ -3042,14 +3042,18 @@ config.maxConcurrentLoads = 0
 -- The broker learns how long each module runs for (it stops when consumables
 -- run out, so this is very consistent) and checks lazily until the end is near.
 --
---   runPollIdle  seconds between checks while the finish is far off.
---                0 = check at the fast rate throughout, the old behaviour.
---   runNearEnd   switch to the fast rate this long before the expected finish.
+-- Run length is not constant -- a recipe cycle varies from a few seconds to
+-- fifteen, and a run is several cycles -- so the broker does not try to predict
+-- when a run will end. It remembers the SHORTEST run each module has done for
+-- its current asteroid, drill and parallel count, and checks lazily only within
+-- a fraction of that: a window the module has demonstrably never finished in.
 --
--- The cost of runPollIdle is how late a module stopping UNEXPECTEDLY early is
--- noticed. 3s is about what one cycle already spends loading.
-config.runPollIdle = 3.0
-config.runNearEnd  = 5.0
+--   runPollIdle      seconds between checks inside that safe window.
+--                    0 = check at the fast rate throughout, the old behaviour.
+--   runSafeFraction  how much of the shortest observed run counts as safe.
+--                    Lower is more cautious and costs more calls.
+config.runPollIdle     = 3.0
+config.runSafeFraction = 0.8
 
 -- Par levels for drill consumables. The broker publishes this table to the hw
 -- telem node (DRILL_PAR on config.ports.hardware); the node compares it against

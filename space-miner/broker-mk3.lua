@@ -254,12 +254,17 @@ local RUN_INACTIVE_CONFIRM = 3
 -- stops early, or the estimate is wrong, something must still be watching. This
 -- degrades to "late by RUN_POLL_IDLE"; a hard schedule degrades to "nobody
 -- notices".
-local RUN_POLL_IDLE = 3.0    -- while the end is far off (0 disables, poll fast)
-local RUN_NEAR_END  = 5.0    -- switch to the fast rate this long before the estimate
-
--- How much of the estimate is carried from previous runs. Favours stability:
--- one unusual run should nudge it, not redefine it.
-local RUN_EST_DECAY = 0.7
+-- Run length is NOT constant: one recipe cycle varies from about 3s to 15s and a
+-- run is several cycles, so predicting when a run will END is unreliable. An
+-- estimate that says 70s when the run actually stops at 40s would leave us
+-- polling lazily through the finish.
+--
+-- So do not predict the end. Track the SHORTEST run this module has ever done
+-- and be lazy only within a fraction of that -- a window it has demonstrably
+-- never finished inside. Outside that window, poll normally. Wrong estimates
+-- then cost nothing, because the window only ever shrinks toward the truth.
+local RUN_POLL_IDLE   = 3.0   -- interval inside the safe window (0 disables)
+local RUN_SAFE_FRAC   = 0.8   -- of the shortest run seen, to allow for variance
 local RUN_HEARTBEAT_INTERVAL = 120
 local RUN_WARN_COOLDOWN = 60
 
@@ -603,7 +608,12 @@ local function stepRunning(mod)
     end
   end
 
-  if mod.runStartedAt and (now - mod.runStartedAt) < RUN_STARTUP_GRACE then
+  -- Grace exists because a machine reads inactive for a moment after the gate
+  -- opens. Once the spin-up check above has actually SEEN it active, that
+  -- moment has passed and there is nothing left to wait for -- which matters
+  -- when a run can be short enough to finish inside a flat 3s grace.
+  if not mod.spinupDone
+     and mod.runStartedAt and (now - mod.runStartedAt) < RUN_STARTUP_GRACE then
     return
   end
 
@@ -611,15 +621,15 @@ local function stepRunning(mod)
   -- estimate; lazy otherwise.
   local interval = RUN_POLL_INTERVAL
   local idle = config.runPollIdle or RUN_POLL_IDLE
-  -- A streak already underway is confirmed at the FAST rate whatever the
-  -- estimate says. Confirmation is three polls, so leaving it on the lazy
-  -- interval made an unexpectedly early finish cost 3 x 3s to notice rather
-  -- than 3s -- measured at 7.1s worst case against 0.7s in steady state.
-  -- Being lazy is only safe while we have no reason to think anything changed.
-  if idle > 0 and mod.runEstimate and mod.runStartedAt
+  -- A streak already underway is confirmed at the FAST rate. Confirmation is
+  -- three polls, so leaving it lazy made an early finish cost 3 x 3s to notice
+  -- rather than 3s -- 7.1s worst case, measured, against 0.7s in steady state.
+  if idle > 0 and mod.runMin and mod.runStartedAt
      and (mod.inactiveStreak or 0) == 0 then
-    local untilEnd = (mod.runStartedAt + mod.runEstimate) - now
-    if untilEnd > (config.runNearEnd or RUN_NEAR_END) then interval = idle end
+    local elapsed = now - mod.runStartedAt
+    if elapsed < mod.runMin * (config.runSafeFraction or RUN_SAFE_FRAC) then
+      interval = idle
+    end
   end
   if (now - (mod.lastRunPollAt or 0)) < interval then
     return
@@ -680,15 +690,22 @@ local function stepRunning(mod)
   local observed = now - (mod.runStartedAt or now)
   cycleStats.runTime = cycleStats.runTime + observed
 
-  -- Learn how long this module runs for. Keyed on drill and parallels, because
-  -- those set the consumption rate: a different drill is a different run length
-  -- and the old estimate is worse than none.
-  local key = tostring(mod.job and mod.job.drillKey) .. "/" ..
-              tostring(mod.job and mod.job.parallels or 1)
-  if mod.runEstKey ~= key then
-    mod.runEstimate, mod.runEstKey = observed, key
-  else
-    mod.runEstimate = mod.runEstimate * RUN_EST_DECAY + observed * (1 - RUN_EST_DECAY)
+  -- Remember the SHORTEST run for this configuration. Keyed on asteroid, drill
+  -- and parallels because all three change how long a run lasts, and a minimum
+  -- learned under one of them is not safe under another.
+  --
+  -- A minimum rather than an average precisely because run length varies: the
+  -- average would sit in the middle of the spread and be wrong, low, half the
+  -- time. The minimum can only be too conservative, which costs a few polls.
+  local key = table.concat({
+    tostring(mod.job and mod.job.asteroid),
+    tostring(mod.job and mod.job.drillKey),
+    tostring(mod.job and mod.job.parallels or 1),
+  }, "/")
+  if mod.runMinKey ~= key then
+    mod.runMin, mod.runMinKey = observed, key
+  elseif observed < (mod.runMin or math.huge) then
+    mod.runMin = observed
   end
 
   mod.status = "DONE"
