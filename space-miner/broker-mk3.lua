@@ -318,7 +318,20 @@ local function pollLoad(mod)
     -- "db" = max polls any fingerprint needed (low => store() reliable here),
     -- "buf" = polls waiting for items to arrive in the interface buffer.
     local maxConfirm = math.max(cp.drone or 0, cp.tip or 0, cp.rod or 0)
-    mod.lastLoad = string.format("loaded %.1fs  db:%d buf:%d", elapsed, maxConfirm, s.arrivePolls or 0)
+    -- Phase breakdown, because "loaded 43s" says nothing about which part was
+    -- slow. pre = waiting for the interface buffer to clear, fill = getting
+    -- consumables into the bus, and `waits` is how many fill passes moved
+    -- nothing at all -- i.e. time spent purely waiting on the ME to deliver.
+    -- @n/m is the start threshold actually in force, so the line identifies
+    -- which version of the loader produced it.
+    local sw = s.startedWith or {}
+    mod.lastLoad = string.format("%.0fs pre%.0f fill%.0f w%d @%d/%d db%d buf%d",
+      elapsed, s.preDrainSecs or 0, s.fillSecs or 0, s.fillWaits or 0,
+      sw.tips or 0, sw.rods or 0, maxConfirm, s.arrivePolls or 0)
+    logger:info(string.format(
+      "[LOAD] M%d %.1fs = pre %.1fs + fill %.1fs (%d passes, %d waiting) start %d/%d",
+      mod.index, elapsed, s.preDrainSecs or 0, s.fillSecs or 0,
+      s.fillPasses or 0, s.fillWaits or 0, sw.tips or 0, sw.rods or 0))
     logger:info(string.format(
       "[LOAD] M%d ready (confirm polls d=%s t=%s r=%s, arrive=%s)",
       mod.index, tostring(cp.drone), tostring(cp.tip), tostring(cp.rod),

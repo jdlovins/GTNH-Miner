@@ -155,6 +155,7 @@ function loader.run(mod, job, deps)
   -- previous job, just pushed in by clearInputBus) is still sitting in slot 1,
   -- the fresh drone could end up in the wrong slot and a tip gets transferred
   -- as the "drone". Confirm slots 1-3 are empty before stocking fresh items.
+  local preDrainAt = computer.uptime()
   local drained = pollUntil(function()
     for s = 1, 3 do
       if (mod.transposer.getSlotStackSize(mod.conf.interfaceSide, s) or 0) > 0 then
@@ -163,6 +164,7 @@ function loader.run(mod, job, deps)
     end
     return true
   end, ARRIVE_TIMEOUT)
+  stats.preDrainSecs = computer.uptime() - preDrainAt
   if not drained then
     return false, "interface buffer did not drain before load (stale items stuck)"
   end
@@ -381,6 +383,7 @@ function loader.run(mod, job, deps)
     local deadline = computer.uptime() + FILL_TIMEOUT
     while true do
       local outstanding, moved = false, false
+      stats.fillPasses = (stats.fillPasses or 0) + 1
 
       -- Two reads for the whole pass, however many consumables are outstanding.
       local busSnap = scanSide(mod.conf.inputBusSide, 2, busSlots)
@@ -425,8 +428,14 @@ function loader.run(mod, job, deps)
         end
         return true
       end
-      -- Only yield when nothing could be moved: otherwise keep draining.
-      if not moved then sched.sleep(POLL_INTERVAL) end
+      -- Only yield when nothing could be moved: otherwise keep draining. A pass
+      -- that moves nothing is a pass spent waiting on the ME to restock the
+      -- interface buffer, so counting them separates "the transposer is slow"
+      -- from "the network is not delivering".
+      if not moved then
+        stats.fillWaits = (stats.fillWaits or 0) + 1
+        sched.sleep(POLL_INTERVAL)
+      end
     end
   end
 
@@ -438,10 +447,12 @@ function loader.run(mod, job, deps)
     return false, "drone mismatch in bus: expected " .. droneName ..
                   ", got " .. (droneStack and droneStack.label or "empty")
   end
+  local fillAt = computer.uptime()
   local ok, shortLabel = drain({
     { label = drillEntry.tip, target = TIPS_START },
     { label = drillEntry.rod, target = RODS_START },
   })
+  stats.fillSecs = computer.uptime() - fillAt
   if not ok then
     local target = (shortLabel == drillEntry.tip) and TIPS_START or RODS_START
     local kind   = (shortLabel == drillEntry.tip) and "tip" or "rod"
