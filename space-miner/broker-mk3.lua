@@ -231,6 +231,35 @@ local RUN_STARTUP_GRACE = 3.0
 -- survive an unlucky poll, and that is unchanged by polling more often.
 local RUN_POLL_INTERVAL = 0.25
 local RUN_INACTIVE_CONFIRM = 3
+
+-- ADAPTIVE COMPLETION POLLING
+--
+-- Asking a module whether it has finished costs a component call, and at 0.25s
+-- apart that is four a second EACH. Nine running modules spend 36 calls a
+-- second on a question whose answer is "no" for about 56 seconds out of every
+-- 62 -- while a whole load is 39 calls. The watchdog was outspending the work
+-- it competes with, and halving the interval to cut detection latency doubled
+-- it.
+--
+-- A module's run length is very predictable: it stops when its consumables run
+-- out, and the buffer is fixed. So the previous run is a good estimate of the
+-- next, and no extra hardware call is needed to learn it -- runStartedAt and
+-- the DONE transition already bracket it.
+--
+-- Poll lazily until the estimate says the end is near, then at the normal rate.
+-- Detection latency at the end of a run is unchanged; the standing cost drops
+-- by roughly six times.
+--
+-- Deliberately an interval and not a single scheduled wake-up: if a module
+-- stops early, or the estimate is wrong, something must still be watching. This
+-- degrades to "late by RUN_POLL_IDLE"; a hard schedule degrades to "nobody
+-- notices".
+local RUN_POLL_IDLE = 3.0    -- while the end is far off (0 disables, poll fast)
+local RUN_NEAR_END  = 5.0    -- switch to the fast rate this long before the estimate
+
+-- How much of the estimate is carried from previous runs. Favours stability:
+-- one unusual run should nudge it, not redefine it.
+local RUN_EST_DECAY = 0.7
 local RUN_HEARTBEAT_INTERVAL = 120
 local RUN_WARN_COOLDOWN = 60
 
@@ -578,7 +607,21 @@ local function stepRunning(mod)
     return
   end
 
-  if (now - (mod.lastRunPollAt or 0)) < RUN_POLL_INTERVAL then
+  -- How soon to ask again. Fast near the expected finish and while we have no
+  -- estimate; lazy otherwise.
+  local interval = RUN_POLL_INTERVAL
+  local idle = config.runPollIdle or RUN_POLL_IDLE
+  -- A streak already underway is confirmed at the FAST rate whatever the
+  -- estimate says. Confirmation is three polls, so leaving it on the lazy
+  -- interval made an unexpectedly early finish cost 3 x 3s to notice rather
+  -- than 3s -- measured at 7.1s worst case against 0.7s in steady state.
+  -- Being lazy is only safe while we have no reason to think anything changed.
+  if idle > 0 and mod.runEstimate and mod.runStartedAt
+     and (mod.inactiveStreak or 0) == 0 then
+    local untilEnd = (mod.runStartedAt + mod.runEstimate) - now
+    if untilEnd > (config.runNearEnd or RUN_NEAR_END) then interval = idle end
+  end
+  if (now - (mod.lastRunPollAt or 0)) < interval then
     return
   end
   mod.lastRunPollAt = now
@@ -634,7 +677,20 @@ local function stepRunning(mod)
     "[HEALTH] M%d marking DONE after %.1fs inactive confirmation",
     mod.index,
     now - (mod.inactiveSinceAt or now)))
-  cycleStats.runTime = cycleStats.runTime + (now - (mod.runStartedAt or now))
+  local observed = now - (mod.runStartedAt or now)
+  cycleStats.runTime = cycleStats.runTime + observed
+
+  -- Learn how long this module runs for. Keyed on drill and parallels, because
+  -- those set the consumption rate: a different drill is a different run length
+  -- and the old estimate is worse than none.
+  local key = tostring(mod.job and mod.job.drillKey) .. "/" ..
+              tostring(mod.job and mod.job.parallels or 1)
+  if mod.runEstKey ~= key then
+    mod.runEstimate, mod.runEstKey = observed, key
+  else
+    mod.runEstimate = mod.runEstimate * RUN_EST_DECAY + observed * (1 - RUN_EST_DECAY)
+  end
+
   mod.status = "DONE"
   mod.adapter.setWorkAllowed(false)
 end

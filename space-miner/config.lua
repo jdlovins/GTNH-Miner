@@ -3032,6 +3032,25 @@ config.topUpWindow = 30
 -- has started competing for the call budget once more.
 config.maxConcurrentLoads = 0
 
+-- How often to ask a running module whether it has finished.
+--
+-- Each check is a component call, so a constant fast rate is expensive: nine
+-- modules at four checks a second spend 36 calls a second on a question that is
+-- answered "no" for nearly the whole run, competing with the loads for the same
+-- budget.
+--
+-- The broker learns how long each module runs for (it stops when consumables
+-- run out, so this is very consistent) and checks lazily until the end is near.
+--
+--   runPollIdle  seconds between checks while the finish is far off.
+--                0 = check at the fast rate throughout, the old behaviour.
+--   runNearEnd   switch to the fast rate this long before the expected finish.
+--
+-- The cost of runPollIdle is how late a module stopping UNEXPECTEDLY early is
+-- noticed. 3s is about what one cycle already spends loading.
+config.runPollIdle = 3.0
+config.runNearEnd  = 5.0
+
 -- Par levels for drill consumables. The broker publishes this table to the hw
 -- telem node (DRILL_PAR on config.ports.hardware); the node compares it against
 -- its own live ME scan and auto-crafts anything below par.
