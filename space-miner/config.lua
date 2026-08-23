@@ -3048,11 +3048,14 @@ config.topUpWindow = 30
 -- another 4096 and lands near 8191 before settling. Lower the batch if you would
 -- rather hold less, or lower the floor if you would rather craft less often.
 --
--- Values are in ITEMS. One module refill is config.tipsPerLoad (64) of each, so
--- 4096 is 64 refills. How long a refill lasts depends on the module: the recipe
--- burns 4 tips and 4 rods per parallel per cycle, and maxParallels is 2/4/8 for
--- MK-I/II/III -- so on an MK-II a refill covers 4 cycles, making 4096 roughly
--- 256 cycles of buffer.
+-- Values are in ITEMS. One module refill is config.tipsPerLoad of each, which
+-- ships at 128, so 4096 is 32 refills. How long a refill lasts depends on the
+-- module: the recipe burns 4 tips and 4 rods per parallel per cycle, and
+-- maxParallels is 2/4/8 for MK-I/II/III -- so on an MK-II a refill covers 8
+-- cycles, making 4096 roughly 256 cycles of buffer.
+--
+-- (This paragraph said 64 and "4 cycles" while tipsPerLoad was already 128, so
+-- every number derived from it was out by half.)
 --
 -- Keep every floor at or above 64 or a module can stall on the kits < 64
 -- dispatch floor while nominally sitting at par.
