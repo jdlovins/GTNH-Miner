@@ -237,15 +237,94 @@ local defBus   = template and template.inputBusSide or 2
 local srcNote  = template and ("default = M" .. existingCount .. "'s value")
                           or  "default = first-module guess"
 
+-- ---------------------------------------------------------------------------
+-- Tier detection.
+-- This used to be copied blindly from the previous module (or hardcoded MK-II
+-- on the first one), so an MK-III always got written as MK-II and the broker
+-- ran it at half its parallels. The module controller does say its own tier —
+-- we just have to look. Nothing in GT guarantees WHERE, so we scrape every
+-- string the adapter will hand us (machine name, sensor readout, parameter
+-- values) and match an MK marker in it. Roman first, longest-first so "MK-III"
+-- can't match the "MK-I" prefix; then arabic ("Mk 3") and a bare "Tier: 3".
+-- ---------------------------------------------------------------------------
+local TIER_BY_NUM = { "MK-I", "MK-II", "MK-III" }
+
+local function tierFromText(text)
+  local up = text:upper()
+  for _, roman in ipairs({ "III", "II", "I" }) do
+    -- %f[%a-] .. frontier so "MK-I" doesn't match inside "MK-III"
+    if up:find("MK[%s%-_]?" .. roman .. "%f[^IV]") then
+      return "MK-" .. roman
+    end
+  end
+  local n = up:match("MK[%s%-_]?([123])") or up:match("TIER[%s:]+([123])")
+  if n then return TIER_BY_NUM[tonumber(n)] end
+  return nil
+end
+
+-- Every string this machine will tell us about itself, flattened.
+local function machineStrings(addr)
+  local proxy = component.proxy(addr)
+  local out = {}
+  local function collect(v)
+    if type(v) == "string" then
+      out[#out + 1] = v
+    elseif type(v) == "table" then
+      for _, inner in pairs(v) do collect(inner) end
+    end
+  end
+  for _, call in ipairs({ "getName", "getSensorInformation", "getParameters" }) do
+    local okCall, res = pcall(function() return proxy[call] and proxy[call]() end)
+    if okCall then collect(res) end
+  end
+  return out
+end
+
+local detectedTier, tierEvidence
+for _, s in ipairs(machineStrings(newMachines[1])) do
+  local t = tierFromText(s)
+  if t then
+    detectedTier, tierEvidence = t, s
+    break
+  end
+end
+
+local defTier = detectedTier or (template and template.tier) or "MK-I"
+
+-- Ask regardless: detection reads text GT is free to reword, so a wrong read
+-- must be correctable without hand-editing the config afterwards.
+local function askTier(def)
+  while true do
+    io.write(string.format("  tier [MK-I | MK-II | MK-III] (default %s): ", def))
+    local s = io.read()
+    if not s or s == "" then return def end
+    s = s:upper():gsub("%s", ""):gsub("^MK[%-_]?", "")
+    if s == "1" or s == "I"   then return "MK-I"   end
+    if s == "2" or s == "II"  then return "MK-II"  end
+    if s == "3" or s == "III" then return "MK-III" end
+    print("    enter 1, 2, 3, or MK-I / MK-II / MK-III")
+  end
+end
+
 print("\n=== NEW MODULE " .. newIndex .. " — detected components ===")
 print("  moduleAddr     = " .. newMachines[1])
 print("  ifaceAddr      = " .. newInterfaces[1])
 print("  transposerAddr = " .. newTransposers[1])
-print("\nNow set the transposer sides (" .. srcNote .. ").")
+if detectedTier then
+  print("  tier           = " .. detectedTier .. "  (read from the module: \"" ..
+        tierEvidence:gsub("§.", "") .. "\")")
+elseif template then
+  print("  tier           = ? — module didn't report one; defaulting to M" ..
+        existingCount .. "'s " .. defTier)
+else
+  print("  tier           = ? — module didn't report one; defaulting to " .. defTier)
+end
+
+print("\nConfirm the tier, then set the transposer sides (" .. srcNote .. ").")
 print("These depend on how this module is physically built — check your transposer.")
 
 local proposed = {
-  tier           = template and template.tier or "MK-II",
+  tier           = askTier(defTier),
   moduleAddr     = newMachines[1],
   ifaceAddr      = newInterfaces[1],
   transposerAddr = newTransposers[1],
