@@ -214,6 +214,94 @@ local function statsDuty()
   return cycleStats.runTime / total * 100
 end
 
+--------------------------------------------------------------------------------
+-- COMPUTATION DEMAND
+--
+-- Every mining recipe draws computation per parallel per second
+-- (config.asteroids[x].computation -- see the legend in config.lua). Nothing
+-- read that field before, so "how much computation does this array need?" could
+-- only be answered by hand, against whatever happened to be running.
+--
+-- One instantaneous reading is too jumpy to size a research network from --
+-- modules start and finish constantly -- so keep a time-weighted average over a
+-- 5 minute window plus the high-water mark. The peak is what the supply has to
+-- cover or a recipe stalls; the average is what it sustains.
+--
+-- The window measures demand WHILE MINING: an interval with nothing running is
+-- skipped rather than averaged in as zero. Counting idle time would make the
+-- figure a function of how busy dispatch happened to be, when the question being
+-- asked is what the array needs when work is happening.
+--------------------------------------------------------------------------------
+local COMP_BUCKET  = 5      -- seconds per bucket
+local COMP_BUCKETS = 60     -- 60 * 5s = a 5 minute window
+local compRing     = {}     -- [i] = { stamp, sum, dt }
+local compPeak     = 0
+local compLastAt   = nil
+
+-- What the array draws right now. RUNNING only: a module draws no computation
+-- while it is loading, returning or idle.
+local function computationDemand()
+  local total = 0
+  for _, mod in ipairs(modules) do
+    if mod.status == "RUNNING" and mod.job then
+      local a = config.asteroids[mod.job.asteroid]
+      -- A job naming an asteroid this config no longer has must not take the
+      -- dashboard down with it.
+      total = total + ((a and a.computation or 0) * (mod.job.parallels or 0))
+    end
+  end
+  return total
+end
+
+-- Fold the interval since the last call into the ring. Called from the main
+-- loop, NOT from the draw path: the editor suppresses redraws while modules keep
+-- mining, and sampling only on frames that paint would drop that time.
+local function computationSample()
+  local now  = computer.uptime()
+  local last = compLastAt
+  if not last then compLastAt = now return end
+
+  -- The main loop spins about a hundred times a second and there is nothing to
+  -- learn from sampling that often. Returning WITHOUT advancing compLastAt is
+  -- the point: the interval is not dropped, it is folded into the next sample.
+  local dt = now - last
+  if dt < 0.1 then return end
+  compLastAt = now
+
+  -- Clamp, so one stalled iteration cannot inject a single huge weight.
+  if dt > COMP_BUCKET then dt = COMP_BUCKET end
+
+  local demand = computationDemand()
+  if demand <= 0 then return end                  -- not mining: interval excluded
+  if demand > compPeak then compPeak = demand end
+
+  local stamp = math.floor(now / COMP_BUCKET)
+  local i = (stamp % COMP_BUCKETS) + 1
+  local b = compRing[i]
+  -- Age out by stamp rather than by walking the buckets we skipped: after a long
+  -- stall the ring may have wrapped several times over, and each bucket already
+  -- carries what is needed to tell stale from current.
+  if not b or b.stamp ~= stamp then
+    b = { stamp = stamp, sum = 0, dt = 0 }
+    compRing[i] = b
+  end
+  b.sum = b.sum + demand * dt
+  b.dt  = b.dt + dt
+end
+
+-- now, the windowed average (nil until the window holds some mining time), peak.
+local function computationStats()
+  local oldest = math.floor(computer.uptime() / COMP_BUCKET) - COMP_BUCKETS
+  local sum, dt = 0, 0
+  for _, b in pairs(compRing) do
+    if b.stamp > oldest then
+      sum = sum + b.sum
+      dt  = dt + b.dt
+    end
+  end
+  return computationDemand(), (dt > 0) and (sum / dt) or nil, compPeak
+end
+
 local drillKeyOrder = {
   "steel", "titanium", "tungstensteel", "naquadah",
   "naquadahAlloy", "neutronium", "cosmicNeutronium", "infinity", "transcendentMetal"
@@ -1795,6 +1883,15 @@ local function restockSorted()
   return restockList
 end
 
+-- Panel columns are PW wide and six MK-III modules on a heavy asteroid reach
+-- five digits, so abbreviate above 9999 rather than let the row outgrow its
+-- panel.
+local function fmtComp(v)
+  v = v or 0
+  if v >= 10000 then return string.format("%.1fk", v / 1000) end
+  return string.format("%d", math.floor(v + 0.5))
+end
+
 local function drawHWPanel()
   local row = 6
   local function put(text, color)
@@ -1875,6 +1972,15 @@ local function drawHWPanel()
   else
     put("  CYCLES: none completed yet", 0x555555)
   end
+
+  -- What the recipes actually draw. Written outside the cycles branch above on
+  -- purpose: demand is real from the first running module, long before any cycle
+  -- completes. "pk" is what the computation supply has to cover or a module
+  -- stalls mid-recipe; "5m" is what it sustains while mining -- idle intervals
+  -- are excluded, see computationSample.
+  local cNow, cAvg, cPeak = computationStats()
+  put(string.format("  COMP/s now %s   5m %s   pk %s",
+      fmtComp(cNow), cAvg and fmtComp(cAvg) or "--", fmtComp(cPeak)), 0x668866)
   skip(1)
 
   -- Plasma stock (required to mine -- a module won't run without a plasma fluid).
@@ -3288,6 +3394,13 @@ while true do
   -- sched.tick(). At a 0.25s panel cadence and 2s in the editor, one iteration
   -- of staleness is not observable.
   local up = computer.uptime()
+
+  -- Sample computation demand every pass, not from the draw path. The editor
+  -- suppresses redraws for up to two seconds at a time while modules carry on
+  -- mining, and a window that only saw the frames it painted would quietly lose
+  -- that time out of its average.
+  computationSample()
+
   if ed.open then
     -- Event-driven: repaint when the editor changed, plus a slow tick so live
     -- HAVE values from telemetry still refresh. Repainting a full-screen list
