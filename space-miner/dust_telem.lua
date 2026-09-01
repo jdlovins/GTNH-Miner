@@ -38,8 +38,16 @@ if not me then
   error("Missing ME Interface (attach one via an Adapter to read network stock).")
 end
 -- Proxy methods are callable tables here, not functions, so probe by calling.
-if me.getItemsInNetwork == nil or not pcall(me.getItemsInNetwork) then
+if me.getItemsInNetwork == nil then
   error("ME device cannot query the network - check it is joined to the dust subnet.")
+end
+do
+  local ok, err = pcall(me.getItemsInNetwork)
+  if not ok then
+    -- Report what actually went wrong: on a large network this is usually an
+    -- out-of-memory throw, not a wiring problem, and the two need different fixes.
+    error("ME query failed: " .. tostring(err))
+  end
 end
 
 local gpu      = component.gpu
@@ -113,16 +121,33 @@ local function handleMessage(_, _, _, _, _, rawMsg)
   saveWatchlist(msg.data)
 end
 
+-- Last scan's outcome, for the status line. A failed query and a genuinely
+-- empty network both used to render as an all-red board of zeroes, which is
+-- indistinguishable at a glance -- so record which one it was.
+local scanState = { ok = true, err = nil, seen = 0, matched = 0 }
+
 local function scanDustStock()
   local stocks = {}
   local success, items = pcall(me.getItemsInNetwork)
-  if success and items then
-    for _, item in ipairs(items) do
-      if item and item.label and thresholds[item.label] then
+  if not success or not items then
+    -- Most likely out of memory: getItemsInNetwork builds a table entry per
+    -- stack, and on a large main network that can exceed what this machine
+    -- has left after loading config.lua.
+    scanState = { ok = false, err = tostring(items), seen = 0, matched = 0 }
+    return stocks
+  end
+
+  local seen, matched = 0, 0
+  for _, item in ipairs(items) do
+    if item and item.label then
+      seen = seen + 1
+      if thresholds[item.label] then
+        matched = matched + 1
         stocks[item.label] = (stocks[item.label] or 0) + item.size
       end
     end
   end
+  scanState = { ok = true, err = nil, seen = seen, matched = matched }
   return stocks
 end
 
@@ -182,6 +207,24 @@ local function updateDashboard(sorted)
   io.write(string.format("watchlist: %-13s (%d items)   ", listSource, listCount))
   term.setCursor(55, 2)
   io.write("LAST_SYNC: " .. os.date("%X"))
+
+  -- Why the board is empty, when it is. "0 seen" means the query died; "N seen
+  -- / 0 matched" means it worked and no label on this network is on the list.
+  local row = 17
+  gpu.fill(2, row, 76, 1, " ")
+  term.setCursor(2, row)
+  if not scanState.ok then
+    gpu.setForeground(0xFF4444)
+    io.write(string.sub("SCAN FAILED: " .. (scanState.err or "?"), 1, 76))
+  elseif scanState.matched == 0 then
+    gpu.setForeground(0xFFAA00)
+    io.write(string.format("scan ok: %d stacks seen, 0 on watchlist - wrong network or labels differ",
+      scanState.seen))
+  else
+    gpu.setForeground(0x555555)
+    io.write(string.format("scan ok: %d stacks seen, %d matched   mem free: %dk",
+      scanState.seen, scanState.matched, math.floor(computer.freeMemory() / 1024)))
+  end
 end
 
 drawStaticFrame()
