@@ -81,7 +81,7 @@ Loaded by every node with `dofile("/home/config.lua")`. Sections:
 8. **Dust target registry** — maps each tracked dust/item name to its source asteroid and a priority number
 9. **Module filter blacklist** — high-volume junk ores to exclude from module output
 10. **Dust stock thresholds** — `config.conditions` — what the broker uses to decide when to mine
-11. **Dispatch** — `config.asteroidCap`: how many modules may work the same asteroid. Default is automatic — half the fleet plus one while several asteroids are wanted, and no limit when only one is, since the cap exists to divide the fleet between competing needs and there is nothing to divide against a single target. Pin it to a number, or `"all"` to never limit
+11. **Dispatch** — `config.asteroidCap`: how many modules may work the same asteroid. Default is automatic — half the fleet plus one while several asteroids are wanted, and no limit when only one is, since the cap exists to divide the fleet between competing needs and there is nothing to divide against a single target. Pin it to a number, or `"all"` to never limit. `config.reserveWhileMining`: charge a drone and a full load of kits for every working module rather than only for commitments telemetry has not seen yet — off by default, since it holds back a spare drone per busy module; turn it on if the hardware node’s figures lag enough that two modules end up promised the same drone
 12. **Network settings** — `config.ports` (telemetry=2026; command=2027 reserved for optional remote job nodes; hardware=2025 for `DRILL_PAR` to the hw node), `config.pipelineCheckDelay` (default 120 s), `config.drillPar` (per-material stock the hw node auto-crafts back up to)
 
 ---

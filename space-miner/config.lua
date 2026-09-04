@@ -3044,6 +3044,32 @@ config.preDrainWait = 2.0
 config.fastReload  = false
 config.holdTimeout = 10
 
+-- Charge a drone and a full load of kits for EVERY working module.
+--
+-- Dispatch works from a pool of what is free right now: telemetry reports what
+-- the staging ME holds, and commitments the last sweep could not have seen yet
+-- are subtracted by hand. A module that has been mining long enough for a sweep
+-- to run is NOT subtracted, because the ME no longer lists its drone -- charging
+-- it again would count the same drone twice.
+--
+-- That trusts telemetry to be current. Turn this on and the trust goes away: a
+-- working module costs its drone and its tipsPerLoad/rodsPerLoad of kits for as
+-- long as it is working, whatever the ME says. Nothing in stock can be promised
+-- to two modules on the strength of a stale sweep.
+--
+-- The price is a standing spare per busy module -- five modules mining means
+-- five drones held out of the pool -- and, if commitments ever outnumber
+-- reported stock, a pool that goes negative and stops dispatching that tier
+-- entirely. That is the failure this was conditionalised to fix, so it is off
+-- by default.
+--
+-- Turn it on if you do not trust the hw node's figures, or if you have watched
+-- two modules argue over one physical drone.
+--
+-- A module blocked this way does not idle: dispatch moves on to the next need,
+-- so it takes a different asteroid it CAN reach rather than waiting.
+config.reserveWhileMining = false
+
 -- How many modules may be LOADING at the same time. 0 = no limit.
 --
 -- Loads do not really run in parallel: they share one computer's component-call

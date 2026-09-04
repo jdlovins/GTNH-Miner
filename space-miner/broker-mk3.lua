@@ -1177,6 +1177,11 @@ end
 --
 -- If the hw node goes quiet, lastHWSyncTime stops advancing and every
 -- commitment counts again -- which is the conservative direction to fail in.
+--
+-- config.reserveWhileMining skips this question entirely: with it set, a busy
+-- module is charged for its drone and kits however long ago telemetry saw them.
+-- That reintroduces the standing tax described above on purpose, for setups
+-- where the hw node's figures cannot be trusted to be current.
 local function telemetryHasSeen(mod)
   local at = mod.job and mod.job.dispatchedAt
   if not at then return true end   -- pre-existing job from before this field
@@ -1184,11 +1189,16 @@ local function telemetryHasSeen(mod)
 end
 
 -- How many of each drone are actually free to assign right now?
-local function availableDrones()
+--
+-- strict charges every busy module, not just the ones telemetry has yet to see.
+-- Callers pass config.reserveWhileMining for the dispatch pool, and false where
+-- the question is which tiers this array OWNS rather than which are free.
+local function availableDrones(strict)
   local avail = {}
   for key, count in pairs(brokerState.drones) do avail[key] = count end
   for _, mod in ipairs(modules) do
-    if mod.status ~= "IDLE" and mod.job and mod.job.droneKey and not telemetryHasSeen(mod) then
+    if mod.status ~= "IDLE" and mod.job and mod.job.droneKey
+       and (strict or not telemetryHasSeen(mod)) then
       local k = mod.job.droneKey
       avail[k] = (avail[k] or 0) - 1
     end
@@ -1200,12 +1210,13 @@ end
 -- config.tipsPerLoad / rodsPerLoad, not one kit. Subtracting 1 under-counted an
 -- unseen commitment by that whole factor, which every other site in this file
 -- already charges in full.
-local function availableKits()
+local function availableKits(strict)
   local perLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
   local avail = {}
   for key, d in pairs(brokerState.drills) do avail[key] = (d and d.kits) or 0 end
   for _, mod in ipairs(modules) do
-    if mod.status ~= "IDLE" and mod.job and mod.job.drillKey and not telemetryHasSeen(mod) then
+    if mod.status ~= "IDLE" and mod.job and mod.job.drillKey
+       and (strict or not telemetryHasSeen(mod)) then
       local k = mod.job.drillKey
       avail[k] = (avail[k] or 0) - perLoad
     end
@@ -1334,9 +1345,23 @@ local function dispatchBatch()
   while #idleModules > slots do table.remove(idleModules) end
 
   -- Working pools we can still hand out this batch: drones and drill kits.
-  local avail          = availableDrones()
-  local availKit       = availableKits()
+  local strict         = config.reserveWhileMining or false
+  local avail          = availableDrones(strict)
+  local availKit       = availableKits(strict)
   local minKitsForLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
+
+  -- A SECOND view, for reachability only.
+  --
+  -- Reachability asks whether this array can ever serve a need at all -- a
+  -- question about which drone tiers we own, not which are free this instant.
+  -- Under reserveWhileMining the dispatch pool deliberately hides every busy
+  -- module's drone, and answering from it would report a merely busy fleet as
+  -- permanently unable to mine anything, filling the dust panel with "NO DRONE"
+  -- for asteroids we have perfectly good drones for.
+  --
+  -- With the option off these are the same tables, so nothing changes.
+  local reachAvail    = strict and availableDrones(false) or avail
+  local reachAvailKit = strict and availableKits(false)   or availKit
 
   -- Count what idle modules are still holding as available, because it is: the
   -- drone is sitting in that module and the loader will not ask the ME for
@@ -1351,6 +1376,13 @@ local function dispatchBatch()
       if h then
         avail[h.droneKey]    = (avail[h.droneKey] or 0) + 1
         availKit[h.drillKey] = (availKit[h.drillKey] or 0) + minKitsForLoad
+        -- A held drone is owned as much as a stocked one, so reachability has to
+        -- see it too. Skipped when the tables are the same object, or the add
+        -- would land twice.
+        if reachAvail ~= avail then
+          reachAvail[h.droneKey]    = (reachAvail[h.droneKey] or 0) + 1
+          reachAvailKit[h.drillKey] = (reachAvailKit[h.drillKey] or 0) + minKitsForLoad
+        end
       end
     end
   end
@@ -1424,7 +1456,7 @@ local function dispatchBatch()
     local a = config.asteroids[need.asteroid]
     if not a then return false, "noast" end
     local sawDrone, wantKit = false, nil
-    for key, n in pairs(avail) do
+    for key, n in pairs(reachAvail) do
       if (n or 0) > 0 then
         local tier = config.droneTierKeys[key]
         if tier and tier >= a.minDrone and tier <= a.maxDrone then
@@ -1432,7 +1464,7 @@ local function dispatchBatch()
           local dk = config.droneDrillMap[tier]
           if dk then
             wantKit = wantKit or dk
-            if (availKit[dk] or 0) >= minKitsForLoad then return true end
+            if (reachAvailKit[dk] or 0) >= minKitsForLoad then return true end
           end
         end
       end
@@ -1445,7 +1477,7 @@ local function dispatchBatch()
   -- would bury the real message -- which the hardware panel already gives as
   -- "[ NO DRONES IN STOCK ]".
   local haveAnyDrone = false
-  for key, n in pairs(avail) do
+  for key, n in pairs(reachAvail) do
     -- Only drones the config recognises. availableDrones copies whatever keys
     -- telemetry sent, and a key with no tier cannot reach any asteroid -- so
     -- counting it as "we have drones" would make every need look blocked.
