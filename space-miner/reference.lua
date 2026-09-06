@@ -31,9 +31,12 @@ local reference = {}
 
 --------------------------------------------------------------------------------
 -- 2b. ITEM REGISTRY (internal names for db.set)
--- GTNH 2.9 broke iface.store(); we now write fingerprints via db.set(slot,
--- registryName, damage). These tables map config keys to the Minecraft internal
--- item name + damage value. Scan new items with scan_items.lua to get values.
+-- These tables map config keys to the Minecraft internal item name + damage
+-- value, for a fingerprint-based loader using db.set(slot, registryName, damage).
+-- Nothing reads them: loader.lua resolves items by LABEL through iface.store(),
+-- which works on both GTNH 2.8 and 2.9 -- an earlier version of this comment
+-- claimed 2.9 had broken it, and that was simply wrong. Scan new items with
+-- verify_items.lua to get values.
 --------------------------------------------------------------------------------
 reference.droneRegistry = {
   lv  = { name = "gtnhintergalactic:item.MiningDrone", damage = 0 },

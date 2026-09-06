@@ -422,6 +422,57 @@ fetch one; otherwise timestamps are uptime-relative.
 
 ---
 
+## Compatibility
+
+### `gtVersion`
+
+Which Space Elevator Mining Module API the modules speak. `auto` (default),
+`2.9`, or `2.8`.
+
+GTNH 2.9 replaced the module's positional parameter call with a named one, and
+the two forms are disjoint — a 2.9 module has no `setParameters` at all, which
+is how the broker originally found out about the break ("attempt to call a nil
+value (field 'setParameters')").
+
+| | GTNH 2.8 | GTNH 2.9 |
+|---|---|---|
+| set distance | `setParameters(distanceParam, 0, d)` | `setParameter("distance", d)` |
+| set parallel | *module GUI only* | `setParameter("parallel", n)` |
+| set cycle mode | *module GUI only* | `setParameter("cycle", false)` |
+| introspection | `getParametersInfo()` | `getParameters()` |
+
+Nothing else on the miner path moved. `setWorkAllowed()` and `isMachineActive()`
+are the same call on both, and the whole consumable path — `iface.store{label}`,
+`setInterfaceConfiguration`, the transposer — never changed. All four
+version-dependent calls live in [`module_api.lua`](module_api.lua) and nowhere
+else.
+
+**`auto` probes each module's adapter once at boot** and logs what it found
+(`[STARTUP] M1 speaks GTNH 2.9 (probed)`). Because the methods are disjoint,
+presence of the method *is* the answer — there is nothing to guess. A module that
+answers neither is reported as an error on the dashboard and kept out of dispatch
+rather than being handed a job it cannot be told where to send.
+
+Force `2.9` or `2.8` only when the probe reads wrong — a pack where both methods
+exist, or one that exists but throws. A forced value is honoured over the probe,
+which is the entire point of having it; a wrong force fails every module start
+loudly (`parameters failed: setParameters: ...`) rather than silently mining at
+the wrong distance.
+
+**On GTNH 2.8, `parallel` and `cycle` cannot be set from code.** They live in
+each module's own GUI, and there is no 2.8 call to write instead. Set every
+module to its tier maximum by hand, because dispatch charges jobs at
+`config.moduleTiers[tier].maxParallels` — a GUI holding less still mines, but
+the computation draw and the ETA readouts will be wrong. The broker prints one
+warning at boot when it detects 2.8, once for the whole array rather than once
+per module.
+
+`distanceParam` in `job_node_config.lua` is used on 2.8 and ignored on 2.9. It is
+harmless to leave in place either way, and `detect_module.lua` now prints which
+dialect a new module speaks next to the value it proposes.
+
+---
+
 ## Ports
 
 `config.ports` is **not** in the settings registry, on purpose.

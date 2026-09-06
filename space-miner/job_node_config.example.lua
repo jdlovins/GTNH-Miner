@@ -18,7 +18,9 @@
 --   transposerAddr : Transposer between the ME Interface buffer and the Input Bus
 --   interfaceSide  : transposer side facing the ME Interface buffer (0-5)
 --   inputBusSide   : transposer side facing the Input Bus (0-5)
---   distanceParam  : setParameters index for distance (usually 0)
+--   distanceParam  : GTNH 2.8 ONLY -- the setParameters index for distance
+--                    (usually 0). Ignored on GTNH 2.9, which sets parameters
+--                    by name. Harmless to leave in place either way.
 --   pinnedAsteroid : (optional) reserve this module to ALWAYS mine one asteroid,
 --                    ignoring dust thresholds and the per-asteroid cap. Use the
 --                    exact asteroid name from config.asteroids, e.g.

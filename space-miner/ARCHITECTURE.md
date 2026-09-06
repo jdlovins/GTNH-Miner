@@ -267,7 +267,7 @@ later.
    - Store drill fingerprints in database slots
    - Load drone into module via `iface.setInterfaceConfiguration()` + `transposer.transferItem()`
    - Load drills into module via same pipeline
-   - Configure module: `setParameters(0, 0, distance)` and plasma mode
+   - Configure module via `module_api.lua`: distance (plus parallel and cycle on GTNH 2.9), and plasma mode
    - Run recipe until complete
    - Recover output back to ME via transposer
    - Clear interface config for next job

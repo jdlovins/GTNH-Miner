@@ -325,7 +325,7 @@ On first run, auto-generates `/home/job_node_config.lua` with full comments and 
 | `transposerAddr` | OC Transposer between ME Interface and Input Bus |
 | `interfaceSide` | Side of transposer facing the ME Interface buffer (0–5) |
 | `inputBusSide` | Side of transposer facing the Input Bus (0–5) |
-| `distanceParam` | `setParameters` index for distance — confirmed as `0` in-game |
+| `distanceParam` | **GTNH 2.8 only** — `setParameters` index for distance, confirmed as `0` in-game. Ignored on 2.9, which addresses parameters by name. |
 
 **Per-module state machine** (advances every 0.5 s, all slots run concurrently):
 
@@ -459,7 +459,7 @@ The single broker is limited by the host computer's component budget (≈6 modul
    a. store() fingerprints into db slots, setInterfaceConfiguration() to pull from ME
    b. Poll transposer slot sizes until drone + 4×parallels tips + rods are present
    c. transferItem() drone/tips/rods into Input Bus; clear interface config
-   d. setParameters(0, 0, distance), setWorkAllowed(true)
+   d. set distance/parallel/cycle via module_api.lua, setWorkAllowed(true)
    e. Poll isMachineActive() every 10 s (5 s startup grace period)
 
 6. Job complete:
@@ -472,7 +472,9 @@ The single broker is limited by the host computer's component budget (≈6 modul
 
 ## Notes
 
-- **`distanceParam` index** — confirmed as `0` in-game. The default in `job_node_config.lua` is already correct. Verify with `component.proxy(component.get("<moduleAddr>")).getParametersInfo()` if behaviour seems wrong.
+- **GTNH 2.8 vs 2.9** — GTNH 2.9 replaced the mining module's positional `setParameters(index, 0, value)` with a named `setParameter(key, value)`, and the two forms are disjoint. `module_api.lua` holds the difference and every other file goes through it. The broker probes each module's adapter once at boot and reports what it found (`M1 speaks GTNH 2.9 (probed)`); the `gtVersion` setting forces a dialect if the probe reads wrong. Nothing else on the miner path changed — `setWorkAllowed`, `isMachineActive` and the whole ME/transposer load path are identical on both.
+- **On GTNH 2.8, parallel and cycle are not settable from code** — they live in each module's own GUI. Set every module to its tier maximum, because dispatch assumes `moduleTiers[tier].maxParallels`; a GUI holding less still mines, but the computation draw and ETA readouts will be wrong. The broker prints one warning at boot when it detects 2.8.
+- **`distanceParam` index** — GTNH 2.8 only; ignored on 2.9. Confirmed as `0` in-game, and the default in `job_node_config.lua` is already correct. Verify with `component.proxy(component.get("<moduleAddr>")).getParametersInfo()` if behaviour seems wrong.
 - **Plasma supply** — the script does not load plasma. Connect an ME Fluid Export Bus directly to each module's Input Hatch and configure it to export the plasma type you want for that module. The broker selects plasma based on mode (best/single/tiered) and reports it in `hw_telem`; the physical export bus must be pre-configured to match.
 - **Database slots** — each module uses 3 consecutive slots in the shared database (M1→1-3, M2→4-6, …). The script writes fingerprints at runtime via `store()` — the database does not need to be pre-loaded manually.
 - **Ore → dust pipeline** — the broker triggers on dust levels, not ore. Ore outputs to an ore-processing subnet, then dusts arrive in the dust-storage subnet where `dust_telem` is watching. There is a lag between a job finishing and its yield showing up in the dust figures, so a module can be re-dispatched for dust that is already on its way. Nothing throttles for it today; the practical control is `dustScanInterval` and your ore factory throughput.

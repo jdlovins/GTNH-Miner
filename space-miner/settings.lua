@@ -43,6 +43,7 @@ S.groups = {
   { id = "nodes",    label = "TELEMETRY NODES (pushed to dust/fluid/hw over the air)" },
   { id = "ui",       label = "INTERFACE       (this screen)" },
   { id = "logging",  label = "LOGGING         (see logger.lua)" },
+  { id = "compat",   label = "COMPATIBILITY   (which GTNH the modules speak)" },
   { id = "other",    label = "OTHER" },
 }
 
@@ -193,6 +194,17 @@ S.list = {
 
   { key = "logging.bootUnixTime", group = "logging", type = "int", default = 0, min = 0,
     label = "Boot epoch", help = "real unix seconds at boot, to anchor timestamps; 0 = uptime-relative" },
+
+  -- --- COMPATIBILITY -------------------------------------------------------
+  -- GTNH 2.9 renamed the mining module's parameter API and the two forms are
+  -- disjoint, so "auto" asks each adapter which one it has rather than making
+  -- the operator know. module_api.lua holds the difference; this only decides
+  -- whether it probes. Not scope = "node": no telemetry node touches a module
+  -- controller, so shipping this to them would be noise on the wire.
+  { key = "gtVersion", group = "compat", type = "choice", default = "auto",
+    choices = { "auto", "2.9", "2.8" },
+    label = "GTNH module API",
+    help  = "auto probes each module; force it only if the probe reads wrong" },
 }
 
 -- ---------------------------------------------------------------------------

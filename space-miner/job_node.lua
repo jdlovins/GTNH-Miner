@@ -50,6 +50,7 @@ local fs           = require("filesystem")
 local loggingModule = dofile("/home/logger.lua")
 
 local config = dofile("/home/config.lua")
+local moduleApi = dofile("/home/module_api.lua")
 local logger = loggingModule.createLogger("jobnode1")
 -- logger.lua exports exactly { createLogger, getCurrentTimestamp }. This used to
 -- reach for loggingModule.bootUnixTime and .bootComputerTime, which have never
@@ -81,7 +82,8 @@ if not fs.exists(CONFIG_PATH) then
 --
 -- PER-MODULE HARDWARE
 --   moduleAddr     OC Adapter adjacent to the Mining Module controller block.
---                  Exposes setParameters() / setWorkAllowed() / isMachineActive().
+--                  Exposes setWorkAllowed() / isMachineActive(), plus
+--                  setParameter() on GTNH 2.9 or setParameters() on GTNH 2.8.
 --
 --   ifaceAddr      OC Adapter adjacent to the ME Interface.
 --                  Exposes store() and setInterfaceConfiguration().
@@ -93,9 +95,10 @@ if not fs.exists(CONFIG_PATH) then
 --   inputBusSide   Side of the transposer that faces the module Input Bus.
 --                  Sides: 0=down  1=up  2=north  3=south  4=west  5=east
 --
---   distanceParam  setParameters index for the asteroid distance value.
---                  Confirmed in-game as index 0. Verify with:
+--   distanceParam  GTNH 2.8 ONLY: the setParameters index for the asteroid
+--                  distance value. Confirmed in-game as index 0. Verify with:
 --                    component.proxy(component.get("moduleAddr")).getParametersInfo()
+--                  Ignored on GTNH 2.9, which addresses parameters by name.
 return {
   nodeId = "MEDINA-Ring-1",
   dbAddr = "",  -- shared OC Database component address (first 8 chars is enough)
@@ -162,6 +165,15 @@ for i, mc in ipairs(nodeConf.modules) do
     lastPoll   = 0,        -- os.time() of last isMachineActive() call
     errorMsg   = nil,
   }
+  -- Which GTNH parameter API this controller speaks. Resolved once, here, the
+  -- same way broker-mk3 does it in initModules(): it cannot change while we are
+  -- up, and probing per job would cost two component calls before every start.
+  modules[i].dialect, modules[i].dialectHow =
+    moduleApi.resolve(modules[i].adapter, config.gtVersion)
+  if not modules[i].dialect then
+    error(lbl .. ": module API not recognised (no setParameter or setParameters)")
+  end
+  logger:info(string.format("M%d speaks %s", i, moduleApi.describe(modules[i])))
 end
 
 -- =============================================================================
@@ -520,13 +532,16 @@ local STARTUP_GRACE = 10  -- seconds after start before polling isMachineActive 
 local POLL_INTERVAL = 5 * 20   -- Minecraft seconds between active-status polls (0.25 real seconds for fast DONE detection)
 
 local function startModule(mod, distance)
-  -- GTNH 2.9: named-key API replaces positional setParameters.
-  local ok, err = pcall(function()
-    mod.adapter.setParameter("distance", distance)
-    mod.adapter.setParameter("parallel", mod.job and mod.job.parallels or 1)
-    mod.adapter.setParameter("cycle", false)
-    mod.adapter.setWorkAllowed(true)
-  end)
+  -- module_api.lua holds the 2.8/2.9 difference and does its own pcall'ing.
+  -- The job carries the distance the broker chose; pass it through rather than
+  -- reading mod.job again, so a caller can start a module on a distance it has
+  -- not committed to the job yet.
+  local ok, err = moduleApi.configure(mod, {
+    distance  = distance,
+    parallels = mod.job and mod.job.parallels or 1,
+  })
+  if not ok then return false, tostring(err) end
+  ok, err = pcall(function() mod.adapter.setWorkAllowed(true) end)
   if not ok then return false, tostring(err) end
   return true
 end
@@ -582,10 +597,8 @@ local function stepDone(mod)
   os.sleep(1.0)  -- 1 Minecraft second (1/20 real second) for machine output phase
   returnItemsToME(mod)
   -- Clear module distance parameter to reset adapter state
-  pcall(function()
-    mod.adapter.setWorkAllowed(false)
-    mod.adapter.setParameter("distance", 1)
-  end)
+  pcall(function() mod.adapter.setWorkAllowed(false) end)
+  moduleApi.resetDistance(mod)
   log("DONE M" .. mod.index .. ": " .. mod.job.asteroid)
   modLog(mod.index, "Job complete!")
   sendComplete(mod.job.jobId, true)

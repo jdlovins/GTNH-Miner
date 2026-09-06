@@ -273,7 +273,12 @@ local function machineStrings(addr)
       for _, inner in pairs(v) do collect(inner) end
     end
   end
-  for _, call in ipairs({ "getName", "getSensorInformation", "getParameters" }) do
+  -- getParameters is GTNH 2.9's introspection call and getParametersInfo is
+  -- 2.8's; a module has one or the other, and the pcall below already tolerates
+  -- the missing one. Asking for both is what lets tier detection work on either
+  -- pack instead of falling through to the "module didn't report one" prompt.
+  for _, call in ipairs({ "getName", "getSensorInformation",
+                          "getParameters", "getParametersInfo" }) do
     local okCall, res = pcall(function() return proxy[call] and proxy[call]() end)
     if okCall then collect(res) end
   end
@@ -306,8 +311,22 @@ local function askTier(def)
   end
 end
 
+-- Which parameter API does this controller speak? The same probe module_api.lua
+-- makes at boot, reported here so the operator sees whether distanceParam below
+-- is load-bearing (GTNH 2.8) or ignored (GTNH 2.9) before confirming it.
+local function dialectOf(addr)
+  local proxy = component.proxy(addr)
+  local ok29, has29 = pcall(function() return proxy.setParameter  ~= nil end)
+  if ok29 and has29 then return "GTNH 2.9 (named parameters)" end
+  local ok28, has28 = pcall(function() return proxy.setParameters ~= nil end)
+  if ok28 and has28 then return "GTNH 2.8 (indexed parameters)" end
+  return nil
+end
+local dialect = dialectOf(newMachines[1])
+
 print("\n=== NEW MODULE " .. newIndex .. " — detected components ===")
 print("  moduleAddr     = " .. newMachines[1])
+print("  module API     = " .. (dialect or "? — neither setParameter nor setParameters"))
 print("  ifaceAddr      = " .. newInterfaces[1])
 print("  transposerAddr = " .. newTransposers[1])
 if detectedTier then
@@ -340,7 +359,8 @@ print("  ifaceAddr      = " .. proposed.ifaceAddr)
 print("  transposerAddr = " .. proposed.transposerAddr)
 print("  interfaceSide  = " .. proposed.interfaceSide)
 print("  inputBusSide   = " .. proposed.inputBusSide)
-print("  distanceParam  = " .. proposed.distanceParam)
+print("  distanceParam  = " .. proposed.distanceParam ..
+      (dialect and dialect:find("2%.9") and "   (ignored on GTNH 2.9)" or ""))
 io.write("\nWrite this as module " .. newIndex .. "? [y/N]: ")
 local answer = io.read()
 if not answer or answer:lower():sub(1, 1) ~= "y" then

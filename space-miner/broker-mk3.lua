@@ -17,7 +17,7 @@
 --   - ONE OC Database (slots partitioned per module: M1->1-3, M2->4-6, ...)
 --   - Per-module: Adapter (module controller), Adapter (ME interface), Transposer
 --
--- Requires: /home/scheduler.lua, /home/loader.lua,
+-- Requires: /home/scheduler.lua, /home/loader.lua, /home/module_api.lua,
 --           /home/job_node_config.lua, /home/config.lua, /home/logger.lua
 -- =============================================================================
 
@@ -31,6 +31,7 @@ local computer      = require("computer")
 local config        = dofile("/home/config.lua")
 local sched         = dofile("/home/scheduler.lua")
 local loader        = dofile("/home/loader.lua")
+local moduleApi     = dofile("/home/module_api.lua")
 
 local loggingModule = dofile("/home/logger.lua")
 assert(loggingModule and loggingModule.createLogger, "logger.lua not loaded")
@@ -107,6 +108,12 @@ for i, mc in ipairs(nodeConf.modules) do
     inactiveSinceAt = nil,
     nextHeartbeatAt = 0,
     lastRunWarnAt   = 0,
+    -- Which GTNH parameter API this module's controller speaks. Filled in by
+    -- initModules(), because resolving it needs config.gtVersion and a live
+    -- adapter, and a module that answers neither dialect must be reported on
+    -- the dashboard rather than erroring the whole boot.
+    dialect         = nil,
+    dialectHow      = nil,
   }
 end
 
@@ -607,32 +614,22 @@ local function pollLoad(mod)
       tostring(mod.job and mod.job.asteroid or "?"),
       tostring(mod.job and mod.job.distance or "?"),
       tostring(mod.job and mod.job.parallels or "?")))
-    -- GTNH 2.9: set all required named parameters before enabling.
-    -- Keys confirmed live via getParameters() on an MK-II:
-    --   cycle (bool), cycleDistance, distance, parallel, range, step
-    -- "cycle=false" pins a static distance; with cycle on, the module sweeps
-    -- between distance-range and distance+range and getOptimalDistance's choice
-    -- stops meaning anything.
-    --
-    -- pcall is deliberate and not upstream's: a nil setParameter is exactly what
-    -- took this broker down before, and a crash in pollLoad kills all six
-    -- modules. On failure this one goes ERROR and the rest keep mining.
-    local okParams, paramErr = pcall(function()
-      mod.adapter.setParameter("distance", mod.job.distance)
-      mod.adapter.setParameter("parallel", mod.job.parallels or 1)
-      mod.adapter.setParameter("cycle", false)
-    end)
+    -- Set every parameter the run needs, in whichever dialect this module
+    -- speaks. module_api.lua holds the 2.8/2.9 difference and does the pcall'ing
+    -- -- the reasoning for that guard is written out there, and it is the same
+    -- reasoning as the gate below.
+    local okParams, paramErr = moduleApi.configure(mod, mod.job)
     if not okParams then
       mod.status = "ERROR"
-      mod.lastError = "setParameter: " .. tostring(paramErr)
-      logger:error("[LOAD] M" .. mod.index .. " setParameter failed: " .. tostring(paramErr))
+      mod.lastError = tostring(paramErr)
+      logger:error("[LOAD] M" .. mod.index .. " parameters failed: " .. tostring(paramErr))
       return
     end
 
-    -- pcall'd for the same reason the setParameter block above is, which the
-    -- comment there spells out: this runs inside pollLoad, and a throw in
-    -- pollLoad takes down the main loop and with it every other module. The
-    -- guard stopped one line short of the call that actually opens the gate.
+    -- pcall'd for the same reason module_api.configure is: this runs inside
+    -- pollLoad, and a throw in pollLoad takes down the main loop and with it
+    -- every other module. The guard used to stop one line short of the call that
+    -- actually opens the gate.
     local okGate, gateErr = pcall(function() mod.adapter.setWorkAllowed(true) end)
     if not okGate then
       mod.status = "ERROR"
@@ -1132,18 +1129,35 @@ local function getIdleModules()
   local idle = {}
   local now = computer.uptime()
   for i, mod in ipairs(modules) do
-    if mod.status == "IDLE" then
-      idle[#idle + 1] = mod
-    elseif mod.status == "ERROR" then
-      if not lastErrorTime[i] then
-        lastErrorTime[i] = now
-      elseif now - lastErrorTime[i] >= ERROR_TIMEOUT then
-        pcall(function() mod.adapter.setWorkAllowed(false) end)
-        pcall(function() returnItemsToME(mod) end)
-        mod.status = "IDLE"; mod.job = nil; mod.doneTime = nil
-        lastErrorTime[i] = nil
-        logger:info("[RECOVERY] M" .. i .. " auto-recovered from ERROR state")
+    -- A module whose parameter API we could not identify is never dispatchable:
+    -- the load would run in full and only then discover there is no way to tell
+    -- the module where to mine. Re-probe first, because the usual reason for a
+    -- nil dialect is an adapter that was mid chunk-reload at boot, and that
+    -- fixes itself.
+    if not mod.dialect then
+      mod.dialect, mod.dialectHow = moduleApi.resolve(mod.adapter, config.gtVersion)
+      if mod.dialect then
+        logger:info(string.format("[RECOVERY] M%d now speaks %s", i, moduleApi.describe(mod)))
+      end
+    end
+
+    -- Still unidentified after the re-probe: leave it out of dispatch entirely,
+    -- including out of the ERROR recovery below, which would otherwise hand it a
+    -- job every ERROR_TIMEOUT seconds forever.
+    if mod.dialect then
+      if mod.status == "IDLE" then
         idle[#idle + 1] = mod
+      elseif mod.status == "ERROR" then
+        if not lastErrorTime[i] then
+          lastErrorTime[i] = now
+        elseif now - lastErrorTime[i] >= ERROR_TIMEOUT then
+          pcall(function() mod.adapter.setWorkAllowed(false) end)
+          pcall(function() returnItemsToME(mod) end)
+          mod.status = "IDLE"; mod.job = nil; mod.doneTime = nil
+          lastErrorTime[i] = nil
+          logger:info("[RECOVERY] M" .. i .. " auto-recovered from ERROR state")
+          idle[#idle + 1] = mod
+        end
       end
     end
   end
@@ -2381,11 +2395,18 @@ local function runBootPrompt()
   os.sleep(1)
 end
 
--- Disable and clear every module's interface. Shows live progress in the MODULES
--- panel so boot feels responsive instead of staring at a blank console while ~24
--- component calls run. Cheap work; this is purely about feedback.
+-- Disable and clear every module's interface, and settle which GTNH parameter
+-- API each one speaks. Shows live progress in the MODULES panel so boot feels
+-- responsive instead of staring at a blank console while ~24 component calls
+-- run. Cheap work; this is purely about feedback.
+--
+-- The dialect is resolved HERE, once, rather than at every start: it is a
+-- property of the pack the world is running, it cannot change while the broker
+-- is up, and probing it per job would put two speculative component calls in
+-- front of every dispatch.
 local function initModules()
   logger:info("[STARTUP] Initializing " .. #modules .. " modules...")
+  local anyLegacy = false
   for i, mod in ipairs(modules) do
     if gpu then
       local row = 5 + i
@@ -2394,6 +2415,20 @@ local function initModules()
       gpu.setForeground(0xFFFF00)
       io.write(string.format("  M%d [%-5s]  clearing...", mod.index, mod.tier))
     end
+
+    mod.dialect, mod.dialectHow = moduleApi.resolve(mod.adapter, config.gtVersion)
+    if mod.dialect then
+      if mod.dialect == moduleApi.V28 then anyLegacy = true end
+      logger:info(string.format("[STARTUP] M%d speaks %s", mod.index, moduleApi.describe(mod)))
+    else
+      -- Neither setParameter nor setParameters. That is not a mining module, or
+      -- moduleAddr points at the wrong block. Fail the module, not the boot: the
+      -- other five are probably fine and the dashboard is where you find out.
+      mod.status = "ERROR"
+      mod.lastError = "module API not recognised (no setParameter or setParameters)"
+      logger:error("[STARTUP] M" .. mod.index .. " " .. mod.lastError)
+    end
+
     pcall(function()
       mod.adapter.setWorkAllowed(false)
       -- At boot we have no idea what a previous run left configured, so this
@@ -2401,6 +2436,17 @@ local function initModules()
       -- which is exactly the "clear everything" case.
       clearInterfaceSlots(mod)
     end)
+  end
+
+  -- Said once for the whole array, not once per module: on a 2.8 world every
+  -- module is in the same boat, and six identical warnings is how a real one
+  -- gets scrolled past.
+  if anyLegacy then
+    local line = "GTNH 2.8: parallel and cycle are not settable from code -- set them " ..
+                 "in each module's GUI. Dispatch assumes maxParallels for the tier, so " ..
+                 "computation and ETA figures are wrong if the GUI holds less."
+    logger:warn("[STARTUP] " .. line)
+    print(line)
   end
 end
 

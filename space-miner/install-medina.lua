@@ -37,6 +37,7 @@ local ROLES = {
     label = "Broker (main computer)",
     files = { "config.lua", "settings.lua",
               "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
+              "module_api.lua",
               "list_components.lua", "detect_module.lua", "detect_sides.lua", "find_item.lua",
               "migrate_drill.lua" },
     config = { ["job_node_config.example.lua"] = "job_node_config.lua" },
@@ -60,7 +61,7 @@ local ROLES = {
   ["jobnode"] = {
     label = "Remote job node (optional, multi-node fleets)",
     files = { "config.lua", "settings.lua",
-              "job_node.lua", "list_components.lua", "detect_module.lua",
+              "job_node.lua", "module_api.lua", "list_components.lua", "detect_module.lua",
               "detect_sides.lua", "find_item.lua" },
     config = { ["job_node_config.example.lua"] = "job_node_config.lua" },
     note = "Edit /home/job_node_config.lua (give it a unique nodeId), then run: job_node",
