@@ -3252,6 +3252,9 @@ config.logging = {
 --                drill wins, while the materials you never touched keep
 --                following the shipped defaults. Set a material to false to
 --                stop ordering it entirely.
+--   drillLoad    MERGED per field, over tipsPerLoad / rodsPerLoad /
+--                tipsToStart / rodsToStart / drillCraftSlots. Same reasoning
+--                again: a field you set wins, the rest follow this file.
 --------------------------------------------------------------------------------
 
 -- Snapshot before merging so the editor can tell which entries are genuinely
@@ -3262,6 +3265,21 @@ config.shippedDustTargets = {}
 for item, t in pairs(config.dustTargets) do
   config.shippedDustTargets[item] = { asteroid = t.asteroid, priority = t.priority }
 end
+
+-- Same snapshot, same reason, for the two drill tables the editor can write.
+config.shippedDrillPar = {}
+for key, p in pairs(config.drillPar) do
+  config.shippedDrillPar[key] = { tips = p.tips, rods = p.rods, batch = p.batch }
+end
+
+-- The fields the editor's drill page can move. Named in one place so the
+-- overlay, the snapshot and the editor cannot drift apart.
+config.drillLoadFields = {
+  "tipsPerLoad", "rodsPerLoad", "tipsToStart", "rodsToStart", "drillCraftSlots"
+}
+
+config.shippedDrillLoad = {}
+for _, k in ipairs(config.drillLoadFields) do config.shippedDrillLoad[k] = config[k] end
 
 do
   local ok, user = pcall(dofile, "/home/user_config.lua")
@@ -3284,6 +3302,18 @@ do
         elseif type(p) == "table" then
           config.drillPar[key] = { tips = p.tips, rods = p.rods, batch = p.batch }
         end
+      end
+    end
+    -- Scalars rather than a table, so they merge field by field.
+    --
+    -- The >= 1 guard is not tidiness. A zero tipsPerLoad would send modules out
+    -- with nothing to drill with, and a zero drillCraftSlots would stop every
+    -- restock without saying anything -- both of which look like hardware faults
+    -- from the dashboard.
+    if type(user.drillLoad) == "table" then
+      for _, k in ipairs(config.drillLoadFields) do
+        local v = user.drillLoad[k]
+        if type(v) == "number" and v >= 1 then config[k] = math.floor(v) end
       end
     end
   end

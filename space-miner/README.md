@@ -403,7 +403,7 @@ Three files, three writers, one writer each. They never overwrite each other.
 | file | written by | contains |
 |---|---|---|
 | `config.lua` | this repo | shipped tables plus the generated `asteroidOutputs` block. Regenerated wholesale, so never hand-edit it in game. |
-| `user_config.lua` | the in-game editor (press `E`) | what you track, any dust→asteroid mappings you added, and your drill par overrides. Safe to hand-edit. |
+| `user_config.lua` | the in-game editor (press `E`) | what you track, any dust→asteroid mappings you added, and your drill par and load-buffer overrides. Safe to hand-edit — the editor writes only what differs from the shipped values, so a hand-edit survives a save. |
 
 Pressing `E` does not open the editor immediately: it starts a ten second
 countdown during which **no new jobs are dispatched**, so loads already running
@@ -434,11 +434,13 @@ stays suspended for as long as the editor is open.
   }
   ```
 
-  Par is not edited by the in-game editor — hand-edit `user_config.lua` for this
-  one. Keep any par at or above `config.tipsPerLoad` (64) or a module can still
-  stall while nominally "at par". `config.drillCraftSlots` sets how many crafts
-  may run at once; set it to your AE2 crafting CPU count. Rounding down only
-  slows restocking, whereas setting it too high produces rejected requests.
+  Editable in game: press `E`, then `d` for the drill page. Keep any par at or
+  above the larger of `tipsPerLoad`/`rodsPerLoad` (128) — that is the kit floor
+  dispatch enforces, and below it a material can sit "at par", never be crafted,
+  and still refuse to dispatch. The page shows that floor and warns when a value
+  you type falls under it. `config.drillCraftSlots` sets how many crafts may run
+  at once; set it to your AE2 crafting CPU count. Rounding down only slows
+  restocking, whereas setting it too high produces rejected requests.
 
   Each material carries two numbers: `tips`/`rods` are the stock **floor** that
   triggers a craft, and `batch` is the **request size** — always sent whole,
@@ -449,7 +451,22 @@ stays suspended for as long as the editor is open.
 
   Shipped values are scaled to material cost — 4096 for
   steel/titanium/tungstensteel, 2048 for the naquadahs, 1024 for neutronium, 256
-  for the top three tiers. Values are in items; one module refill is 64 of each.
+  for the top three tiers. Values are in items; one module refill is
+  `tipsPerLoad`/`rodsPerLoad` of each, which ships at 128.
+
+- **`drillLoad`** — merges per field over `tipsPerLoad`, `rodsPerLoad`,
+  `tipsToStart`, `rodsToStart` and `drillCraftSlots`. The same drill page writes
+  these, and they apply live: the loader runs inside the broker process and
+  re-reads config on every load, so a change takes effect on the next one rather
+  than at the next reboot. Par changes are re-broadcast to the hw telemetry node
+  immediately on save instead of waiting out the 30 s cadence.
+
+  ```lua
+  drillLoad = {
+    tipsPerLoad = 128,  -- items put in the bus per module load
+    tipsToStart = 64,   -- module starts once this many have arrived
+  }
+  ```
 
 The editor only persists mappings that are genuinely yours, compared against
 `config.shippedDustTargets` — the snapshot taken before the overlay is applied.
@@ -458,3 +475,30 @@ label correction.
 
 `user_config.lua` is optional. Without it the shipped defaults apply exactly as
 before, so a fresh install needs nothing extra.
+
+### Migrating drill settings out of a hand-edited config.lua
+
+Drill settings used to be the one thing you had to edit in `config.lua` itself,
+and `install-medina` wgets that file straight over the top. If you tuned
+`drillPar` or the load buffer there, carry them across **before** updating:
+
+```bash
+migrate_drill --dry
+```
+
+That reads `/home/config.lua`, lists every drill setting that differs from the
+shipped defaults, and shows the `user_config.lua` it would write. Drop `--dry` to
+write it. Only differences are migrated — a value matching the shipped default is
+left alone so it keeps following `config.lua`.
+
+Already updated? The installer copies your old file to `/home/config.lua.bak`
+first, so point the script at that instead:
+
+```bash
+migrate_drill /home/config.lua.bak
+```
+
+It merges into an existing `user_config.lua` rather than replacing it, keeping
+what you track and any mappings you added (and saving a `.bak` of that too). This
+is a one-time bridge — afterwards, change drill settings in the editor with `E`
+then `d`.

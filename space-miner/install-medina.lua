@@ -31,7 +31,8 @@ local ROLES = {
   ["broker"] = {
     label = "Broker (main computer)",
     files = { "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
-              "list_components.lua", "detect_module.lua", "detect_sides.lua", "find_item.lua" },
+              "list_components.lua", "detect_module.lua", "detect_sides.lua", "find_item.lua",
+              "migrate_drill.lua" },
     config = { ["job_node_config.example.lua"] = "job_node_config.lua" },
     note = "Edit /home/job_node_config.lua with your hardware, then run: broker-mk3",
   },
@@ -78,6 +79,35 @@ local function fetch(name, dest)
   end
 end
 
+-- config.lua is fetched before anything else, which means an install destroys a
+-- hand-edited one before the script that could have rescued it has even landed.
+-- So copy it aside first. Costs one small file and removes the only irreversible
+-- step in an install.
+--
+-- Returns true if the backup is a PRE-overlay config -- one whose drill settings
+-- lived in config.lua itself, and are therefore worth migrating.
+local function backupConfig()
+  local path = "/home/config.lua"
+  if not fs.exists(path) then return false end
+
+  local src = io.open(path, "r")
+  if not src then return false end
+  local body = src:read("*a")
+  src:close()
+
+  local bak = io.open(path .. ".bak", "w")
+  if not bak then return false end
+  bak:write(body)
+  bak:close()
+  print("  config.lua -> /home/config.lua.bak (backup of your current one)")
+
+  -- Text match rather than dofile: this runs before the new config lands, and a
+  -- half-written or hand-broken file should not stop the install.
+  return body:find("drillLoadFields", 1, true) == nil
+end
+
+local hadOldConfig = false
+
 -- Don't clobber an existing job_node_config.lua (it holds the user's addresses).
 local function fetchConfigExample(srcName, destName)
   local dest = "/home/" .. destName
@@ -86,6 +116,25 @@ local function fetchConfigExample(srcName, destName)
     return true
   end
   return fetch(srcName, destName)
+end
+
+-- Drill settings used to live in config.lua, which an install overwrites. Say so
+-- while the backup is still fresh, and only when there is actually something to
+-- rescue -- an upgrade from a version that already had the overlay has nothing.
+local function drillNotice()
+  if not hadOldConfig then return end
+  print("")
+  print("------------------------------------------------------------")
+  print("Your previous config.lua predates the drill overlay.")
+  print("If you had hand-edited any drill settings in it -- drillPar,")
+  print("tipsPerLoad, rodsPerLoad, tipsToStart, rodsToStart or")
+  print("drillCraftSlots -- carry them across with:")
+  print("")
+  print("  migrate_drill /home/config.lua.bak")
+  print("")
+  print("It writes them to user_config.lua, which updates never touch.")
+  print("From then on edit them in the broker: press E, then d.")
+  print("------------------------------------------------------------")
 end
 
 local function installRole(key)
@@ -97,6 +146,7 @@ local function installRole(key)
   print("")
 
   local allOk = true
+  hadOldConfig = backupConfig()
   for _, f in ipairs(COMMON) do
     if not fetch(f) then allOk = false end
   end
@@ -116,6 +166,7 @@ local function installRole(key)
     print("Some files FAILED — check the network card / internet access and re-run.")
   end
   if role.note then print("\nNext: " .. role.note) end
+  drillNotice()
 end
 
 -- ---------------------------------------------------------------------------
@@ -153,11 +204,14 @@ if choice == 6 then
     "config.lua", "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
     "list_components.lua", "detect_module.lua", "detect_sides.lua", "find_item.lua",
     "dust_telem.lua", "hw_telem.lua", "fluid_telem.lua", "job_node.lua",
+    "migrate_drill.lua",
   }
   local allOk = true
+  hadOldConfig = backupConfig()
   for _, f in ipairs(everything) do if not fetch(f) then allOk = false end end
   fetchConfigExample("job_node_config.example.lua", "job_node_config.lua")
   print(allOk and "\nInstall complete." or "\nSome files FAILED — check internet and re-run.")
+  drillNotice()
 elseif map[choice] then
   installRole(map[choice])
 else
