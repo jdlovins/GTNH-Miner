@@ -194,32 +194,69 @@ end
 -- of keys never changes.
 local volumes = {}
 
+-- Last scan's outcome, mirroring dust_telem.lua. This node had none, which left
+-- a failed query and a genuinely empty network rendering identically -- as a red
+-- "NO PLASMA IN STOCK". That is the worst thing this node can be vague about,
+-- because the broker's hasPlasma() gate reads what it publishes.
+local scanState = { ok = true, err = nil }
+
+-- RECASTING A FAILED SCAN
+--
+-- The stakes here are higher than on the dust node. A zeroed plasma reading does
+-- not merely distort dispatch, it STOPS it: the broker's hasPlasma() gate sees
+-- no plasma and refuses to send anything out, and the dashboard blames an empty
+-- tank. One chunk reload could halt the whole fleet and misname the cause.
+--
+-- So a failed scan republishes the last good volumes, marked as held over, for
+-- up to MAX_RECASTS cycles; past that the node reports the error instead and the
+-- broker holds dispatch deliberately, saying why. See dust_telem.lua for the
+-- same mechanism and why this is a constant rather than a setting.
+local MAX_RECASTS = 5
+local recasts     = 0
+
+-- Returns volumes, the dominant plasma, its amount, and whether these figures
+-- are fresh. As on the dust node, the query happens BEFORE the zeroing: this
+-- used to reset every entry to 0 up front and refill only on success, so a
+-- failed read published five zeroes as fact.
 local function scanPlasmaStock()
-  -- Keyed off PLASMA_ORDER, not the dashboard's row map: what to look for is a
-  -- scanning concern, and this way the scan still works with the dashboard off.
-  for _, name in ipairs(PLASMA_ORDER) do volumes[name] = 0 end
-
-  local highestVolume  = 0
-  local dominantPlasma = ""
-
-  local success, networkFluids = pcall(me_ctrl.getFluidsInNetwork)
-  if success and networkFluids then
+  -- `why` is the third value on purpose: an unpowered or channel-starved
+  -- network returns nil plus a reason rather than throwing, so pcall reports
+  -- success and the reason lands past the value.
+  local success, networkFluids, why = pcall(me_ctrl.getFluidsInNetwork)
+  local fresh = true
+  if not success then
+    scanState = { ok = false, err = "threw: " .. tostring(networkFluids) }
+    fresh = false
+  elseif networkFluids == nil then
+    scanState = { ok = false, err = "returned nil: " .. (why or "no reason given") }
+    fresh = false
+  else
+    -- Only now drop what we had. Keyed off PLASMA_ORDER, not the dashboard's row
+    -- map: what to look for is a scanning concern, and this way the scan still
+    -- works with the dashboard off.
+    for _, name in ipairs(PLASMA_ORDER) do volumes[name] = 0 end
     for _, fluid in ipairs(networkFluids) do
       if fluid and fluid.label and volumes[fluid.label] ~= nil then
         volumes[fluid.label] = fluid.amount
       end
     end
-    -- Find the highest-tier plasma that has stock (PLASMA_ORDER is descending tier)
-    for _, plasmaName in ipairs(PLASMA_ORDER) do
-      if (volumes[plasmaName] or 0) > 0 then
-        dominantPlasma = plasmaName
-        highestVolume  = volumes[plasmaName]
-        break
-      end
+    scanState = { ok = true, err = nil }
+  end
+
+  -- Derived from whatever `volumes` now holds -- this cycle's reading, or the
+  -- retained one -- so a recast dashboard stays self-consistent.
+  local highestVolume  = 0
+  local dominantPlasma = ""
+  -- Find the highest-tier plasma that has stock (PLASMA_ORDER is descending tier)
+  for _, plasmaName in ipairs(PLASMA_ORDER) do
+    if (volumes[plasmaName] or 0) > 0 then
+      dominantPlasma = plasmaName
+      highestVolume  = volumes[plasmaName]
+      break
     end
   end
 
-  return volumes, dominantPlasma, highestVolume
+  return volumes, dominantPlasma, highestVolume, fresh
 end
 
 -- ---------------------------------------------------------------------------
@@ -290,27 +327,80 @@ local function updateDashboard(plasmaVolumes, dominant, dominantVolume)
     settings.fluidScanInterval))
   term.setCursor(55, 2)
   io.write("LAST_SYNC: " .. os.date("%X"))
+
+  -- Scan health. Without this a failed query and an empty tank farm look
+  -- identical -- both render as "NO PLASMA IN STOCK" above -- and that is the
+  -- single most misleading thing this screen can say, because the broker stops
+  -- mining on it.
+  -- Row 18: the first free line under the frame. drawStaticFrame lays out the
+  -- plasma rows at 6-10, the divider at 12, the dominant block at 13-16 and the
+  -- closing "=" rule at 17, so this is the first row nothing else owns.
+  local row = 18
+  gpu.fill(2, row, 76, 1, " ")
+  term.setCursor(2, row)
+  if scanState.ok then
+    gpu.setForeground(0x555555)
+    io.write(string.format("scan ok   mem free: %dk",
+      math.floor(computer.freeMemory() / 1024)))
+  elseif recasts > MAX_RECASTS then
+    gpu.setForeground(0xFF4444)
+    io.write(string.sub("SCAN FAILED, NOT PUBLISHING: " .. (scanState.err or "?"), 1, 76))
+  else
+    gpu.setForeground(0xFFAA00)
+    io.write(string.sub(string.format("scan failed, recasting last good volumes (%d/%d): %s",
+      recasts, MAX_RECASTS, scanState.err or "?"), 1, 76))
+  end
 end
 
 -- ---------------------------------------------------------------------------
 -- MAIN LOOP
 -- ---------------------------------------------------------------------------
 
-if settings.nodeDashboard then drawStaticFrame() end
+-- DASHBOARD ON/OFF AT RUNTIME
+--
+-- nodeDashboard is pushed by the broker, so it can flip while this node is
+-- running. Drawing was gated per-iteration but the FRAME was drawn once before
+-- the loop, so turning the dashboard on mid-run painted rows onto a screen with
+-- no frame, and turning it off left the last frame frozen there looking live.
+-- Track the previous value and act on the transition.
+local dashOn = settings.nodeDashboard
+if dashOn then drawStaticFrame() end
+
+local function syncDashboard()
+  if settings.nodeDashboard == dashOn then return end
+  dashOn = settings.nodeDashboard
+  if dashOn then drawStaticFrame() else term.clear() end
+end
 
 while true do
-  local plasmaVolumes, dominant, dominantVolume = scanPlasmaStock()
+  local plasmaVolumes, dominant, dominantVolume, fresh = scanPlasmaStock()
+  if fresh then recasts = 0 else recasts = recasts + 1 end
 
-  if settings.nodeDashboard then
+  syncDashboard()
+  if dashOn then
     updateDashboard(plasmaVolumes, dominant, dominantVolume)
   end
 
-  modem.broadcast(PORT_TELEMETRY, serialization.serialize({
-    protocol    = "MEDINA_TELEMETRY",
-    sender      = nodeName,
-    payloadType = "FLUID_UPDATE",
-    data        = { plasmas = plasmaVolumes }
-  }))
+  if recasts > MAX_RECASTS then
+    -- Out of recasts: report the fault rather than publishing volumes we no
+    -- longer stand behind. Still every cycle, so the broker can tell a broken
+    -- ME from a missing node.
+    modem.broadcast(PORT_TELEMETRY, serialization.serialize({
+      protocol    = "MEDINA_TELEMETRY",
+      sender      = nodeName,
+      payloadType = "FLUID_UPDATE",
+      error       = scanState.err or "scan failed",
+    }))
+  else
+    modem.broadcast(PORT_TELEMETRY, serialization.serialize({
+      protocol    = "MEDINA_TELEMETRY",
+      sender      = nodeName,
+      payloadType = "FLUID_UPDATE",
+      -- Absent when fresh; present means held over from `recast` scans ago.
+      recast      = (recasts > 0) and recasts or nil,
+      data        = { plasmas = plasmaVolumes }
+    }))
+  end
 
   -- Wait out the scan interval in short hops so a push is picked up promptly
   -- instead of a whole interval late. The interval is read on every hop rather

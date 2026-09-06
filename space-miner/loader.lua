@@ -24,7 +24,9 @@
 --   way the first in-world run tells us the truth.
 -- =============================================================================
 
-local component = require("component")
+-- No `component` require: every hardware handle this file touches arrives on the
+-- `mod` table from the broker, which is what makes loader.run testable and what
+-- lets one loader serve six differently-wired modules.
 local computer  = require("computer")   -- drain() times out against uptime()
 local sched     = dofile("/home/scheduler.lua")
 
@@ -97,10 +99,14 @@ end
 -- so both are normalised here. Falls back to per-slot reads if a transposer does
 -- not offer it, so nothing breaks on an older setup -- it just stays slow.
 -- ---------------------------------------------------------------------------
-local useGetAll = true
-
+-- PER MODULE, not per file. This was one shared flag, so the first transposer
+-- that could not answer getAllStacks turned the fast path off for every module
+-- in the array -- one old or oddly-wired module quietly halving the whole
+-- broker's call budget. The capability belongs to the transposer, so the flag
+-- belongs on the module that owns it.
 local function snapshotSide(mod, side, from, to)
-  if useGetAll then
+  if mod.useGetAll == nil then mod.useGetAll = true end
+  if mod.useGetAll then
     local ok, all = pcall(function()
       local arr = mod.transposer.getAllStacks(side)
       return arr and arr.getAll and arr.getAll() or nil
@@ -115,7 +121,7 @@ local function snapshotSide(mod, side, from, to)
       end
       return snap
     end
-    useGetAll = false   -- do not pay for the failed attempt on every call
+    mod.useGetAll = false   -- do not pay for the failed attempt on every call
   end
   local snap = {}
   for s = from, to do snap[s] = mod.transposer.getStackInSlot(side, s) end
@@ -134,13 +140,28 @@ local function clearInputBus(mod)
   end
 end
 
+-- Clear the interface configuration slots this module may currently be holding.
+--
+-- CLEARS WHAT WAS ACTUALLY USED, not a fixed count, because every slot is a
+-- metered component call and this runs once per module per cycle.
+--
+-- `mod.cfgHigh` is the high-water slot the allocator below reached. With the
+-- shipped tipsToStart/rodsToStart of 64 a load needs one slot per consumable,
+-- so cfgHigh is 3 and this costs exactly what the old three-slot version did.
+-- It only rises when a start threshold spans more than one stack, which is
+-- precisely when the extra slots exist to be left behind.
+--
+-- The floor of 3 is the defensive case: if we have no idea what is configured
+-- (first load, or a crash before the allocator ran) clear the three a minimal
+-- load uses. The `or MAX_CFG_SLOTS` covers a module whose cfgHigh was never set
+-- at all -- clear everything rather than guess low, since guessing low leaves
+-- the ME stocking items nobody asked for.
 local function clearInterfaceSlots(mod)
-  -- Clear every slot we might have configured, not just the original three:
-  -- a multi-stack load spreads its requests across more of them, and a slot
-  -- left configured keeps the ME stocking items we no longer want.
-  for slot = 1, MAX_CFG_SLOTS do
+  local high = math.max(mod.cfgHigh or MAX_CFG_SLOTS, 3)
+  for slot = 1, high do
     mod.iface.setInterfaceConfiguration(slot)
   end
+  mod.cfgHigh = 0   -- nothing configured now
 end
 
 -- ---------------------------------------------------------------------------
@@ -309,6 +330,10 @@ function loader.run(mod, job, deps)
     if not fast then mod.iface.setInterfaceConfiguration(1, dbAddr, slotDrone, 1) end
     alloc("tip", slotTip, TIPS_START)
     alloc("rod", slotRod, RODS_START)
+    -- Remember how far we went, so whoever clears up knows how many slots to
+    -- pay for. max() rather than assignment: a previous load that ended without
+    -- clearing may still be holding slots above this one.
+    mod.cfgHigh = math.max(mod.cfgHigh or 0, next_ - 1)
   end
 
   -- 4. The DRONE is the load gate: wait only for it. Tips and rods are handled
@@ -352,12 +377,13 @@ function loader.run(mod, job, deps)
   --    of trusting positions, we SCAN the buffer for the slot that actually holds
   --    each item and move that one. This is correct regardless of how the
   --    interface reorders slots or whether clearing drains them.
-  local busSize = mod.transposer.getInventorySize(mod.conf.interfaceSide) or 9
-
   -- Find the buffer slot whose item matches `label` with at least `minSize`.
+  -- Scans the INTERFACE buffer, whose size is ibufSize from step 4. There used
+  -- to be a second local here called busSize that read the interface side too --
+  -- right value, wrong name, and one more component call to get it.
   local function findSlot(label, minSize)
-    local snap = snapshotSide(mod, mod.conf.interfaceSide, 1, busSize)
-    for s = 1, busSize do
+    local snap = snapshotSide(mod, mod.conf.interfaceSide, 1, ibufSize)
+    for s = 1, ibufSize do
       local stack = snap[s]
       if stack and stack.label == label and (stack.size or 0) >= minSize then
         return s
@@ -563,5 +589,13 @@ loader.dbSlotsFor = dbSlotsFor  -- exported for the broker's UI/return logic
 -- and worse there, because restock runs every few seconds for every module
 -- while loads are trying to use the same call budget.
 loader.snapshotSide = snapshotSide
+
+-- Exported so the broker clears up through the same function that allocates,
+-- rather than keeping its own copy that clears a different number of slots.
+-- That divergence was real: the broker cleared 1-3 while this file allocated up
+-- to MAX_CFG_SLOTS, so a load using more than one stack per consumable could
+-- leave slots 4-8 configured and the ME stocking into a bus nobody was loading.
+loader.clearInterfaceSlots = clearInterfaceSlots
+loader.MAX_CFG_SLOTS       = MAX_CFG_SLOTS
 
 return loader

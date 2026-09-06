@@ -81,7 +81,7 @@ reference.drillRegistry = {
   --
   -- This does NOT hold back those tiers. Nothing reads this table any more --
   -- the loader resolves items by LABEL via iface.store(), and tryDispatch()
-  -- gates on reference.drills, which has all nine materials. Tiers 11-14 dispatch
+  -- gates on config.drills, which has all nine materials. Tiers 11-14 dispatch
   -- and load fine without an entry here.
   --
   -- Kept because a fingerprint-based loader would need it again, but treat it

@@ -7,18 +7,25 @@
 -- resumes whichever tasks are ready each tick, then hands control straight back
 -- to your main loop so the UI keeps drawing and telemetry keeps flowing.
 --
--- Three things to learn, and that's the entire API:
+-- Two things to learn, and that's the entire API:
 --
 --   sched.spawn(fn[, name])      -- run fn as a task; it can sleep/await freely
 --   sched.tick()                 -- call once per main-loop pass; advances tasks
---   sched.lock(name)             -- a fairness lock for a shared resource
 --
 -- Inside a task you may call (NOT from the main loop — only inside a task):
 --
 --   sched.sleep(seconds)         -- pause this task, let others run
 --   sched.await(fn[, timeout])   -- pause until fn() is truthy (or timeout)
---   lock:acquire()  / lock:release()
---   lock:with(fn)                -- acquire, run fn(), always release
+--
+-- There used to be a sched.lock() here as well, described as a fair FIFO lock
+-- for serialising a shared component. It was neither used nor fair: nothing in
+-- either project ever called it, its `waiters` counter was never read, and
+-- waiters woke in whatever order tick() happened to step them. Removed rather
+-- than fixed, because the thing it was written for -- serialising the shared
+-- database between concurrent loads -- turned out not to need it: the loader
+-- partitions db slots per module instead, so there is nothing to contend over.
+-- If a genuinely shared resource ever appears, write the lock then, against a
+-- real caller.
 --
 -- ONE clock governs everything: computer.uptime() (real seconds since boot).
 -- No mixing of os.time() world-ticks with real-time sleeps — every wait in the
@@ -65,49 +72,6 @@ function scheduler.await(condition, timeout, interval)
 end
 
 -- ---------------------------------------------------------------------------
--- LOCKS
--- A fair (FIFO) lock so concurrent tasks can take turns on a shared component.
--- We default to NOT using one for the loader, but it's here for when a real
--- shared resource needs serializing — and it reads honestly in the code.
--- ---------------------------------------------------------------------------
-
-function scheduler.lock(name)
-  local lock = { name = name, held = false, waiters = 0 }
-
-  function lock:acquire()
-    -- Wait our turn: block while someone holds it. await() yields to the
-    -- scheduler, so other tasks keep running while we queue.
-    --
-    -- Safe against the "two waiters wake together" race because tick() steps
-    -- tasks sequentially: the first waiter to be stepped sets held=true, and the
-    -- next waiter re-evaluates `not self.held` (now false) in the SAME tick and
-    -- keeps waiting. The atomic check-and-set below is belt-and-suspenders.
-    while true do
-      local got = scheduler.await(function() return not self.held end)
-      if got and not self.held then
-        self.held = true
-        return
-      end
-      -- Someone beat us to it this tick; loop and wait again.
-    end
-  end
-
-  function lock:release()
-    self.held = false
-  end
-
-  -- Run fn() with the lock held, releasing even if fn errors.
-  function lock:with(fn)
-    self:acquire()
-    local ok, err = pcall(fn)
-    self:release()
-    if not ok then error(err, 0) end
-  end
-
-  return lock
-end
-
--- ---------------------------------------------------------------------------
 -- SPAWN / TICK
 -- ---------------------------------------------------------------------------
 
@@ -129,14 +93,6 @@ function scheduler.spawn(fn, name)
     done = function() return task.dead end,
     name = task.name,
   }
-end
-
--- True if any task is still alive (useful for "wait until all loads finish").
-function scheduler.busy()
-  for _, t in ipairs(tasks) do
-    if not t.dead then return true end
-  end
-  return false
 end
 
 -- How many tasks are currently alive.

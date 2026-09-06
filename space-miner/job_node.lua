@@ -21,6 +21,24 @@
 --
 -- Requires /home/job_node_config.lua  - auto-generated on first run.
 -- Fill in component addresses, then restart.
+--
+-- STATUS: LEGACY, AND NOT CURRENTLY RUN BY ANYTHING.
+--
+-- The broker drives its own modules directly (broker-mk3.lua + loader.lua), so
+-- this remote-worker path exists for a future multi-node fleet and is not
+-- exercised. Two things to know before trusting it:
+--
+--   1. It measures every timeout with os.time(), which in OpenOS is world time,
+--      not real seconds -- the exact mixing scheduler.lua's header warns
+--      against. The waits it produces are whatever they happen to be, and the
+--      "ms" in its log lines is not milliseconds. The live path was converted to
+--      computer.uptime(); this was not.
+--   2. Its load sequence predates the read-back confirmation, identity-based
+--      item routing and patient fill that loader.lua now does, so it carries the
+--      bugs those were written to fix.
+--
+-- Fix both before putting a fleet on it. Until then it is reference, not a
+-- supported path -- and it is excluded from .luacheckrc for that reason.
 -- =============================================================================
 
 local component    = require("component")
@@ -29,12 +47,16 @@ local serial       = require("serialization")
 local event        = require("event")
 local term         = require("term")
 local fs           = require("filesystem")
-local createLogger = dofile("/home/logger.lua")
+local loggingModule = dofile("/home/logger.lua")
 
 local config = dofile("/home/config.lua")
-local loggingModule = createLogger  -- the module exports {createLogger, bootUnixTime, bootComputerTime}
 local logger = loggingModule.createLogger("jobnode1")
-local loggingBootUnixTime = loggingModule.bootUnixTime
+-- logger.lua exports exactly { createLogger, getCurrentTimestamp }. This used to
+-- reach for loggingModule.bootUnixTime and .bootComputerTime, which have never
+-- existed under those names, so both were nil and the dashboard threw on its
+-- first frame doing arithmetic on them. getCurrentTimestamp() is the supported
+-- way to ask the same question.
+local getUnixTime = loggingModule.getCurrentTimestamp
 
 logger:info("========== JOB_NODE STARTUP ==========")
 
@@ -226,9 +248,8 @@ local function clearScreen()
   -- Show real-world Unix time on line 3 for tracking
   term.setCursor(2, 3)
   gpu.setForeground(0x555555)
-  local elapsedSinceBoot = computer.uptime() - loggingModule.bootComputerTime
-  local realWorldNow = loggingBootUnixTime + elapsedSinceBoot
-  io.write("Real-world: " .. os.date("!%Y-%m-%d %H:%M:%S", math.floor(realWorldNow)) .. " UTC")
+  io.write("Real-world: " ..
+    os.date("!%Y-%m-%d %H:%M:%S", math.floor(getUnixTime())) .. " UTC")
 end
 
 local function drawModules()

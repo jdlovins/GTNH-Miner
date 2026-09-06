@@ -125,7 +125,8 @@ end
 
 -- --- What to check -----------------------------------------------------------
 local arg = ...
-local checkList, sourceName = {}, ""
+local checkList = {}
+local sourceName          -- set by both branches below
 
 if arg == "cond" then
   sourceName = "config.conditions"

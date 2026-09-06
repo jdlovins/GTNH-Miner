@@ -148,6 +148,14 @@ local par = {}
 -- indistinguishable from a broken pattern unless we simply do not ask.
 local slots = 1
 
+-- Is auto-crafting switched on at all? Published with par, because this node
+-- cannot read config.lua.
+--
+-- Defaults TRUE for the absent-value case: an older broker sends no `enabled`
+-- field, and reading that as "off" would silently stop restocking for anyone
+-- who upgraded this file first. A broker that wants it off says so.
+local restockEnabled = true
+
 -- label -> shortfall, for materials below par that are waiting on a free slot.
 -- Deliberately not in `orders`: nothing has been requested for these.
 local queued = {}
@@ -312,6 +320,12 @@ local function placeOrder(label, have, amount)
 end
 
 -- One pass: retire finished orders, then order anything still below par.
+--
+-- RETIRING HAPPENS WHETHER OR NOT AUTO-CRAFTING IS ON. Switching it off must not
+-- strand the crafts already in flight: AE2 will still deliver them, and an order
+-- nobody ever retires would sit on both dashboards reading "crafting" forever.
+-- So the first half always runs and the array drains honestly; only the second
+-- half -- deciding to ask for more -- is gated.
 local function stepOrders(assets)
   local now = computer.uptime()
 
@@ -341,6 +355,13 @@ local function stepOrders(assets)
       -- game resolves the warning without restarting this node.
       orders[label] = nil
     end
+  end
+
+  if not restockEnabled then
+    -- Nothing new is ordered, and nothing is reported as waiting to be: the
+    -- queue is a statement about work we intend to do.
+    queued = {}
+    return
   end
 
   -- Collect every shortfall first, then spend the available slots on the worst
@@ -661,7 +682,16 @@ local function updateDashboard(assets)
     gpu.setForeground(0x555555)
     -- Distinguish "at par" from "no par received": a broker that is down or on
     -- a stale config would otherwise look identical to a fully stocked network.
-    io.write(next(par) and "  All at par." or "  Awaiting par from broker...")
+    -- Three states, not two. "Awaiting par" used to cover both a broker that
+    -- has never spoken and a broker that deliberately told us to order nothing,
+    -- which reads as a fault when it is a choice.
+    if not restockEnabled then
+      io.write("  Auto-craft off (broker).")
+    elseif next(par) then
+      io.write("  All at par.")
+    else
+      io.write("  Awaiting par from broker...")
+    end
     qRow = qRow + 1
   end
   for r = qRow, QLAST do gpu.fill(QX, r, QW, 1, " ") end
@@ -779,13 +809,15 @@ while true do
       local ok, msg = pcall(serialization.unserialize, rawMsg)
       if ok and msg and msg.protocol == "MEDINA_COMMAND" then
         if msg.payloadType == "HW_QUERY" then
-          -- Respond immediately with current inventory
-          local payload = buildPayload(lastAssets)
+          -- Respond immediately with current inventory. Named apart from the
+          -- broadcast `payload` above rather than shadowing it: they are two
+          -- different messages and the loop reuses that one across iterations.
+          local reply = buildPayload(lastAssets)
           modem.send(senderAddr, 2025, serialization.serialize({
             protocol    = "MEDINA_TELEMETRY",
             sender      = nodeName,
             payloadType = "HW_QUERY_RESPONSE",
-            data        = payload
+            data        = reply
           }))
         elseif msg.payloadType == "DRILL_PAR" and type(msg.data) == "table"
                and type(msg.data.par) == "table" then
@@ -795,6 +827,8 @@ while true do
           -- config.drillPar, or because you no longer hold a drone that uses
           -- it -- actually stops being ordered.
           par = msg.data.par
+          -- Absent means an older broker, which is the enabled case.
+          restockEnabled = msg.data.enabled ~= false
           -- Absent-value fallback, not the shipped default (config sets 2).
           -- A broker that does not tell us the CPU count gets the conservative
           -- answer: too few slots is slow, too many is rejected requests.

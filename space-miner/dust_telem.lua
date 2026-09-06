@@ -269,6 +269,24 @@ end
 -- indistinguishable at a glance -- so record which one it was.
 local scanState = { ok = true, err = nil, seen = 0, matched = 0 }
 
+-- RECASTING A FAILED SCAN
+--
+-- An ME query can fail for reasons that clear themselves within seconds -- a
+-- chunk reloading, a channel briefly starved, the network dropping power for a
+-- tick. Publishing zeroes through one of those is worse than publishing nothing,
+-- because the broker acts on it: every tracked item reads 0% of target and
+-- dispatch chases a shortage that does not exist.
+--
+-- So a failed scan republishes the last good figures, marked as held over, for
+-- up to MAX_RECASTS cycles. Past that the fault is not transient and pretending
+-- otherwise is its own lie, so the node stops publishing figures at all and
+-- reports the error instead. The broker holds dispatch and names the cause.
+--
+-- A local constant rather than a registry setting on purpose: this is a
+-- correctness backstop, not a preference, and nothing good comes of turning it.
+local MAX_RECASTS = 5
+local recasts     = 0
+
 -- Reused across scans. Rebuilding these two tables every 10 seconds meant a
 -- fresh entry table per watched item, ~90 of them, discarded immediately -- on
 -- the machine in this fleet with the least memory to spare and the largest
@@ -278,20 +296,32 @@ local sorted = {}
 
 local function byRatio(a, b) return a.ratio < b.ratio end
 
+-- Returns true if this scan produced fresh figures, false if it failed and
+-- `stocks` still holds the previous ones.
+--
+-- THE QUERY HAPPENS BEFORE THE CLEAR, AND THAT ORDER IS THE POINT. This used to
+-- empty `stocks` first and refill on success -- so a failed query left it empty,
+-- and the broadcast below reported every tracked item at zero. The broker cannot
+-- tell that from a genuinely empty network: it wrote the zeroes straight into
+-- its dust table, every item read 0% of target, and dispatch went to work on a
+-- fiction. Clearing only once the items are in hand makes a failed scan leave
+-- the last known good figures untouched, which is what the recast logic in the
+-- main loop then republishes.
 local function scanDustStock()
-  for k in pairs(stocks) do stocks[k] = nil end
-
   -- `why` is the third value on purpose: a nil return is not a throw, so the
   -- reason arrives alongside the nil rather than in pcall's error slot.
   local success, items, why = pcall(me.getItemsInNetwork)
   if not success then
     scanState = { ok = false, err = "threw: " .. tostring(items), seen = 0, matched = 0 }
-    return
+    return false
   elseif items == nil then
     scanState = { ok = false, err = "returned nil: " .. (why or "no reason given"),
                   seen = 0, matched = 0 }
-    return
+    return false
   end
+
+  -- Only now is it safe to drop what we had.
+  for k in pairs(stocks) do stocks[k] = nil end
 
   local seen, matched = 0, 0
   for _, item in ipairs(items) do
@@ -304,6 +334,7 @@ local function scanDustStock()
     end
   end
   scanState = { ok = true, err = nil, seen = seen, matched = matched }
+  return true
 end
 
 -- The row objects are allocated once per watchlist change and then mutated in
@@ -390,8 +421,18 @@ local function updateDashboard(list)
     gpu.setForeground(0xFFAA00)
     io.write("no watchlist yet - waiting for the broker to push one (it re-sends every 30s)")
   elseif not scanState.ok then
-    gpu.setForeground(0xFF4444)
-    io.write(string.sub("SCAN FAILED: " .. (scanState.err or "?"), 1, 76))
+    -- Distinguish the two failure states, because they mean different things to
+    -- whoever is standing here: recasting is "the figures on this screen are
+    -- held over and the broker is still using them", exhausted is "the broker
+    -- has stopped mining and is waiting on this".
+    if recasts > MAX_RECASTS then
+      gpu.setForeground(0xFF4444)
+      io.write(string.sub("SCAN FAILED, NOT PUBLISHING: " .. (scanState.err or "?"), 1, 76))
+    else
+      gpu.setForeground(0xFFAA00)
+      io.write(string.sub(string.format("scan failed, recasting last good figures (%d/%d): %s",
+        recasts, MAX_RECASTS, scanState.err or "?"), 1, 76))
+    end
   elseif scanState.matched == 0 then
     gpu.setForeground(0xFFAA00)
     io.write(string.format("scan ok: %d stacks seen, 0 on watchlist - wrong network or labels differ",
@@ -407,7 +448,21 @@ end
 -- MAIN LOOP
 -- ---------------------------------------------------------------------------
 
-if settings.nodeDashboard then drawStaticFrame() end
+-- DASHBOARD ON/OFF AT RUNTIME
+--
+-- nodeDashboard is pushed by the broker, so it can flip while this node is
+-- running. Drawing was gated per-iteration but the FRAME was drawn once before
+-- the loop, so turning the dashboard on mid-run painted rows onto a screen with
+-- no frame, and turning it off left the last frame frozen there looking live.
+-- Track the previous value and act on the transition.
+local dashOn = settings.nodeDashboard
+if dashOn then drawStaticFrame() end
+
+local function syncDashboard()
+  if settings.nodeDashboard == dashOn then return end
+  dashOn = settings.nodeDashboard
+  if dashOn then drawStaticFrame() else term.clear() end
+end
 
 -- Reused for the same reason as `stocks`: one table per broadcast, every scan.
 local payload = {}
@@ -417,26 +472,42 @@ while true do
   -- the most expensive thing this node does, and with an empty watchlist every
   -- result of it is discarded.
   if listCount > 0 then
-    scanDustStock()
+    if scanDustStock() then recasts = 0 else recasts = recasts + 1 end
   end
 
-  if settings.nodeDashboard then
+  syncDashboard()
+  if dashOn then
     updateDashboard(buildSortedList())
   end
 
-  -- Stock only: the broker holds the thresholds it sent us, and echoing them
-  -- back just gave a stale node a way to overwrite live policy.
-  for k in pairs(payload) do payload[k] = nil end
-  for name in pairs(thresholds) do
-    payload[name] = { stock = stocks[name] or 0 }
-  end
+  if recasts > MAX_RECASTS then
+    -- Out of recasts: say so instead of publishing figures we no longer stand
+    -- behind. Still broadcast every cycle -- that is what lets the broker tell
+    -- "node alive, ME broken" from "node gone", which silence cannot.
+    modem.broadcast(PORT_TELEMETRY, serialization.serialize({
+      protocol    = "MEDINA_TELEMETRY",
+      sender      = nodeName,
+      payloadType = "DUST_UPDATE",
+      error       = scanState.err or "scan failed",
+    }))
+  else
+    -- Stock only: the broker holds the thresholds it sent us, and echoing them
+    -- back just gave a stale node a way to overwrite live policy.
+    for k in pairs(payload) do payload[k] = nil end
+    for name in pairs(thresholds) do
+      payload[name] = { stock = stocks[name] or 0 }
+    end
 
-  modem.broadcast(PORT_TELEMETRY, serialization.serialize({
-    protocol    = "MEDINA_TELEMETRY",
-    sender      = nodeName,
-    payloadType = "DUST_UPDATE",
-    data        = payload
-  }))
+    modem.broadcast(PORT_TELEMETRY, serialization.serialize({
+      protocol    = "MEDINA_TELEMETRY",
+      sender      = nodeName,
+      payloadType = "DUST_UPDATE",
+      -- Absent when fresh. Present means these are the figures from `recast`
+      -- scans ago, republished because the ME query has been failing since.
+      recast      = (recasts > 0) and recasts or nil,
+      data        = payload
+    }))
+  end
 
   -- Wait out the scan interval in short hops so a push is picked up promptly
   -- instead of a whole interval late. The interval is read on every hop rather

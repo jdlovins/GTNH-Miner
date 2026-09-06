@@ -44,13 +44,6 @@ Seconds between sweeps looking for an idle module. The sweep itself is cheap —
 it reads state the broker already holds — so this is low. It is not the cost of
 a dispatch, which is the load task the sweep spawns.
 
-### `pipelineCheckDelay`
-
-Seconds to wait after a job run before re-checking dust levels. Ore has to
-travel from the module output through ore processing and into dust storage
-before the number the broker reads means anything. Set too low, the broker
-re-dispatches for dust that is already on its way.
-
 ### `maxConcurrentLoads`
 
 How many modules may be LOADING at the same time. `0` = no limit.
@@ -180,6 +173,35 @@ network cost a module an ERROR and a cooldown.
 
 ## Restock
 
+### `drillRestock`
+
+Whether the hw node auto-crafts drill tips and rods back up to par at all.
+Default **on**.
+
+Turn it **off** if you would rather stock consumables yourself — by hand, or
+from a separate crafting setup the broker knows nothing about. With it off the
+broker still publishes DRILL_PAR every cycle, but with an empty par table and
+`enabled = false`, so the hw node knows it has been switched off rather than
+merely gone quiet. It orders nothing and its dashboard says `Auto-craft off
+(broker).` rather than `Awaiting par from broker...`.
+
+Two things it deliberately does **not** do:
+
+- **It does not clear your par figures.** The floors and batch sizes on the
+  drills page are kept exactly as they were, so switching back on restores them
+  rather than making you type them again.
+- **It does not cancel crafts already in flight.** AE2 is going to deliver those
+  whatever this says, so the node keeps retiring them normally and both
+  dashboards show them draining away. Only *new* orders stop.
+
+This does not affect dispatch. The broker still refuses to send a module out
+without `max(tipsPerLoad, rodsPerLoad)` kits of its material in stock — turning
+restocking off means keeping that stock up is now your job, and a material that
+runs dry silently stops its whole drone tier dispatching.
+
+The switch is on the editor's drills page (press `E`, then `d`), at the top of
+the RESTOCK PAR section it governs, as well as on the settings page.
+
 ### `drillCraftSlots`
 
 How many drill crafts the hw node may have in flight at once.
@@ -194,7 +216,9 @@ Setting this **higher** than your CPU count is the failure mode to avoid: the
 surplus requests are rejected on arrival and show as REJECTED. Setting it lower
 only makes restocking slower, so when in doubt round down.
 
-This value is pushed to the hw node — it does not read a config file.
+This value is pushed to the hw node inside DRILL_PAR — it does not read a
+config file, and it does not listen on the port that carries the other node
+settings.
 
 ### `config.drillPar` — per-material restock floors
 

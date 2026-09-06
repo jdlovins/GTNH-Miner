@@ -464,8 +464,8 @@ The single broker is limited by the host computer's component budget (≈6 modul
 
 6. Job complete:
    a. Job node iterates Input Bus slots and returns all items (including drone) to ME
-   b. Broadcasts JOB_COMPLETE; broker frees the module and sets pipelineCheckDelay cooldown
-   c. After cooldown, broker re-evaluates and may re-dispatch the same asteroid
+   b. Broadcasts JOB_COMPLETE; broker frees the module
+   c. Broker re-evaluates on the next dispatch sweep and may re-dispatch the same asteroid
 ```
 
 ---
@@ -475,7 +475,7 @@ The single broker is limited by the host computer's component budget (≈6 modul
 - **`distanceParam` index** — confirmed as `0` in-game. The default in `job_node_config.lua` is already correct. Verify with `component.proxy(component.get("<moduleAddr>")).getParametersInfo()` if behaviour seems wrong.
 - **Plasma supply** — the script does not load plasma. Connect an ME Fluid Export Bus directly to each module's Input Hatch and configure it to export the plasma type you want for that module. The broker selects plasma based on mode (best/single/tiered) and reports it in `hw_telem`; the physical export bus must be pre-configured to match.
 - **Database slots** — each module uses 3 consecutive slots in the shared database (M1→1-3, M2→4-6, …). The script writes fingerprints at runtime via `store()` — the database does not need to be pre-loaded manually.
-- **Ore → dust pipeline** — the broker triggers on dust levels, not ore. Ore outputs to an ore-processing subnet, then dusts arrive in the dust-storage subnet where `dust_telem` is watching. `pipelineCheckDelay` (default 120 s) is the cooldown the broker waits after a job completes before re-checking — tune this to your ore factory throughput.
+- **Ore → dust pipeline** — the broker triggers on dust levels, not ore. Ore outputs to an ore-processing subnet, then dusts arrive in the dust-storage subnet where `dust_telem` is watching. There is a lag between a job finishing and its yield showing up in the dust figures, so a module can be re-dispatched for dust that is already on its way. Nothing throttles for it today; the practical control is `dustScanInterval` and your ore factory throughput.
 - **Draconic Core** — always capped at 1 parallel regardless of module tier due to its 7.8 M EU/t draw per parallel. The broker enforces this automatically.
 - **Distances > 200** — some entries in the optimization matrix are `201`+ (optimizer result exceeded the valid range). The broker clamps all dispatched distances to 200.
 - **Component budget** — 6 modules × 3 components (module adapter + ME Interface adapter + transposer) = 18 + ~4 overhead (modem, GPU, database, computer) = 22 of the 32 OC component limit per computer.

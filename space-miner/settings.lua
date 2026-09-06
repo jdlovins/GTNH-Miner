@@ -1,9 +1,9 @@
 -- =============================================================================
 -- settings.lua — the tunable registry
 --
--- Every runtime knob in MEDINA is DECLARED here, once, and nowhere else. A
--- declaration carries what the value is, what it may legally be, and one line
--- of what it does. Three things read this file and they all read the same
+-- Every runtime knob you are meant to TURN is declared here, once, and nowhere
+-- else. A declaration carries what the value is, what it may legally be, and one
+-- line of what it does. Three things read this file and they all read the same
 -- declarations:
 --
 --   config.lua   seeds config.<key> with the default, then applies the user
@@ -18,6 +18,17 @@
 -- reasoning -- why maxConcurrentLoads is 0, what the run-poll measurements
 -- were -- lives in SETTINGS.md, which does not have to be loaded into the
 -- memory of a machine that only wanted to know a number.
+--
+-- WHAT IS DELIBERATELY NOT HERE. broker-mk3.lua keeps a handful of constants of
+-- its own (ERROR_TIMEOUT, DONE_SETTLE, JOB_STALE, RUN_STARTUP_GRACE,
+-- RUN_POLL_INTERVAL, RUN_INACTIVE_CONFIRM, RUN_HEARTBEAT_INTERVAL,
+-- RUN_WARN_COOLDOWN, PIN_RESTOCK_INTERVAL), and loader.lua keeps its own
+-- timeouts and MAX_CFG_SLOTS. Those are not preferences -- they are load-bearing
+-- against the hardware's behaviour, and a wrong value produces a subtly broken
+-- module rather than a slower one. They stay next to the code that depends on
+-- them, where the reasoning for each is written out. If you find yourself
+-- wanting to turn one, read that comment first; it usually explains why the
+-- number is what it is.
 -- =============================================================================
 
 local S = {}
@@ -66,10 +77,6 @@ S.list = {
     min = 0.05, max = 5,
     label = "Dispatch interval", help = "seconds between sweeps looking for an idle module" },
 
-  { key = "pipelineCheckDelay", group = "dispatch", type = "int", default = 30,
-    min = 0, max = 600,
-    label = "Pipeline settle delay", help = "seconds to let ore processing catch up before re-checking dust" },
-
   { key = "maxConcurrentLoads", group = "dispatch", type = "int", default = 0,
     min = 0, max = 12,
     label = "Max concurrent loads", help = "0 = no limit; raise the limit only if load times climb" },
@@ -109,8 +116,17 @@ S.list = {
     label = "Pre-drain wait", help = "seconds given to the ME to absorb returned items before loading again" },
 
   -- --- RESTOCK -------------------------------------------------------------
+  { key = "drillRestock", group = "restock", type = "bool", default = true,
+    label = "Auto-craft drill consumables",
+    help  = "off = never ask the hw node to craft tips or rods; stock them yourself" },
+
+  -- NOT scope = "node". The hw node is the only machine that cares about these
+  -- two, and it does not listen on the command port that carries NODE_SETTINGS
+  -- -- it is deliberately kept off it so the dust watchlist never reaches its
+  -- memory. Both ride along inside DRILL_PAR on the hardware port instead. This
+  -- one was tagged scope = "node" and so went out to the dust and fluid nodes
+  -- every broadcast, which hold no such key and dropped it.
   { key = "drillCraftSlots", group = "restock", type = "int", default = 2, min = 1, max = 16,
-    scope = "node",
     label = "Concurrent drill crafts", help = "match your AE2 crafting CPUs; too high gets requests rejected" },
 
   -- --- RUN POLLING ---------------------------------------------------------

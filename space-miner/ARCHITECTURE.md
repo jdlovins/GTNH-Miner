@@ -238,7 +238,7 @@ later.
 2. Bismuth Plasma
 3. Radon Plasma
 4. Technetium Plasma
-5. Plutonium-241 Plasma
+5. Plutonium 241 Plasma
 
 ---
 
@@ -303,9 +303,33 @@ All telemetry nodes send updates in this format:
   protocol    = "MEDINA_TELEMETRY",
   sender      = "node-id",
   payloadType = "HW_UPDATE" | "DUST_UPDATE" | "FLUID_UPDATE",
+  -- Absent when the figures are fresh. A number means they are the last good
+  -- ones, republished because that many consecutive ME scans have failed. The
+  -- broker uses them and says so on the panel; it does not stop dispatching.
+  recast      = 2,
   data        = { ... }
 }
 ```
+
+**Fault reports.** A node that has failed `MAX_RECASTS` (5) scans in a row stops
+publishing figures and sends this instead, every cycle, in place of the normal
+payload:
+
+```lua
+{
+  protocol    = "MEDINA_TELEMETRY",
+  sender      = "node-id",
+  payloadType = "DUST_UPDATE" | "FLUID_UPDATE",
+  error       = "returned nil: no channel",   -- no `data` field at all
+}
+```
+
+The broker keeps the figures it already has — they are stale, but they are the
+last ones that were true — and **holds dispatch** until the node reports cleanly
+again, naming the node and the reason on the hardware panel. Sending every cycle
+rather than falling silent is deliberate: it is what distinguishes "node alive,
+ME broken" from "node gone", which staleness alone cannot.
+
 
 **HW_UPDATE** data:
 ```lua
@@ -324,23 +348,32 @@ pattern in the network — needs a human), `"failed"` (request rejected by AE2).
 The broker replaces its copy wholesale on every HW_UPDATE, so a resolved entry
 clears itself.
 
-**DUST_UPDATE** data:
+**DUST_UPDATE** data — stock only, keyed by ME label. The threshold is policy
+and stays on the broker (see DUST_WATCHLIST); a node echoing one back used to be
+able to overwrite live policy with a stale copy.
 ```lua
 {
-  ["Uranium-238 Dust"] = 50000,
-  ["Plutonium-239 Dust"] = 12000,
+  ["Uranium-238 Dust"]   = { stock = 50000 },
+  ["Plutonium-239 Dust"] = { stock = 12000 },
   ...
 }
 ```
 
-**FLUID_UPDATE** data:
+**FLUID_UPDATE** data — note the `plasmas` wrapper; the volumes are not at the
+top level.
 ```lua
 {
-  ["Plutonium-241 Plasma"] = 500000,
-  ["Technetium Plasma"] = 250000,
-  ...
+  plasmas = {
+    ["Plutonium 241 Plasma"] = 500000,
+    ["Technetium Plasma"]    = 250000,
+    ...
+  }
 }
 ```
+Plasma labels are spelled as `config.plasmaKeyOrder` spells them — `Plutonium
+241 Plasma`, with a space and no hyphen, which is what the game uses. The broker
+matches on the exact string, so a hyphen here means the reading is silently
+dropped.
 
 ### MEDINA_JOB (Job Node → Broker Status, Port 2026)
 
@@ -405,7 +438,8 @@ dust watchlist:
       ["Steel Rod"]       = { min = 4096, batch = 4096 },  -- batch = request size
       ...
     },
-    slots = 2   -- max concurrent crafts (config.drillCraftSlots)
+    slots   = 2,     -- max concurrent crafts (config.drillCraftSlots)
+    enabled = true,  -- config.drillRestock; false = order nothing at all
   }
 }
 ```
@@ -417,6 +451,12 @@ dust watchlist:
 - Sent on its own port rather than 2027 because the hw node is the most memory-constrained machine in the fleet, and sharing a port would make it unserialize every DUST_WATCHLIST broadcast just to discard it. Port 2025 was already open on that node for a query protocol that never got a client
 - The node **replaces** its par table on receipt, so removing a material from `config.drillPar` actually stops it being ordered
 - An empty `data` table is valid and means "order nothing"
+- `enabled = false` (from `config.drillRestock`) also sends an empty par table,
+  but says WHY it is empty. The node distinguishes the two on its dashboard:
+  switched off reads as `Auto-craft off (broker).`, whereas an empty par with
+  `enabled = true` means nothing is currently restockable — no drone in stock
+  for any material, say. Crafts already in flight are still retired normally
+  when this goes false; only new orders stop, and the par figures are kept
 
 ### MEDINA_COMMAND (Broker → Job Nodes, Port 2027)
 

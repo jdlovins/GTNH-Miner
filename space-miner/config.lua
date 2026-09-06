@@ -2808,8 +2808,6 @@ config.dustTargets = {
 -- Target quantities to maintain in the dust storage ME subnet.
 -- Broker triggers a mining job when stock < amountToMaintain.
 -- Asteroid is resolved via dustTargets[itemName].asteroid.
--- After each job run the broker waits config.pipelineCheckDelay seconds
--- for the ore processing pipeline to catch up before re-evaluating.
 --------------------------------------------------------------------------------
 config.conditions = {
   --  { itemName = "Ichorium Dust",           amountToMaintain = qty("5m")  },
@@ -2997,7 +2995,16 @@ do
       end
     end
 
-    if type(user.conditions) == "table" and #user.conditions > 0 then
+    -- ABSENT means "follow the shipped list"; PRESENT means "this is the list",
+    -- including when it is empty.
+    --
+    -- The `> 0` test that used to be here conflated the two, so unticking the
+    -- last item in the editor saved an empty list and then silently got all
+    -- hundred shipped conditions back on the next boot -- with the editor still
+    -- showing nothing tracked. "Stock nothing" is a legitimate thing to want
+    -- (a base pinning every module to one asteroid by hand, say), and it was
+    -- the one setting the editor could not express.
+    if type(user.conditions) == "table" then
       config.conditions = user.conditions
     end
 

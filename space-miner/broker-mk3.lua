@@ -49,18 +49,6 @@ for key, why in pairs(config.settingsRejected or {}) do
   print(line)
 end
 
--- Surface task crashes in the log instead of swallowing them.
--- CRITICAL: also set loadResult so the module doesn't get stuck in LOADING forever.
-sched.onError = function(name, err)
-  logger:error("[TASK] " .. tostring(name) .. " crashed: " .. tostring(err))
-  -- Find the module whose load task just crashed and mark it failed.
-  for _, mod in ipairs(modules) do
-    if mod.status == "LOADING" and not mod.loadResult then
-      mod.loadResult = { ok = false, err = "task crashed: " .. tostring(err) }
-    end
-  end
-end
-
 -- =============================================================================
 -- HARDWARE VALIDATION
 -- =============================================================================
@@ -125,6 +113,30 @@ end
 -- (Modules are disabled/cleared after the dashboard frame is drawn, so boot
 --  shows progress instead of a blank console. See initModules() below.)
 
+-- Surface task crashes in the log instead of swallowing them, and mark the
+-- module failed so it does not sit in LOADING forever.
+--
+-- DEFINED HERE, BELOW `modules`, AND THAT POSITION IS THE WHOLE POINT. This
+-- handler used to be assigned up beside the logger, forty lines before
+-- `local modules` existed -- so the closure captured the GLOBAL `modules`, which
+-- is nil. Every task crash then threw `ipairs(nil)` inside the scheduler's
+-- `pcall(scheduler.onError, ...)`, where it was swallowed: the log line above
+-- was written, loadResult was never set, pollLoad returned early forever, and
+-- the module stayed in LOADING until the broker was restarted. The comment
+-- claiming to prevent exactly that was the only part of it that worked.
+--
+-- space-pumping/autoPump.lua has the same handler ordered correctly; this now
+-- matches it.
+sched.onError = function(name, err)
+  logger:error("[TASK] " .. tostring(name) .. " crashed: " .. tostring(err))
+  -- Find the module whose load task just crashed and mark it failed.
+  for _, mod in ipairs(modules) do
+    if mod.status == "LOADING" and not mod.loadResult then
+      mod.loadResult = { ok = false, err = "task crashed: " .. tostring(err) }
+    end
+  end
+end
+
 -- =============================================================================
 -- BROKER STATE
 -- =============================================================================
@@ -138,6 +150,12 @@ local brokerState = {
   -- wholesale from HW_UPDATE -- see processMessage() -- so an entry that
   -- resolves itself (a craft lands, a pattern gets added) disappears on its own.
   crafting = {},
+  -- payloadType -> reason, for a node that has given up publishing figures.
+  -- Non-empty means dispatch is held; the panels name the node and the reason.
+  nodeError = {},
+  -- payloadType -> how many scans ago the figures we hold were fresh. Set while
+  -- a node is coping with a transient fault; dispatch continues.
+  nodeRecast = {},
   jobs = {},
   -- itemName -> asteroid, for needs no drone in stock can reach. Rebuilt every
   -- dispatch so it clears itself the moment a suitable drone appears.
@@ -479,10 +497,17 @@ local function returnItemsToME(mod)
   end
 end
 
+-- One implementation, in loader.lua, because the loader is what allocates these
+-- slots and so is the only thing that knows how many are in use. This used to be
+-- a second copy that always cleared exactly three while the loader could
+-- allocate up to eight -- so a load with a start threshold above one stack could
+-- leave slots 4-8 configured, with the ME quietly stocking consumables into a
+-- bus that was finished with them.
+--
+-- Costs the same as the old three-slot version in the shipped configuration:
+-- see the note on loader.clearInterfaceSlots.
 local function clearInterfaceSlots(mod)
-  mod.iface.setInterfaceConfiguration(1)
-  mod.iface.setInterfaceConfiguration(2)
-  mod.iface.setInterfaceConfiguration(3)
+  loader.clearInterfaceSlots(mod)
 end
 
 local function getOptimalDistance(moduleTier, asteroid, droneKey)
@@ -604,7 +629,17 @@ local function pollLoad(mod)
       return
     end
 
-    mod.adapter.setWorkAllowed(true)
+    -- pcall'd for the same reason the setParameter block above is, which the
+    -- comment there spells out: this runs inside pollLoad, and a throw in
+    -- pollLoad takes down the main loop and with it every other module. The
+    -- guard stopped one line short of the call that actually opens the gate.
+    local okGate, gateErr = pcall(function() mod.adapter.setWorkAllowed(true) end)
+    if not okGate then
+      mod.status = "ERROR"
+      mod.lastError = "setWorkAllowed: " .. tostring(gateErr)
+      logger:error("[LOAD] M" .. mod.index .. " setWorkAllowed failed: " .. tostring(gateErr))
+      return
+    end
     mod.enabledAt     = computer.uptime()
     mod.refills       = 0
     mod.bufferFilled  = false
@@ -718,7 +753,7 @@ local function restockRunning(mod)
     local have = busTotal(label)
     local deficit = target - have
     if deficit <= 0 then return "done" end
-    local dst, room = destFor(label)
+    local dst = destFor(label)
     if not dst then
       -- Nowhere to put it. 128 of each needs two slots per consumable plus one
       -- for the drone, so a bus with fewer than five usable slots simply cannot
@@ -944,7 +979,15 @@ local function stepRunning(mod)
   end
 
   mod.status = "DONE"
-  mod.adapter.setWorkAllowed(false)
+  -- Failing to close the gate is worth an ERROR, not a shrug: the module would
+  -- otherwise keep cycling on whatever is left in its bus while the broker
+  -- believes it has stopped.
+  local okGate, gateErr = pcall(function() mod.adapter.setWorkAllowed(false) end)
+  if not okGate then
+    mod.status = "ERROR"
+    mod.lastError = "setWorkAllowed(false): " .. tostring(gateErr)
+    logger:error("[HEALTH] M" .. mod.index .. " could not stop: " .. tostring(gateErr))
+  end
 end
 
 local function stepDone(mod)
@@ -969,10 +1012,16 @@ local function stepDone(mod)
       } or nil
       mod.heldSince = computer.uptime()
     else
-      returnItemsToME(mod)
+      -- Each guarded separately so one failure does not skip the rest. A module
+      -- left with its gate open is the worst of the three outcomes, so it must
+      -- not be reachable by a transposer throwing on the line above it.
+      local okRet, retErr = pcall(returnItemsToME, mod)
+      if not okRet then
+        logger:warn("[DONE] M" .. mod.index .. " item return failed: " .. tostring(retErr))
+      end
     end
-    clearInterfaceSlots(mod)
-    mod.adapter.setWorkAllowed(false)
+    pcall(clearInterfaceSlots, mod)
+    pcall(function() mod.adapter.setWorkAllowed(false) end)
   elseif computer.uptime() - mod.doneTime >= DONE_SETTLE then
     if mod.job and brokerState.jobs[mod.job.jobId] then
       brokerState.jobs[mod.job.jobId] = nil
@@ -1301,6 +1350,29 @@ local function activeAsteroidCounts()
     end
   end
   return counts
+end
+
+-- Is any telemetry node reporting that it has given up on its ME query?
+--
+-- Returns the node's label and the reason, or nil. Dispatch is held while this
+-- is set: every input to the decision -- what is low, what hardware is free,
+-- whether there is plasma -- comes from these three nodes, and acting on figures
+-- a node has disowned is how the fleet ends up mining a shortage that does not
+-- exist.
+local NODE_LABEL = {
+  DUST_UPDATE  = "DUST NODE",
+  FLUID_UPDATE = "FLUID NODE",
+  HW_UPDATE    = "HW NODE",
+}
+
+local function nodeFault()
+  -- Fixed order rather than pairs(), so the message does not change between
+  -- frames while two nodes are down.
+  for _, kind in ipairs({ "DUST_UPDATE", "FLUID_UPDATE", "HW_UPDATE" }) do
+    local why = brokerState.nodeError[kind]
+    if why then return NODE_LABEL[kind], why end
+  end
+  return nil
 end
 
 -- Mining modules physically require a plasma fluid to operate (any of the five
@@ -1660,7 +1732,48 @@ local function processMessage(evType, _, _, _, _, rawMsg)
   if evType ~= "modem_message" then return end
   local ok, msg = pcall(serial.unserialize, rawMsg)
   if not ok or type(msg) ~= "table" then return end
-  if msg.protocol ~= "MEDINA_TELEMETRY" or not msg.data then return end
+  if msg.protocol ~= "MEDINA_TELEMETRY" then return end
+
+  -- A NODE REPORTING A FAULT, rather than reporting figures.
+  --
+  -- A telemetry node whose ME query keeps failing republishes its last good
+  -- figures for a few cycles and then stops publishing them at all, sending this
+  -- instead. Handled before the payload branches because there is no `data` on
+  -- one of these -- the whole point is that the node has nothing it stands
+  -- behind.
+  --
+  -- Keep the figures we already hold: they are stale, but they are the last ones
+  -- that were true, and overwriting them with zeroes is the failure this whole
+  -- mechanism exists to prevent. Dispatch is held instead (see the main loop),
+  -- so nothing acts on them while the fault stands.
+  --
+  -- The sync CLOCK still advances. The node is alive and talking; it is the ME
+  -- behind it that is broken, and letting the sync colour rot to red would say
+  -- the opposite.
+  if msg.error then
+    brokerState.nodeError[msg.payloadType] = tostring(msg.error)
+    if     msg.payloadType == "DUST_UPDATE"  then
+      brokerState.lastDustSyncTime  = computer.uptime()
+      brokerState.lastDustSync      = os.date("%X")
+    elseif msg.payloadType == "FLUID_UPDATE" then
+      brokerState.lastFluidSyncTime = computer.uptime()
+      brokerState.lastFluidSync     = os.date("%X")
+    elseif msg.payloadType == "HW_UPDATE"    then
+      brokerState.lastHWSyncTime    = computer.uptime()
+      brokerState.lastHWSync        = os.date("%X")
+    end
+    edTouch()
+    return
+  end
+
+  if not msg.data then return end
+
+  -- Figures arrived, so whatever fault this node was reporting is over.
+  -- `recast` means they are held over from an earlier scan rather than fresh;
+  -- the node is coping, and the panels say so, but they are real figures and
+  -- there is no reason to stop dispatching on them.
+  brokerState.nodeError[msg.payloadType]  = nil
+  brokerState.nodeRecast[msg.payloadType] = tonumber(msg.recast) or nil
 
   if msg.payloadType == "DUST_UPDATE" then
     -- Stock only. Thresholds are policy and policy lives here, in
@@ -1886,14 +1999,27 @@ local function drawDustPanel()
   -- Range indicator in the panel header, so a truncated list is obvious rather
   -- than looking like the whole list. Painted into a fixed-width region so a
   -- shorter tag cannot leave the tail of a longer one behind it.
+  --
+  -- A dust-node fault takes the slot instead. Every percentage in this panel is
+  -- derived from what that node reports, so when it has stopped reporting, the
+  -- state of the list matters far less than the fact that none of it is current.
+  local dustFault  = brokerState.nodeError["DUST_UPDATE"]
+  local dustRecast = brokerState.nodeRecast["DUST_UPDATE"]
   if #list > 0 then
-    local tag = string.format("%d-%d/%d",
-      math.min(dustScroll + 1, #list), math.min(dustScroll + capacity, #list), #list)
-    if maxScroll > 0 then tag = tag .. " ^v" end
-    local tw = 16
+    local tag, color
+    if dustFault then
+      tag, color = "STALE - NODE DOWN", 0xFF4444
+    elseif dustRecast then
+      tag, color = "held " .. dustRecast .. " scan(s)", 0xFFAA00
+    else
+      tag = string.format("%d-%d/%d",
+        math.min(dustScroll + 1, #list), math.min(dustScroll + capacity, #list), #list)
+      if maxScroll > 0 then tag = tag .. " ^v" end
+      color = maxScroll > 0 and 0xFFAA00 or 0x888888
+    end
+    local tw = 18
     local tx = math.max(P2 + 1, P3 - tw - 1)
-    dashRow("DTAG", tx, tw, 4, string.format("%" .. tw .. "s", tag),
-      maxScroll > 0 and 0xFFAA00 or 0x888888)
+    dashRow("DTAG", tx, tw, 4, string.format("%" .. tw .. "s", tag), color)
   end
 
   for i = dustScroll + 1, #list do
@@ -2011,8 +2137,15 @@ local function drawHWPanel()
   put("  HW:     " .. brokerState.lastHWSync,    getSyncColor(brokerState.lastHWSyncTime))
   -- Outbound par. Grey dashes here mean this broker has never sent DRILL_PAR --
   -- almost always an older broker-mk3.lua, since the send is unconditional.
-  put("  PAR TX: " .. brokerState.lastParSend .. " (" .. brokerState.lastParCount .. ")",
-      brokerState.lastParCount > 0 and 0x00FF00 or 0x555555)
+  -- An explicit "off" rather than a grey zero. Restock disabled and restock
+  -- broken look identical on a count alone, and the grey dashes here already
+  -- mean a third thing (never sent). Say which one it is.
+  if config.drillRestock == false then
+    put("  PAR TX: " .. brokerState.lastParSend .. "  (auto-craft OFF)", 0x888888)
+  else
+    put("  PAR TX: " .. brokerState.lastParSend .. " (" .. brokerState.lastParCount .. ")",
+        brokerState.lastParCount > 0 and 0x00FF00 or 0x555555)
+  end
   skip(1)
 
   put("  TASKS RUNNING: " .. sched.count(), 0x888888)
@@ -2073,23 +2206,48 @@ local function drawHWPanel()
     put(string.format("  %-16s %8d mB", short, amt), amt > 0 and 0xFF00FF or 0x555555)
     if amt > 0 then anyPlasma = true end
   end
-  -- This row holds the waiting/blocked line only while plasma is absent, and the
-  -- row after it is a spacer. The rest of this panel gets away with
-  -- clear-as-you-write because every row is written every frame; this one is
-  -- not. On the frame plasma first appears the branch below stops running, so
-  -- whatever it wrote last frame would never be wiped -- which is how
-  -- "[ waiting for fluid telemetry... ]" survived on screen long after fluid
-  -- telemetry was green. Writing or blanking it unconditionally settles that.
-  if not anyPlasma then
+  -- TELEMETRY STATUS, in the two rows under the plasma list.
+  --
+  -- These rows are the exception to this panel's clear-as-you-write habit: the
+  -- rest of it writes every row on every frame, while what goes here depends on
+  -- state. When it was written conditionally, the frame where plasma first
+  -- appeared simply stopped running the branch and whatever it had written was
+  -- never wiped -- which is how "[ waiting for fluid telemetry... ]" survived on
+  -- screen long after fluid telemetry had gone green. Every branch below writes
+  -- both rows, blanking rather than skipping, which settles that.
+  --
+  -- ALWAYS EXACTLY TWO ROWS, whichever branch runs. The sections below this one
+  -- are laid out by a running cursor, so a block that is sometimes one row and
+  -- sometimes two shifts everything under it between frames -- which repaints
+  -- the whole panel and makes the drone and drill lists jump.
+  --
+  -- A node fault is checked FIRST, and that ordering is the point of it. When
+  -- the fluid node's ME query fails it stops publishing volumes, so every tier
+  -- reads zero here -- and "NO PLASMA - MINING BLOCKED" is then a confident
+  -- statement of something the broker does not know. It sent people to look at
+  -- an empty tank farm that was full. Name the node and the reason instead.
+  local faultNode, faultWhy = nodeFault()
+  local held = brokerState.nodeRecast["FLUID_UPDATE"] or brokerState.nodeRecast["DUST_UPDATE"]
+  if faultNode then
+    put("  [ " .. faultNode .. ": " .. faultWhy:sub(1, PW - 14) .. " ]", 0xFF4444)
+    put("  [ DISPATCH HELD until telemetry is trustworthy ]", 0xFF4444)
+  elseif not anyPlasma then
     if brokerState.lastFluidSyncTime == 0 then
       put("  [ waiting for fluid telemetry... ]", 0xFFAA00)
     else
       put("  [ NO PLASMA - MINING BLOCKED ]", 0xFF4444)
     end
+    put("", 0x555555)
+  elseif held then
+    -- Not a fault: a node hit a bad scan and is republishing its last good
+    -- figures while it recovers. Worth saying, because the numbers above are
+    -- older than the sync clock suggests -- but dispatch carries on.
+    put("  [ telemetry held over " .. held .. " scan(s) - node coping ]", 0xFFAA00)
+    put("", 0x555555)
+  else
+    put("", 0x555555)
+    put("", 0x555555)
   end
-  -- Unconditional, and it doubles as the wipe for the line above: when plasma
-  -- appears the branch stops running, and without this the last thing it wrote
-  -- would sit there forever.
   skip(1)
 
   put("  DRONES IN STOCK:", 0x888888)
@@ -2238,9 +2396,10 @@ local function initModules()
     end
     pcall(function()
       mod.adapter.setWorkAllowed(false)
-      mod.iface.setInterfaceConfiguration(1)
-      mod.iface.setInterfaceConfiguration(2)
-      mod.iface.setInterfaceConfiguration(3)
+      -- At boot we have no idea what a previous run left configured, so this
+      -- deliberately clears the full MAX_CFG_SLOTS -- mod.cfgHigh is unset,
+      -- which is exactly the "clear everything" case.
+      clearInterfaceSlots(mod)
     end)
   end
 end
@@ -2618,10 +2777,30 @@ function DRILL.build()
 
   rows[#rows + 1] = { kind = "header",
     text = "RESTOCK PAR  (fall below the floor and a whole batch is crafted)" }
+
+  -- The master switch sits at the top of the section it governs, not away on
+  -- the settings page. Someone looking at a par table that is not ordering is
+  -- standing right here, and "is this even switched on" should be answerable
+  -- without leaving the page.
+  local restockOn = ed.settings.drillRestock ~= false
+  local switch = SET.spec.byKey["drillRestock"]
+  if switch then
+    rows[#rows + 1] = { kind = "opt", spec = switch }
+  end
+  if not restockOn then
+    rows[#rows + 1] = { kind = "note", text =
+      "auto-crafting is OFF -- the figures below are kept but nothing is ordered" }
+  end
+
   for _, key in ipairs(drillKeyOrder) do
     local name = DRILL.name(key)
     if matchesFilter(name) then
-      rows[#rows + 1] = { kind = "par", key = key, name = name, usable = usable[key] }
+      -- `usable` stays truthful (do we own a drone for it) and `restockOn` is
+      -- carried separately, so the row can name the ACTUAL reason it is not
+      -- being published. Folding the two together made every row claim "no
+      -- drone" the moment auto-crafting was switched off.
+      rows[#rows + 1] = { kind = "par", key = key, name = name,
+                          usable = usable[key], restockOn = restockOn }
     end
   end
 
@@ -3482,8 +3661,12 @@ local function edDraw()
           -- Par is only published for materials a drone in this base actually
           -- uses. Say so on the row, or switching one on for a tier you do not
           -- own looks like the save did nothing.
-          if on and not row.usable and W >= DRILL.xStock + 36 then
-            cells[#cells+1] = { DRILL.xStock + 10, "no drone -- not published", 0x666666 }
+          if on and W >= DRILL.xStock + 36 then
+            if not row.restockOn then
+              cells[#cells+1] = { DRILL.xStock + 10, "auto-craft off", 0x666666 }
+            elseif not row.usable then
+              cells[#cells+1] = { DRILL.xStock + 10, "no drone -- not published", 0x666666 }
+            end
           end
         end
 
@@ -3900,7 +4083,16 @@ end
 local function broadcastDrillPar()
   local list = {}
   local usable = usableDrillKeys()
-  for key, par in pairs(config.drillPar or {}) do
+  -- config.drillRestock off means the hw node is told to order nothing at all,
+  -- whatever config.drillPar says. Building an empty list rather than skipping
+  -- the broadcast is deliberate: the node has to HEAR that it should stop, and
+  -- a broker that simply went quiet is indistinguishable from a broker that is
+  -- down -- which is the state the node keeps its last par through.
+  --
+  -- The par table itself is left untouched, so switching this back on restores
+  -- exactly the floors you had rather than making you re-enter them.
+  local enabled = config.drillRestock ~= false
+  for key, par in pairs(enabled and config.drillPar or {}) do
     local drill = config.drills[key]
     -- An unknown key is a config typo. Skip it rather than shipping a nil label
     -- the node would have to defend against.
@@ -3926,7 +4118,15 @@ local function broadcastDrillPar()
     -- An older config.lua tells us nothing about the CPU count, and guessing
     -- low only slows restocking whereas guessing high produces rejected
     -- requests. Leave it at 1.
-    data        = { par = list, slots = config.drillCraftSlots or 1 },
+    --
+    -- `enabled` is sent as well as the empty table, because those are two
+    -- different states to be in and the node's dashboard should not have to
+    -- guess. An empty par with enabled=true means "nothing is currently
+    -- restockable" -- no drone in stock for any material, say. Empty with
+    -- enabled=false means "you have turned this off". An older broker sends
+    -- neither, which the node reads as enabled.
+    data        = { par = list, slots = config.drillCraftSlots or 1,
+                    enabled = enabled },
   }))
   local n = 0
   for _ in pairs(list) do n = n + 1 end
@@ -3942,6 +4142,38 @@ end
 pcall(broadcastDrillPar)
 pcall(broadcastNodeSettings)
 
+-- ---------------------------------------------------------------------------
+-- SHUTDOWN
+--
+-- Runs on every exit path, crash included. A broker that dies mid-cycle leaves
+-- its modules exactly as they were: work gates open, so a multiblock keeps
+-- consuming the tips and rods in its bus with nobody watching, and interface
+-- configuration slots still standing, so the ME keeps stocking consumables into
+-- buffers for jobs that will never run. Neither clears itself, and neither is
+-- obvious from looking at the machines -- they look busy.
+--
+-- Everything here is pcall'd individually. This is the last code to run before
+-- the program is gone; one unhappy adapter must not stop the other five modules
+-- being shut down properly.
+--
+-- Goes through loader.clearInterfaceSlots like every other cleanup path, so a
+-- module that was mid-load with several slots allocated has all of them
+-- released rather than the first three.
+-- ---------------------------------------------------------------------------
+local function shutdown()
+  for _, mod in ipairs(modules) do
+    pcall(function() mod.adapter.setWorkAllowed(false) end)
+    pcall(clearInterfaceSlots, mod)
+  end
+end
+
+-- The main loop, as a function so it can be wrapped. It never returns on its
+-- own: the broker runs until it is interrupted or something throws.
+--
+-- The loop body below keeps its original indentation rather than being shifted
+-- in a level. Two hundred lines of pure whitespace change would bury the actual
+-- edits in this file's history for no reading benefit.
+local function mainLoop()
 while true do
   -- 1. Service one inbound message. Very short timeout: returns immediately if a
   --    message is waiting, otherwise yields the CPU for ~10ms and comes back so
@@ -4118,10 +4350,33 @@ while true do
   --    it is already open. Existing work is never interrupted; we simply stop
   --    starting more, so the broker drains to idle and stays there.
   local now = computer.uptime()
+  -- `not nodeFault()` sits here beside the other gates rather than inside
+  -- dispatchBatch, because it is the same kind of condition as the two next to
+  -- it: a reason not to start new work, not a rule about how work is chosen.
   if brokerState.telemetryReady and not ed.open and not edPending
+     and not nodeFault()
      and (now - lastDispatchCheck >= config.dispatchInterval) then
     dispatchBatch()
     lastDispatchCheck = now
   end
 
+end
+end
+
+-- Wrapped, so a throw anywhere in the loop lands here instead of killing the
+-- program outright and leaving the array running. space-pumping/autoPump.lua
+-- has done this since it was written; the broker never did, which is why an
+-- unexpected nil from a component could take six mining modules with it.
+local ok, err = xpcall(mainLoop, debug.traceback)
+
+pcall(shutdown)
+
+if gpu then pcall(function() gpu.setForeground(0xFFFFFF) end) end
+if ok then
+  logger:info("clean shutdown")
+  print("Broker stopped. All modules gated off.")
+else
+  logger:error("CRASH: " .. tostring(err))
+  print("broker-mk3 crashed - all modules gated off and interfaces cleared.")
+  print(tostring(err))
 end
