@@ -150,6 +150,22 @@ modem.open(PORT_COMMAND)   -- inbound: broker -> this node
 -- checks is what makes the two files read alike.
 -- ---------------------------------------------------------------------------
 local function handleMessage(_, _, _, _, _, rawMsg)
+  -- Cheap reject before the expensive part. A modem payload can be any type, so
+  -- the string check is a correctness guard as much as a fast path.
+  if type(rawMsg) ~= "string" then return end
+
+  -- This one earns its keep. The dust watchlist shares this port and carries
+  -- every tracked item with its threshold -- up to ~90 pairs -- and without
+  -- this guard we rebuilt that whole table every 30s purely to discard it.
+  -- That is the exact cost the hw node was given its own port to avoid; the
+  -- reasoning was never applied here. Scanning the raw string allocates
+  -- nothing.
+  --
+  -- An allow-list, not a deny-list: a payload type added later should fall out
+  -- here rather than quietly reach the branch below. A false positive is
+  -- harmless -- it only buys a message the payloadType check then ignores.
+  if not rawMsg:find("NODE_SETTINGS", 1, true) then return end
+
   local ok, msg = pcall(serialization.unserialize, rawMsg)
   if not ok or type(msg) ~= "table" then return end
   if msg.protocol ~= "MEDINA_COMMAND" then return end

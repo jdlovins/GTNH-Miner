@@ -218,6 +218,23 @@ end
 -- on payloadType.
 -- ---------------------------------------------------------------------------
 local function handleMessage(_, _, _, _, _, rawMsg)
+  -- Cheap reject before the expensive part. A modem payload can be any type, so
+  -- the string check is a correctness guard as much as a fast path.
+  if type(rawMsg) ~= "string" then return end
+
+  -- Scanning the raw string allocates nothing; unserializing costs a whole
+  -- table. Worth little on this node -- the big message on this port is the
+  -- watchlist and we want that -- but it keeps JOB_ASSIGN broadcasts out in a
+  -- multi-node fleet, and it matches fluid_telem.lua, where the same guard is
+  -- what stops that node rebuilding our watchlist every 30s just to drop it.
+  --
+  -- An allow-list, not a deny-list: a payload type added later should fall out
+  -- here rather than quietly reach the branches below. A false positive is
+  -- harmless -- it only buys a message the payloadType checks then route
+  -- correctly anyway.
+  if not (rawMsg:find("DUST_WATCHLIST", 1, true)
+       or rawMsg:find("NODE_SETTINGS", 1, true)) then return end
+
   local ok, msg = pcall(serialization.unserialize, rawMsg)
   if not ok or type(msg) ~= "table" then return end
   if msg.protocol ~= "MEDINA_COMMAND" then return end

@@ -59,7 +59,19 @@ local droneVoltages = {
 }
 
 modem.setStrength(400)
-modem.open(2026)  -- telemetry: this node -> broker
+-- Only 2025 is opened. modem.open() is what makes a port RECEIVE; broadcasting
+-- needs nothing opened, which is why the dust and fluid nodes have always sent
+-- on 2026 while opening only their command port.
+--
+-- This node used to open 2026 as well, labelled "telemetry: this node ->
+-- broker" -- which is the misconception. The effect was that every DUST_UPDATE,
+-- HW_UPDATE and FLUID_UPDATE broadcast in the fleet was queued as an event
+-- here, woke the loop out of event.pull, and was thrown away on the port check
+-- below. That is the irregular-cadence problem described in the header note:
+-- the traffic waking this loop was traffic it had asked for by mistake.
+--
+-- Nothing is sent TO this node on 2026, so nothing is lost. If that ever
+-- changes, open it deliberately and add a payloadType guard with it.
 modem.open(2025)  -- commands from the broker aimed at this node (DRILL_PAR)
 gpu.setResolution(80, 25)
 
@@ -111,11 +123,13 @@ local drillDisplayNames = {
 --  1. An in-flight craft has not landed in the network yet, so the deficit stays
 --     positive for as long as it runs. Without the `orders` guard below we would
 --     re-issue the same request every cycle and bury the crafting CPUs.
---  2. This loop does NOT actually tick every 10s. event.pull(10, ...) returns
---     early on any modem traffic on any open port, and two other telem nodes
---     broadcast on 2026 continuously -- so iterations are frequent and
---     irregular. Every rate limit here is therefore wall-clock
---     (computer.uptime()), never a loop counter.
+--  2. This loop does not tick on a reliable period. event.pull(10, ...) returns
+--     early on any modem traffic on an OPEN port, plus key presses. It used to
+--     be far worse: this node also opened 2026, so all three telem nodes'
+--     continuous broadcasts woke it. That open was unnecessary -- sending does
+--     not require it -- and is gone, leaving only the broker's occasional
+--     DRILL_PAR on 2025. Iterations are still not evenly spaced, so every rate
+--     limit here remains wall-clock (computer.uptime()), never a loop counter.
 -- =============================================================================
 
 -- label -> { min, batch }, as last published by the broker. Empty until it
@@ -757,6 +771,10 @@ while true do
   elseif ev[1] == "modem_message" then
     -- Query received on port 2025
     local _, _, senderAddr, port, _, rawMsg = table.unpack(ev)
+    -- Belt and braces now that 2026 is not opened: nothing else should reach
+    -- this node, and the two payload types that do are both wanted, so there is
+    -- no string guard here of the kind dust_telem and fluid_telem carry. The
+    -- port check already does that job, more cheaply and more exactly.
     if port == 2025 then
       local ok, msg = pcall(serialization.unserialize, rawMsg)
       if ok and msg and msg.protocol == "MEDINA_COMMAND" then
