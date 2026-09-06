@@ -475,3 +475,30 @@ label correction.
 
 `user_config.lua` is optional. Without it the shipped defaults apply exactly as
 before, so a fresh install needs nothing extra.
+
+### Migrating drill settings out of a hand-edited config.lua
+
+Drill settings used to be the one thing you had to edit in `config.lua` itself,
+and `install-medina` wgets that file straight over the top. If you tuned
+`drillPar` or the load buffer there, carry them across **before** updating:
+
+```bash
+migrate_drill --dry
+```
+
+That reads `/home/config.lua`, lists every drill setting that differs from the
+shipped defaults, and shows the `user_config.lua` it would write. Drop `--dry` to
+write it. Only differences are migrated — a value matching the shipped default is
+left alone so it keeps following `config.lua`.
+
+Already updated? The installer copies your old file to `/home/config.lua.bak`
+first, so point the script at that instead:
+
+```bash
+migrate_drill /home/config.lua.bak
+```
+
+It merges into an existing `user_config.lua` rather than replacing it, keeping
+what you track and any mappings you added (and saving a `.bak` of that too). This
+is a one-time bridge — afterwards, change drill settings in the editor with `E`
+then `d`.
