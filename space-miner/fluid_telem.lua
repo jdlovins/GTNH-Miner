@@ -5,10 +5,14 @@
 --          renders a status dashboard and broadcasts all plasma volumes to
 --          the broker so it can make plasma selection decisions.
 --
--- Like the dust node, this one carries no policy, no config.lua and no config
--- file of any kind. The two port numbers and the plasma tier list are written
--- at the top; the scan interval, modem strength and dashboard state are pushed
--- by the broker. See SETTINGS.md.
+-- This node holds NO policy and needs NO config file. How often it scans and how
+-- far it talks arrive from the broker; the only things written down here are the
+-- pair of port numbers it cannot be told over the air and the five plasma tier
+-- names. It deliberately does not load config.lua.
+--
+-- Laid out to the same skeleton as dust_telem.lua -- wiring, hardware, settings,
+-- inbound, scanning, dashboard, main loop -- so that knowing one node means
+-- knowing the other.
 --
 -- OpenComputers Sides Reference Matrix:
 --   0 = Bottom / Down (-Y) | 1 = Top / Up (+Y) | 2 = North (-Z)
@@ -26,10 +30,14 @@ local computer      = require("computer")
 --
 -- The only things this node cannot be told over the air. OpenComputers makes
 -- you modem.open() an explicit port number, so a node cannot discover which
--- port to listen on -- it has to know.
+-- port to listen on -- it has to know. That makes these two integers
+-- irreducible, and they are almost the entire local configuration of this
+-- machine.
 --
--- These must match config.ports on the broker. dust_telem.lua and hw_telem.lua
+-- They must match config.ports on the broker. dust_telem.lua and hw_telem.lua
 -- carry the same pair for the same reason; SETTINGS.md lists all four places.
+-- Change them together, or this node simply never hears anything -- which the
+-- status line shows as a settings source stuck on "defaults".
 -- ---------------------------------------------------------------------------
 local PORT_TELEMETRY = 2026   -- outbound: this node -> broker
 local PORT_COMMAND   = 2027   -- inbound:  broker -> this node
@@ -48,6 +56,7 @@ local PLASMA_ORDER = {
 -- Cold-start values, and the schema for what a push may contain: applySettings
 -- accepts a key only if it already appears here, with the same type. Replaced
 -- by the cache on boot and by the broker's NODE_SETTINGS whenever it arrives.
+-- The broker's defaults for these live in settings.lua; see SETTINGS.md.
 local settings = {
   fluidScanInterval = 10,
   wirelessStrength  = 400,
@@ -59,6 +68,10 @@ local SETTINGS_CACHE = "/home/node_settings.lua"
 -- Where the values above came from, for the status line. A node still showing
 -- "defaults" long after boot is not hearing the broker.
 local settingsSource = "defaults"
+
+-- ---------------------------------------------------------------------------
+-- HARDWARE
+-- ---------------------------------------------------------------------------
 
 if not component.isAvailable("modem")         then error("Missing network card.") end
 if not component.isAvailable("me_controller") then error("Missing ME Controller.") end
@@ -79,8 +92,11 @@ local nodeName = "MEDINA-FluidRelay"
 -- Accept only keys this node already holds, and only with the same type. A
 -- broadcast does not get to invent keys or hand a string to something used as
 -- a number -- `settings` above is the schema as well as the defaults. The
--- broker sends the same payload to every node, so the keys meant for the dust
--- node are filtered out here simply by not appearing above.
+-- broker sends one payload to every node, so the keys meant for the dust node
+-- are filtered out here simply by not appearing above.
+--
+-- Returns how many values actually moved, so a caller can skip re-applying
+-- side effects (modem strength) when a re-broadcast changed nothing.
 -- ---------------------------------------------------------------------------
 local function applySettings(values)
   if type(values) ~= "table" then return 0 end
@@ -120,12 +136,84 @@ end
 
 modem.setStrength(settings.wirelessStrength)
 gpu.setResolution(80, 25)
-modem.open(PORT_COMMAND)   -- inbound: broker -> this node (settings)
+modem.open(PORT_COMMAND)   -- inbound: broker -> this node
 
--- Row positions in the display. Built from PLASMA_ORDER so the five names exist
+-- ---------------------------------------------------------------------------
+-- INBOUND
+-- Accept pushes from the broker: the node settings that say how often to scan
+-- and how far to talk. Cached so the next restart does not have to wait for the
+-- broker to come back.
+--
+-- Same guard ladder as dust_telem.lua -- unserialize, protocol, then dispatch
+-- on payloadType -- even though only one payload type matters here. The dust
+-- watchlist lands on this port too, and dispatching rather than combining the
+-- checks is what makes the two files read alike.
+-- ---------------------------------------------------------------------------
+local function handleMessage(_, _, _, _, _, rawMsg)
+  local ok, msg = pcall(serialization.unserialize, rawMsg)
+  if not ok or type(msg) ~= "table" then return end
+  if msg.protocol ~= "MEDINA_COMMAND" then return end
+
+  if msg.payloadType == "NODE_SETTINGS" then
+    -- An empty or malformed push is ignored outright rather than resetting a
+    -- working node to its defaults.
+    if type(msg.data) ~= "table" or not next(msg.data) then return end
+    settingsSource = "broker"
+    if applySettings(msg.data) > 0 then
+      saveSettingsCache()
+      -- Strength is the only setting with a side effect to re-apply. The scan
+      -- interval is read live by the wait loop, so a change to it lands
+      -- immediately even mid-wait.
+      modem.setStrength(settings.wirelessStrength)
+    end
+    return
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- SCANNING
+-- ---------------------------------------------------------------------------
+
+-- Reused rather than rebuilt: this runs every few seconds forever, and the set
+-- of keys never changes.
+local volumes = {}
+
+local function scanPlasmaStock()
+  -- Keyed off PLASMA_ORDER, not the dashboard's row map: what to look for is a
+  -- scanning concern, and this way the scan still works with the dashboard off.
+  for _, name in ipairs(PLASMA_ORDER) do volumes[name] = 0 end
+
+  local highestVolume  = 0
+  local dominantPlasma = ""
+
+  local success, networkFluids = pcall(me_ctrl.getFluidsInNetwork)
+  if success and networkFluids then
+    for _, fluid in ipairs(networkFluids) do
+      if fluid and fluid.label and volumes[fluid.label] ~= nil then
+        volumes[fluid.label] = fluid.amount
+      end
+    end
+    -- Find the highest-tier plasma that has stock (PLASMA_ORDER is descending tier)
+    for _, plasmaName in ipairs(PLASMA_ORDER) do
+      if (volumes[plasmaName] or 0) > 0 then
+        dominantPlasma = plasmaName
+        highestVolume  = volumes[plasmaName]
+        break
+      end
+    end
+  end
+
+  return volumes, dominantPlasma, highestVolume
+end
+
+-- ---------------------------------------------------------------------------
+-- DASHBOARD
+-- ---------------------------------------------------------------------------
+
+-- Row positions in the display, built from PLASMA_ORDER so the five names exist
 -- in exactly one place on this machine -- they used to be written out here as
 -- well, which is two lists to keep in step for no gain.
-local rowMap  = {}
+local rowMap   = {}
 local rowFirst = 6
 for i, name in ipairs(PLASMA_ORDER) do
   -- PLASMA_ORDER is highest tier first; the dashboard has always read lowest
@@ -178,6 +266,8 @@ local function updateDashboard(plasmaVolumes, dominant, dominantVolume)
     term.setCursor(18, 15) io.write("0 mB")
   end
 
+  -- Where the settings came from and what they currently say, so a node that is
+  -- not hearing the broker is visible at a glance rather than by inference.
   gpu.setForeground(0x555555)
   term.setCursor(2, 4)
   io.write(string.format("settings: %-8s   scan: %ds   ", settingsSource,
@@ -186,56 +276,15 @@ local function updateDashboard(plasmaVolumes, dominant, dominantVolume)
   io.write("LAST_SYNC: " .. os.date("%X"))
 end
 
--- Reused rather than rebuilt: this runs every few seconds forever, and the set
--- of keys never changes.
-local volumes = {}
-
-local function scanPlasmaStock()
-  for name in pairs(rowMap) do volumes[name] = 0 end
-
-  local highestVolume  = 0
-  local dominantPlasma = ""
-
-  local success, networkFluids = pcall(me_ctrl.getFluidsInNetwork)
-  if success and networkFluids then
-    for _, fluid in ipairs(networkFluids) do
-      if fluid and fluid.label and volumes[fluid.label] ~= nil then
-        volumes[fluid.label] = fluid.amount
-      end
-    end
-    -- Find the highest-tier plasma that has stock (PLASMA_ORDER is descending tier)
-    for _, plasmaName in ipairs(PLASMA_ORDER) do
-      if (volumes[plasmaName] or 0) > 0 then
-        dominantPlasma = plasmaName
-        highestVolume  = volumes[plasmaName]
-        break
-      end
-    end
-  end
-
-  return volumes, dominantPlasma, highestVolume
-end
-
-local function handleMessage(_, _, _, _, _, rawMsg)
-  local ok, msg = pcall(serialization.unserialize, rawMsg)
-  if not ok or type(msg) ~= "table" then return end
-  if msg.protocol ~= "MEDINA_COMMAND" or msg.payloadType ~= "NODE_SETTINGS" then return end
-  -- An empty or malformed push is ignored outright rather than resetting a
-  -- working node to its defaults.
-  if type(msg.data) ~= "table" or not next(msg.data) then return end
-  settingsSource = "broker"
-  if applySettings(msg.data) > 0 then
-    saveSettingsCache()
-    -- Strength is the only setting with a side effect to re-apply; the scan
-    -- interval is read live by the wait loop at the bottom.
-    modem.setStrength(settings.wirelessStrength)
-  end
-end
+-- ---------------------------------------------------------------------------
+-- MAIN LOOP
+-- ---------------------------------------------------------------------------
 
 if settings.nodeDashboard then drawStaticFrame() end
 
 while true do
   local plasmaVolumes, dominant, dominantVolume = scanPlasmaStock()
+
   if settings.nodeDashboard then
     updateDashboard(plasmaVolumes, dominant, dominantVolume)
   end
@@ -247,10 +296,14 @@ while true do
     data        = { plasmas = plasmaVolumes }
   }))
 
-  -- Was os.sleep(10), which meant a settings push sat in the queue for up to a
-  -- full interval and, worse, that this node could not be reconfigured at all
-  -- while it slept. Short hops instead, with the interval read on each one so a
-  -- change lands during the very wait it arrived in.
+  -- Wait out the scan interval in short hops so a push is picked up promptly
+  -- instead of a whole interval late. The interval is read on every hop rather
+  -- than turned into a deadline up front, so a push that shortens it takes
+  -- effect during the very wait it arrived in.
+  --
+  -- This was os.sleep(10), which meant a settings push sat in the queue for up
+  -- to a full interval and, worse, that this node could not be reconfigured at
+  -- all while it slept.
   local waitFrom = computer.uptime()
   while computer.uptime() - waitFrom < settings.fluidScanInterval do
     local ev = { event.pull(0.5, "modem_message") }

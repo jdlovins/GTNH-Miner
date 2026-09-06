@@ -13,6 +13,10 @@
 -- direct cause of this node's out-of-memory failures, and not one line of it
 -- was read here.
 --
+-- Laid out to the same skeleton as fluid_telem.lua -- wiring, hardware,
+-- settings, inbound, scanning, dashboard, main loop -- so that knowing one node
+-- means knowing the other.
+--
 -- OpenComputers Sides Reference Matrix:
 --   0 = Bottom / Down (-Y) | 1 = Top / Up (+Y) | 2 = North (-Z)
 --   3 = South (+Z)         | 4 = West (-X)     | 5 = East (+X)
@@ -55,6 +59,10 @@ local SETTINGS_CACHE = "/home/node_settings.lua"
 -- Where the values above came from, for the status line. A node still showing
 -- "defaults" long after boot is not hearing the broker.
 local settingsSource = "defaults"
+
+-- ---------------------------------------------------------------------------
+-- HARDWARE
+-- ---------------------------------------------------------------------------
 
 if not component.isAvailable("modem") then error("Missing network card.") end
 if not component.isAvailable("gpu")   then error("Requires GPU.")         end
@@ -100,7 +108,9 @@ local nodeName = "MEDINA-DustRelay"
 --
 -- Accept only keys this node already holds, and only with the same type. A
 -- broadcast does not get to invent keys or hand a string to something used as
--- a number -- `settings` above is the schema as well as the defaults.
+-- a number -- `settings` above is the schema as well as the defaults. The
+-- broker sends one payload to every node, so the keys meant for the fluid node
+-- are filtered out here simply by not appearing above.
 --
 -- Returns how many values actually moved, so a caller can skip re-applying
 -- side effects (modem strength) when a re-broadcast changed nothing.
@@ -198,9 +208,15 @@ do
   end
 end
 
+-- ---------------------------------------------------------------------------
+-- INBOUND
 -- Accept pushes from the broker: the watchlist, and the node settings that say
 -- how often to scan and how far to talk. Both are cached so the next restart
 -- does not have to wait for the broker to come back.
+--
+-- Same guard ladder as fluid_telem.lua -- unserialize, protocol, then dispatch
+-- on payloadType.
+-- ---------------------------------------------------------------------------
 local function handleMessage(_, _, _, _, _, rawMsg)
   local ok, msg = pcall(serialization.unserialize, rawMsg)
   if not ok or type(msg) ~= "table" then return end
@@ -226,6 +242,10 @@ local function handleMessage(_, _, _, _, _, rawMsg)
   applyWatchlist(msg.data, "broker")
   saveWatchlist(msg.data)
 end
+
+-- ---------------------------------------------------------------------------
+-- SCANNING
+-- ---------------------------------------------------------------------------
 
 -- Last scan's outcome, for the status line. A failed query and a genuinely
 -- empty network both used to render as an all-red board of zeroes, which is
@@ -290,6 +310,10 @@ local function buildSortedList()
   return sorted
 end
 
+-- ---------------------------------------------------------------------------
+-- DASHBOARD
+-- ---------------------------------------------------------------------------
+
 local function drawStaticFrame()
   term.clear()
   gpu.setForeground(0x00FF00)
@@ -329,6 +353,9 @@ local function updateDashboard(list)
       io.write(string.format("  %-29s  %20s  %3d%%", item.name, stockTarget, pct))
     end
   end
+  -- Where the watchlist and settings came from and what they currently say, so
+  -- a node that is not hearing the broker is visible at a glance rather than by
+  -- inference.
   gpu.setForeground(0x555555)
   term.setCursor(2, 4)
   io.write(string.format("watchlist: %-8s (%d items)   settings: %-8s   scan: %ds   ",
@@ -358,6 +385,10 @@ local function updateDashboard(list)
       scanState.seen, scanState.matched, math.floor(computer.freeMemory() / 1024)))
   end
 end
+
+-- ---------------------------------------------------------------------------
+-- MAIN LOOP
+-- ---------------------------------------------------------------------------
 
 if settings.nodeDashboard then drawStaticFrame() end
 
