@@ -403,6 +403,13 @@ local function drawStaticFrame()
   term.setCursor(2, 24) io.write("  Network Port: 2026")
 end
 
+-- OpenComputers' sandbox does not hand the Lua `collectgarbage` global to the
+-- script -- the host decides when to collect -- so calling it directly kills
+-- the node with "attempt to call a nil value". Bind it where it exists and
+-- no-op where it does not: every call below is a hint that now is a good
+-- moment, never something the logic depends on.
+local gc = type(collectgarbage) == "function" and collectgarbage or function() end
+
 -- =============================================================================
 -- NETWORK SCAN
 --
@@ -465,7 +472,7 @@ do
   local ok, items = pcall(me.getItemsInNetwork, { label = drillLabels[1] })
   useFilter = ok and type(items) == "table" and #items <= FILTER_SANE_MAX
   items = nil
-  collectgarbage()
+  gc()
 end
 
 -- Why the counts look the way they do, for the status line. A failed query and
@@ -499,7 +506,7 @@ end
 -- lands, and treat the failure as a failed scan instead of letting it kill the
 -- node -- a dashboard reporting "SCAN FAILED" is far more use than a dead one.
 local function scanFull()
-  collectgarbage()
+  gc()
   local assets = newAssets()
 
   local success, itemList = pcall(me.getItemsInNetwork)
@@ -526,7 +533,7 @@ local function scanFull()
 
   -- Drop the list before anything else allocates against it.
   itemList = nil
-  collectgarbage()
+  gc()
   scanState = { ok = true, mode = "full", err = nil }
   return assets
 end
@@ -727,7 +734,7 @@ while true do
   -- them while we are idle anyway keeps the heap floor steady instead of
   -- letting it drift up until an unlucky cycle has nowhere to allocate.
   payload = nil
-  collectgarbage()
+  gc()
 
   -- Listen for Ctrl+C or broker commands (10s timeout).
   --
