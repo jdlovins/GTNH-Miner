@@ -506,8 +506,15 @@ OpenComputers' per-tick component call budget, so it is least responsive exactly
 when the broker is busiest — quiescing first is what makes it fast. Work in
 flight is never interrupted, which is why this is a countdown rather than a
 pause: freezing the scheduler would let loader timeouts expire against the wall
-clock and fail a load that was fine. `esc` cancels the countdown, and dispatch
-stays suspended for as long as the editor is open.
+clock and fail a load that was fine. `tab` or `q` cancels the countdown, and
+dispatch stays suspended for as long as the editor is open.
+
+**Escape does nothing, anywhere in the editor.** Minecraft closes the screen GUI
+on escape, so the keypress never reaches the program — `tab` is the cancel key
+everywhere, and `q` or `backspace` also go back when you are in a list rather
+than typing. Closing with unsaved edits is refused once and tells you how many
+you have; a second CLOSE discards them. Nothing you change is written or applied
+until you press `s`.
 
 Four pages:
 

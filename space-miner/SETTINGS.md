@@ -13,8 +13,18 @@ needed a number.
 
 **You should not need to edit any of this by hand.** Press `E` on the broker,
 then `g` for the settings page. Booleans toggle with `space`, choices cycle
-with `space`, numbers are typed with `t` or `enter`. `s` saves, and everything
-takes effect live.
+with `space`, numbers are typed with `t` or `enter`. `c` narrows the page to
+just the knobs you have changed from shipped. `s` saves, and everything takes
+effect live.
+
+`tab` cancels — a prompt you are typing into, a filter, or a page you want to
+back out of. **Not escape:** Minecraft closes the screen GUI on escape, so the
+keypress never reaches the broker. In a list (not a prompt) `q` and `backspace`
+also go back, and the OK / CANCEL buttons are clickable while a prompt is open.
+
+Nothing you change is written or applied until you press `s`, so the editor
+counts what is pending in its top line and refuses the first CLOSE that would
+throw work away.
 
 Changes are written to `/home/user_config.lua`, which updates never overwrite.
 `config.lua` is shipped data and gets regenerated wholesale.
@@ -66,28 +76,48 @@ has started competing for the call budget once more.
 
 ### `reserveWhileMining`
 
-Charge a drone and a full load of kits to **every** working module.
+Stop trusting the hw node's sweep timestamp when deciding what is free.
 
-Dispatch normally works from a pool of what is free right now: telemetry
-reports what the staging ME holds, and commitments the last sweep could not have
-seen yet are subtracted by hand. A module that has been mining long enough for a
-sweep to run is *not* subtracted, because the ME no longer lists its drone —
-charging it again would count the same drone twice.
+Dispatch works from a pool of what is free right now: telemetry reports what the
+staging ME holds, and commitments the last sweep could not have seen yet are
+subtracted by hand. A module that has been mining long enough for a sweep to run
+is *not* subtracted, because the ME no longer lists its drone — charging it
+again would count the same drone twice.
 
-That trusts telemetry to be current. Turn this on and the trust goes away: a
-working module costs its drone and its `tipsPerLoad`/`rodsPerLoad` of kits for
-as long as it is working, whatever the ME says. Nothing in stock can be promised
-to two modules on the strength of a stale sweep.
+This setting used to mean "charge every working module regardless", and that was
+the double-count it exists to describe. With one UHV drone and one UHV module
+mining, the reported stock was already 0 and the extra charge took the pool to
+−1, so the tier stopped dispatching. Worse, the deficit survived a restock: two
+LuV busy and a third arriving from crafting read as 1 − 2 = −1, and a genuinely
+free drone would not go out.
 
-The price is a standing spare per busy module — five modules mining means five
-drones held out of the pool — and, if commitments ever outnumber reported stock,
-a pool that goes negative and stops dispatching that tier entirely. That is the
-failure this was made optional to fix, so it is **off by default**.
+**It no longer does that.** A commitment is charged only while the sweep has yet
+to see it, in both modes — that arithmetic is simply correct, and promising one
+drone to two modules is prevented by the per-sweep decrements in the assignment
+loop, not by over-charging. What this setting now changes is the *fallback*: if
+the hw node has been quiet for more than 30 s, its figure is stale rather than
+merely between sweeps, so nothing counts as seen and every commitment is charged
+again. That is the conservative direction, and it is the case the option is for.
 
 Turn it on if you do not trust the hw node's figures, or if you have watched two
 modules argue over one physical drone. A module blocked this way does not idle:
 dispatch moves on to the next need, so it takes a different asteroid it *can*
 reach rather than waiting.
+
+**Reading the hardware panel.** `DRONES IN STOCK` shows what the ME held at the
+last sweep and, when the two differ, what dispatch can actually use:
+
+```
+  MK-VI (LuV)         x2  (1 free)
+  MK-IX (UHV)         x1  (0 free)
+```
+
+The columns disagreeing is normal and informative. Stock lags by up to a scan
+interval (~10 s), so a drone pulled a moment ago still shows in stock — the free
+column is right immediately. `x0 (1 free)` is a drone held by a finished module
+under `fastReload`: physically in that module's bus so the ME cannot see it, but
+owned and dispatchable. Amber means the tier is owned with none free, which is a
+different state from owning none at all.
 
 ### `fastReload` and `holdTimeout`
 

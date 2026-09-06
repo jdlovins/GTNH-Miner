@@ -1204,7 +1204,12 @@ local function preferHolder(pool, droneKey)
   return nil
 end
 
-local function tryDispatch(mod, asteroid, droneKey)
+-- `avail` / `availKit` are the batch's working pools. They are REQUIRED, not
+-- optional: this used to gate on brokerState.drones -- the raw ME figure -- which
+-- meant the commitment point ignored reservations entirely and only worked
+-- because both callers happened to check the pool first. Passing them in makes
+-- the gate and the accounting the same numbers.
+local function tryDispatch(mod, asteroid, droneKey, avail, availKit)
   local asteroidData = config.asteroids[asteroid]
   if not asteroidData then return false end
   if not droneKey then return false end
@@ -1229,13 +1234,32 @@ local function tryDispatch(mod, asteroid, droneKey)
   -- another set: the drone never left, and the loader only fetches whatever
   -- consumables it is actually short of.
   local holds = moduleHolds(mod, droneKey, drillKey)
-  if not holds and (brokerState.drones[droneKey] or 0) <= 0 then return false end
-
-  -- Don't dispatch if we don't have enough drill kits for a full load.
-  -- The loader needs config.tipsPerLoad tips + config.rodsPerLoad rods per module.
-  local drill = brokerState.drills[drillKey]
   local minKits = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
-  if not holds and (not drill or (drill.kits or 0) < minKits) then return false end
+
+  -- TWO GATES, AND THEY ASK DIFFERENT QUESTIONS.
+  --
+  -- The pool says whether this drone is still unpromised: it is the ME figure
+  -- minus commitments the last sweep has not seen, plus what idle modules are
+  -- holding. That is the reservation, and it is what reserveWhileMining moves.
+  --
+  -- The raw ME figure says whether the drone can actually be FETCHED. Those come
+  -- apart for a held drone: the pool counts it as owned (correctly -- it exists),
+  -- but it is sitting in one module's input bus, so a DIFFERENT module cannot
+  -- load it. Without the second gate that phantom gets handed to whoever is next
+  -- in pool order, the loader waits out ARRIVE_TIMEOUT for a drone the network
+  -- does not have, and the module lands in ERROR.
+  --
+  -- A module that holds the hardware needs neither: the drone never left it, and
+  -- the loader only fetches what it is short of.
+  if not holds then
+    if (avail[droneKey] or 0) <= 0 then return false end
+    if (brokerState.drones[droneKey] or 0) <= 0 then return false end
+
+    -- Same pair for kits: enough unpromised, and enough actually in the network.
+    if (availKit[drillKey] or 0) < minKits then return false end
+    local drill = brokerState.drills[drillKey]
+    if not drill or (drill.kits or 0) < minKits then return false end
+  end
 
   local jobId = nodeId .. "-" .. math.floor(computer.uptime() * 1000) .. "-M" .. mod.index
   mod.lastDispatchAt = computer.uptime()   -- fairness ordering, see dispatchBatch
@@ -1293,10 +1317,21 @@ end
 -- module is charged for its drone and kits however long ago telemetry saw them.
 -- That reintroduces the standing tax described above on purpose, for setups
 -- where the hw node's figures cannot be trusted to be current.
-local function telemetryHasSeen(mod)
+-- hw_telem scans and broadcasts once per loop around a 10s event.pull, so a
+-- figure older than this means the node has genuinely stopped reporting rather
+-- than merely being between sweeps.
+local HW_STALE = 30
+
+local function telemetryHasSeen(mod, strict)
   local at = mod.job and mod.job.dispatchedAt
   if not at then return true end   -- pre-existing job from before this field
-  return at <= (brokerState.lastHWSyncTime or 0)
+  local sync = brokerState.lastHWSyncTime or 0
+  -- What reserveWhileMining still buys, now that it no longer double-charges.
+  -- If the hw node has gone quiet the FIGURE is old, so no commitment counts as
+  -- seen however long ago it was made, and every one is charged again. That is
+  -- the conservative direction and it is the case the setting exists for.
+  if strict and (computer.uptime() - sync) > HW_STALE then return false end
+  return at <= sync
 end
 
 -- How many of each drone are actually free to assign right now?
@@ -1308,12 +1343,39 @@ local function availableDrones(strict)
   local avail = {}
   for key, count in pairs(brokerState.drones) do avail[key] = count end
   for _, mod in ipairs(modules) do
+    -- CHARGE ONLY WHAT THE SWEEP HAS NOT SEEN.
+    --
+    -- This used to read `strict or not telemetryHasSeen(mod)`, which charged
+    -- every busy module under reserveWhileMining -- including the ones the ME
+    -- figure had ALREADY stopped counting, because their drone is sitting in a
+    -- bus. That is a double subtraction, and it is what "forgot a drone" was:
+    -- two LuV busy and a third finishing a craft read as 1 - 2 = -1, so a
+    -- genuinely free drone would not dispatch. Flooring the result at zero does
+    -- not help, since -1 and 0 both mean "cannot dispatch" -- the count itself
+    -- had to stop being wrong.
+    --
+    -- Promising the same drone to two modules in one sweep is prevented by the
+    -- batch-local decrements in assignOne and tryDispatchPinned, not by this.
     if mod.status ~= "IDLE" and mod.job and mod.job.droneKey
-       and (strict or not telemetryHasSeen(mod)) then
+       and not telemetryHasSeen(mod, strict) then
       local k = mod.job.droneKey
       avail[k] = (avail[k] or 0) - 1
     end
+    -- A HELD DRONE IS OWNED. With fastReload a finished module keeps its drone
+    -- and goes IDLE with job = nil, so it is charged by nothing above -- and the
+    -- ME cannot see it either, because it is physically in the bus. Without this
+    -- it exists nowhere in the model until releaseStaleHold fires.
+    --
+    -- dispatchBatch used to add this back to its own local copy. That is gone;
+    -- doing it here is what lets the hardware panel see holds too, and keeping
+    -- both would credit every hold twice.
+    if config.fastReload and mod.holding and mod.holding.droneKey then
+      local k = mod.holding.droneKey
+      avail[k] = (avail[k] or 0) + 1
+    end
   end
+  -- Nothing downstream should have to reason about a negative pool.
+  for k, v in pairs(avail) do if v < 0 then avail[k] = 0 end end
   return avail
 end
 
@@ -1321,19 +1383,62 @@ end
 -- config.tipsPerLoad / rodsPerLoad, not one kit. Subtracting 1 under-counted an
 -- unseen commitment by that whole factor, which every other site in this file
 -- already charges in full.
+-- Same three changes as availableDrones, for the same reasons: charge only what
+-- the sweep has not seen, credit what a module is holding, and never return a
+-- negative.
 local function availableKits(strict)
   local perLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
   local avail = {}
   for key, d in pairs(brokerState.drills) do avail[key] = (d and d.kits) or 0 end
   for _, mod in ipairs(modules) do
     if mod.status ~= "IDLE" and mod.job and mod.job.drillKey
-       and (strict or not telemetryHasSeen(mod)) then
+       and not telemetryHasSeen(mod, strict) then
       local k = mod.job.drillKey
       avail[k] = (avail[k] or 0) - perLoad
     end
+    if config.fastReload and mod.holding and mod.holding.drillKey then
+      local k = mod.holding.drillKey
+      avail[k] = (avail[k] or 0) + perLoad
+    end
   end
+  for k, v in pairs(avail) do if v < 0 then avail[k] = 0 end end
   return avail
 end
+
+-- ---------------------------------------------------------------------------
+-- THE POOLS, FOR ANYONE WHO IS NOT DISPATCHING
+--
+-- The hardware panel wants the same numbers dispatch uses, but it repaints on
+-- uiInterval (0.1s by default) and rebuilding both tables per frame would walk
+-- every module and every telemetry key ten times a second for a readout that
+-- only changes when something is dispatched or a sweep lands.
+--
+-- Cached against a stamp that moves on exactly those events, the way dustList
+-- caches against edGen. Dispatch itself never calls this: it needs tables it can
+-- decrement as it assigns, so it keeps building its own.
+--
+-- ONE TABLE RATHER THAN SIX LOCALS, because the main chunk is at Lua's 200-local
+-- ceiling and this file is the reason. See the K table near the editor.
+-- ---------------------------------------------------------------------------
+local POOL = { stamp = nil, drones = nil, kits = nil }
+
+function POOL.refresh()
+  local parts = { tostring(brokerState.lastHWSyncTime or 0) }
+  for _, mod in ipairs(modules) do
+    parts[#parts + 1] = mod.status ..
+      (mod.job and mod.job.droneKey or "-") ..
+      (mod.holding and mod.holding.droneKey or "-")
+  end
+  local stamp = table.concat(parts, "|")
+  if stamp ~= POOL.stamp then
+    POOL.stamp  = stamp
+    POOL.drones = availableDrones(config.reserveWhileMining or false)
+    POOL.kits   = availableKits(config.reserveWhileMining or false)
+  end
+end
+
+function POOL.freeDrones() POOL.refresh() return POOL.drones end
+function POOL.freeKits()   POOL.refresh() return POOL.kits   end
 
 -- Per-asteroid module cap: an asteroid may hold at most "half the modules plus
 -- one" at once, so a single high-tier target (e.g. Infinity Catalyst) can take a
@@ -1420,7 +1525,7 @@ local function tryDispatchPinned(mod, avail, availKit, minKitsForLoad)
       if droneTier >= asteroidData.minDrone and droneTier <= asteroidData.maxDrone then
         local drillKey = config.droneDrillMap[droneTier]
         if drillKey and (availKit[drillKey] or 0) >= minKitsForLoad then
-          if tryDispatch(mod, asteroid, droneKey) then
+          if tryDispatch(mod, asteroid, droneKey, avail, availKit) then
             avail[droneKey]    = avail[droneKey] - 1
             availKit[drillKey] = availKit[drillKey] - minKitsForLoad
             return true
@@ -1497,29 +1602,11 @@ local function dispatchBatch()
   local reachAvail    = strict and availableDrones(false) or avail
   local reachAvailKit = strict and availableKits(false)   or availKit
 
-  -- Count what idle modules are still holding as available, because it is: the
-  -- drone is sitting in that module and the loader will not ask the ME for
-  -- another. Without this the outer gates below see zero stock and refuse the
-  -- one dispatch that needs no stock at all.
-  --
-  -- tryDispatch still checks the real ME figures, so a phantom cannot be spent
-  -- by a DIFFERENT module -- it would fail there and the loop moves on.
-  if config.fastReload then
-    for _, m in ipairs(idleModules) do
-      local h = m.holding
-      if h then
-        avail[h.droneKey]    = (avail[h.droneKey] or 0) + 1
-        availKit[h.drillKey] = (availKit[h.drillKey] or 0) + minKitsForLoad
-        -- A held drone is owned as much as a stocked one, so reachability has to
-        -- see it too. Skipped when the tables are the same object, or the add
-        -- would land twice.
-        if reachAvail ~= avail then
-          reachAvail[h.droneKey]    = (reachAvail[h.droneKey] or 0) + 1
-          reachAvailKit[h.drillKey] = (reachAvailKit[h.drillKey] or 0) + minKitsForLoad
-        end
-      end
-    end
-  end
+  -- Held drones and kits used to be credited back here, over this function's
+  -- own copies. availableDrones/availableKits do it now, which fixes two things
+  -- this version could not: a hold on a module trimmed out of idleModules by the
+  -- concurrency cap was never counted, and nothing outside this function -- the
+  -- hardware panel especially -- could see a hold at all.
 
   -- Pinned modules always mine their assigned asteroid, ignoring dust thresholds
   -- and the per-asteroid cap. Handle them first and drop them from the pool so
@@ -1674,7 +1761,7 @@ local function dispatchBatch()
             end
             for _, idx in ipairs(order) do
               local mod = pool[idx]
-              if mod and tryDispatch(mod, asteroidName, droneKey) then
+              if mod and tryDispatch(mod, asteroidName, droneKey, avail, availKit) then
                 astCount[asteroidName] = (astCount[asteroidName] or 0) + 1
                 avail[droneKey]        = avail[droneKey] - 1
                 availKit[drillKey]     = availKit[drillKey] - minKitsForLoad
@@ -2264,15 +2351,33 @@ local function drawHWPanel()
   end
   skip(1)
 
+  -- STOCK AND FREE ARE DIFFERENT NUMBERS, AND THIS PANEL USED TO SHOW ONLY ONE.
+  --
+  -- Stock is what the ME held at the last hw sweep, which is up to a scan
+  -- interval old and never subtracts a thing. Free is what dispatch can actually
+  -- hand out. Reading the first as the second is what made a busy UHV look like
+  -- an idle one -- the drone was already in a module and the figure had simply
+  -- not caught up.
+  --
+  -- Both are shown, and only when they disagree, so the ordinary case stays a
+  -- single number. `x0 (1 free)` is a drone held by a finished module under
+  -- fastReload: the ME cannot see it, the pool can, and that gap is worth
+  -- saying out loud rather than hiding.
+  local freeDrones = POOL.freeDrones()
   put("  DRONES IN STOCK:", 0x888888)
   local any = false
   for _, key in ipairs(config.droneKeyOrder) do
     local count = brokerState.drones[key] or 0
-    if count > 0 then
+    local free  = freeDrones[key] or 0
+    if count > 0 or free > 0 then
       if row > H then break end
       local droneName = config.drones[key] or ("Drone-" .. key)
       local lvl = droneName:match("MK%-(.+)") or "?"
-      put(string.format("  %-18s  x%d", "MK-" .. lvl, count), 0x00FFFF)
+      local line = string.format("  %-18s  x%d", "MK-" .. lvl, count)
+      if free ~= count then line = line .. string.format("  (%d free)", free) end
+      -- Amber when nothing is free: the tier is owned but cannot be dispatched,
+      -- which is a different state from not owning one at all.
+      put(line, (free > 0) and 0x00FFFF or 0xFFAA00)
       any = true
     end
   end
@@ -2281,17 +2386,21 @@ local function drawHWPanel()
   skip(1)
 
   -- Drill kits (a "kit" = one drill tip + one rod of the same material).
+  local freeKits = POOL.freeKits()
   put("  DRILL KITS IN STOCK:", 0x888888)
   local anyDrill = false
   for _, key in ipairs(drillKeyOrder) do
     local d = brokerState.drills[key]
     local kits = (d and d.kits) or 0
-    if kits > 0 then
+    local free = freeKits[key] or 0
+    if kits > 0 or free > 0 then
       if row > H then break end
       -- Display the material name, stripped of " Drill Tip".
       local entry = config.drills[key]
       local name = (entry and entry.tip and entry.tip:gsub(" Drill Tip", "")) or key
-      put(string.format("  %-18s  x%d", name, kits), 0x00AAFF)
+      local line = string.format("  %-18s  x%d", name, kits)
+      if free ~= kits then line = line .. string.format("  (%d free)", free) end
+      put(line, 0x00AAFF)
       anyDrill = true
     end
   end
@@ -2526,8 +2635,17 @@ end
 --
 -- KEYS: up/down/pgup/pgdn/home/end move   enter drill in / commit
 --       space toggle or cycle   t type a value   T step the ladder
---       r reset to shipped      a add downstream item
---       d drills   g settings   / filter   s save   esc back, or close at the top
+--       r reset to shipped      a add downstream item   c changed only
+--       i items   d drills   g settings   / filter   s save
+--       TAB cancel a prompt, or go back -- and q or backspace in a list
+--
+-- NOT escape. Minecraft closes the screen GUI on escape, so the keypress never
+-- reaches this program; the editor advertised it for a long time regardless.
+-- The bindings are declared once in EDKEYS and the on-screen legend is built
+-- from that table, so this class of drift cannot recur silently.
+--
+-- Closing with unsaved edits is refused once and says how many; a second CLOSE
+-- discards them. Nothing here is applied or written until you press s.
 -- =============================================================================
 
 local USER_CONFIG_PATH   = "/home/user_config.lua"
@@ -2572,6 +2690,31 @@ local SET = { spec = config.settingsSpec }
 -- a material on should not commit the base to an expensive unattended craft.
 DRILL.fallback = { tips = 256, rods = 256, batch = 256 }
 
+-- ---------------------------------------------------------------------------
+-- KEYS THAT ACTUALLY REACH US
+--
+-- Escape does not, and that is the whole reason this section exists. In
+-- Minecraft, pressing Escape closes the screen GUI itself: the client eats the
+-- keypress and no key_down event is ever delivered to the program. Every
+-- `code == 1` branch in this editor was unreachable, and three legend strings
+-- advertised it -- so the only way out of a text prompt was to commit a value.
+--
+-- TAB is the universal cancel now, because it is the one key that works in a
+-- text field too: q is something you might legitimately type, and backspace
+-- already means delete-a-character. In list mode q and backspace also go back,
+-- since both are free there and closer to the hand.
+--
+-- Escape stays bound below as an alias. It costs one table entry, and it is
+-- what everyone tries first.
+-- ---------------------------------------------------------------------------
+-- One table, not eleven locals: the main chunk is near Lua's 200-local ceiling
+-- and this file is the reason. Scancodes as OpenComputers delivers them in
+-- ev[4] of a key_down.
+local K = {
+  ESC = 1, BACKSPACE = 14, TAB = 15, ENTER = 28, DELETE = 211,
+  UP = 200, DOWN = 208, PGUP = 201, PGDN = 209, HOME = 199, END_ = 207,
+}
+
 local ed = {
   open = false,
   mode = "asteroids",          -- asteroids | detail | items | drills | settings
@@ -2579,6 +2722,7 @@ local ed = {
   rows = {},                   -- row model for the current mode
   sel = 1, scroll = 0,
   filter = nil, filtering = false,
+  changedOnly = false,         -- settings page: show only knobs that differ from shipped
   input = nil,                 -- { label, buffer, onCommit }
   enabled = {}, threshold = {},-- working copy of config.conditions
   targets = {},                -- working copy of config.dustTargets
@@ -2586,10 +2730,79 @@ local ed = {
   settings = {},               -- working copy of config.settings (every knob)
   added = {},                  -- items newly mapped this session
   msg = "", msgColor = 0x888888,
-  dirty = true,
+  dirty = true,                -- REPAINT flag. Unsaved edits are edDirtyCount().
+  closeArmed = false,          -- a CLOSE was refused for unsaved changes; a second one discards
 }
 
 local function edSay(m, c) ed.msg = m; ed.msgColor = c or 0x888888 end
+
+-- ---------------------------------------------------------------------------
+-- BINDINGS, DECLARED ONCE
+--
+-- edHandle dispatches from this table and the legend at the top of the editor
+-- is BUILT from it, so a binding cannot exist without being advertised, or be
+-- advertised without existing. That is not tidiness for its own sake: the key
+-- dispatch used to be an if/elseif ladder of raw scancodes and the legend three
+-- hand-written strings, they drifted, and the UI ended up telling everyone to
+-- press a key the game never delivers.
+--
+--   char / code  one or the other. `char` is the printable character (ev[3]),
+--                `code` the scancode (ev[4]), matching what edHandle receives.
+--   action       must be a case edAction handles. The test asserts this.
+--   hint         how it appears in the legend. Omit to bind without listing --
+--                that is what the cancel aliases do.
+--   modes        space-separated pages, or "*" for every page.
+--
+-- Navigation (arrows, page up/down, home/end, enter) is deliberately NOT here.
+-- Those are not actions, they have nothing to advertise, and they stay in the
+-- ladder in edHandle.
+-- ---------------------------------------------------------------------------
+local EDKEYS = {
+  { char = 32,  action = "activate", hint = "space=toggle",       modes = "asteroids detail items" },
+  { char = 32,  action = "activate", hint = "space=on/off",       modes = "drills" },
+  { char = 32,  action = "activate", hint = "space=toggle/cycle", modes = "settings" },
+  { char = 116, action = "type",     hint = "t=type amount",      modes = "asteroids detail items" },
+  { char = 116, action = "type",     hint = "t=edit",             modes = "drills" },
+  { char = 116, action = "type",     hint = "t=type",             modes = "settings" },
+  { char = 84,  action = "step",     hint = "T=step",             modes = "asteroids detail items" },
+  { char = 97,  action = "add",      hint = "a=add",              modes = "detail" },
+  { char = 114, action = "reset",    hint = "r=reset",            modes = "settings" },
+  { char = 82,  action = "reset" },
+  { char = 99,  action = "changed",  hint = "c=changed only",     modes = "settings" },
+  { char = 105, action = "items",    hint = "i=items",            modes = "asteroids detail" },
+  { char = 100, action = "drills",   hint = "d=drills",           modes = "asteroids detail items" },
+  { char = 103, action = "settings", hint = "g=settings",         modes = "drills" },
+  { char = 47,  action = "find",     hint = "/=find",             modes = "*" },
+  { char = 115, action = "save",     hint = "s=save",             modes = "*" },
+  -- Cancel. Tab is the one that is listed; the rest are aliases people try.
+  { code = K.TAB,       action = "back", hint = "tab=back", modes = "*" },
+  { code = K.BACKSPACE, action = "back" },
+  { code = K.ESC,       action = "back" },
+  { char = 113,         action = "back" },   -- q
+  { char = 81,          action = "back" },   -- Q
+}
+
+local function edBindingFor(ch, code)
+  for _, b in ipairs(EDKEYS) do
+    if (b.char and ch == b.char) or (b.code and code == b.code) then
+      if b.modes == nil or b.modes == "*" or b.modes:find(ed.mode, 1, true) then
+        return b
+      end
+    end
+  end
+  return nil
+end
+
+-- The legend, assembled from the same table the dispatch reads.
+local function edLegend()
+  local parts = {}
+  for _, b in ipairs(EDKEYS) do
+    if b.hint and (b.modes == "*" or (b.modes and b.modes:find(ed.mode, 1, true))) then
+      parts[#parts + 1] = b.hint
+    end
+  end
+  return table.concat(parts, "  ")
+end
 
 local function edRows()  return H - 6 end   -- rows 5 .. H-2 hold the list
 local function edFirst() return 5 end
@@ -2624,6 +2837,78 @@ local function edLoad()
   -- different pending values depending on where you looked at it.
   ed.settings = {}
   for key, value in pairs(config.settings) do ed.settings[key] = value end
+end
+
+-- ---------------------------------------------------------------------------
+-- HOW MUCH WOULD CLOSING THROW AWAY?
+--
+-- Every edit in this editor lands in a working copy above and NOWHERE ELSE
+-- until edSave runs -- edSave is what writes user_config.lua and what applies
+-- the values live, in that order. So closing without saving silently discards
+-- the session, which is what this exists to stop.
+--
+-- Compared against `config` rather than against a snapshot taken at open,
+-- because config IS the last-saved state: edSave updates it in the same pass
+-- that writes the file. That also means a save mid-session correctly drops the
+-- count back to zero without anything having to reset a baseline.
+--
+-- Counts entries, not keystrokes: flipping a setting and flipping it back is
+-- zero changes, which is the honest answer to "would I lose anything".
+-- ---------------------------------------------------------------------------
+-- Memoised against edGen, the same way dustList is at the dust panel: this is
+-- read on every repaint for the legend, and every mutation in the editor goes
+-- through edTouch or edRebuild (which calls it), so a stale answer is not
+-- reachable. edGen also ticks for reasons outside the editor, which costs a
+-- recount and never correctness.
+local edDirtyGen, edDirtyCached = -1, 0
+
+local function edDirtyCount()
+  if edDirtyGen == edGen then return edDirtyCached end
+  local n = 0
+
+  -- Conditions: the tracked set and each threshold. Walk both directions so a
+  -- removal counts as loudly as an addition.
+  local liveCond = {}
+  for _, cond in ipairs(config.conditions) do
+    liveCond[cond.itemName] = cond.amountToMaintain
+  end
+  for item in pairs(ed.enabled) do
+    if liveCond[item] == nil then n = n + 1
+    elseif (ed.threshold[item] or DEFAULT_TARGET) ~= liveCond[item] then n = n + 1 end
+  end
+  for item in pairs(liveCond) do
+    if not ed.enabled[item] then n = n + 1 end
+  end
+
+  -- Dust mappings: asteroid or priority moved.
+  for item, t in pairs(ed.targets) do
+    local live = config.dustTargets[item]
+    if not live or live.asteroid ~= t.asteroid or (live.priority or 99) ~= t.priority then
+      n = n + 1
+    end
+  end
+
+  -- Drill par. Absence is a real state here ("never order this"), so a material
+  -- present on one side and nil on the other is a change.
+  local livePar = config.drillPar or {}
+  for key, p in pairs(ed.par) do
+    local live = livePar[key]
+    if type(live) ~= "table" then n = n + 1
+    elseif live.tips ~= p.tips or live.rods ~= p.rods
+        or (live.batch or live.tips) ~= p.batch then n = n + 1 end
+  end
+  for key, live in pairs(livePar) do
+    if type(live) == "table" and not ed.par[key] then n = n + 1 end
+  end
+
+  -- Settings, in stored form on both sides -- config.settings is the raw table
+  -- the overlay and the editor share, not the applied runtime values.
+  for key, value in pairs(ed.settings) do
+    if config.settings[key] ~= value then n = n + 1 end
+  end
+
+  edDirtyGen, edDirtyCached = edGen, n
+  return n
 end
 
 -- "naquadahAlloy" -> "Naquadah Alloy". The tip label is the only place the
@@ -3159,7 +3444,10 @@ function SET.build()
       if (spec.group or "other") == group.id then
         if spec.type == "note" then
           body[#body + 1] = { kind = "note", text = spec.text }
-        elseif matchesFilter(spec.label) or matchesFilter(spec.key) then
+        elseif (matchesFilter(spec.label) or matchesFilter(spec.key))
+           and (not ed.changedOnly or SET.changed(spec.key)) then
+          -- changedOnly composes with the / filter rather than replacing it,
+          -- so "what did I touch in logging" is one search and one toggle.
           body[#body + 1] = { kind = "opt", spec = spec }
         end
       end
@@ -3246,7 +3534,7 @@ end
 
 -- Enter on a par row walks all three fields in turn -- chained prompts, the same
 -- shape edAddDownstream uses. Each link is still one non-blocking field, so a
--- load in flight keeps progressing between keystrokes, and esc drops out of the
+-- load in flight keeps progressing between keystrokes, and tab drops out of the
 -- chain wherever you are in it.
 function DRILL.editAll(key)
   DRILL.editField(key, "tips", function()
@@ -3449,7 +3737,16 @@ end
 local edButtons = {}
 local function edLayoutButtons()
   local defs
-  if ed.mode == "asteroids" then
+  -- A PROMPT OWNS THE BUTTON ROW.
+  --
+  -- The row keeps painting underneath an open prompt, and its buttons kept
+  -- firing mode actions -- clicking SAVE while typing a number ran a save with
+  -- the prompt still up. Swapping the set means the mouse does the two things
+  -- that make sense here and nothing else, and it gives the cancel a target for
+  -- anyone who has not found Tab yet.
+  if ed.input or ed.filtering then
+    defs = { { "OK", "input_ok" }, { "CANCEL", "input_cancel" } }
+  elseif ed.mode == "asteroids" then
     defs = { { "ITEMS", "items" }, { "DRILLS", "drills" }, { "SETTINGS", "settings" },
              { "FIND", "find" }, { "SAVE", "save" }, { "CLOSE", "close" } }
   elseif ed.mode == "detail" then
@@ -3598,22 +3895,30 @@ local function edDraw()
 
   local n = 0
   for _ in pairs(ed.enabled) do n = n + 1 end
-  local hint
+  -- The key half of this line is generated from EDKEYS, so it cannot advertise
+  -- a binding that does not exist -- which is the bug that started all this.
+  -- Only the counts and the filter state are assembled here.
+  local lead
   if ed.mode == "drills" then
-    hint = string.format("space=on/off  enter=edit all three  t=edit  g=settings  /=find  s=save  esc=back%s",
-      ed.filter and ("  |  filter: " .. ed.filter) or "")
+    lead = "enter=edit all three"
   elseif ed.mode == "settings" then
     local changed = 0
     for key in pairs(ed.settings) do if SET.changed(key) then changed = changed + 1 end end
-    hint = string.format(
-      "%d changed from shipped  |  space=toggle/cycle  t=type  r=reset  /=find  s=save  esc=back%s",
-      changed, ed.filter and ("  |  filter: " .. ed.filter) or "")
+    lead = string.format("%d changed from shipped", changed)
   else
-    hint = string.format(
-      "%d tracked  |  space=toggle  t=type amount  T=step  a=add  d=drills  /=find  s=save  esc=back%s",
-      n, ed.filter and ("  |  filter: " .. ed.filter) or "")
+    lead = string.format("%d tracked", n)
   end
-  edPaint(2, hint, 0x000000, { { 2, hint, 0x888888 } })
+
+  local tail = ""
+  if ed.changedOnly and ed.mode == "settings" then tail = tail .. "  |  changed only" end
+  if ed.filter then tail = tail .. "  |  filter: " .. ed.filter end
+
+  -- Unsaved work is stated in the one line that is always on screen, so it is
+  -- something you see before reaching for CLOSE rather than only after.
+  local pending = edDirtyCount()
+  local hint = lead .. "  |  " .. edLegend() .. tail
+  if pending > 0 then hint = hint .. string.format("  |  %d UNSAVED", pending) end
+  edPaint(2, hint, 0x000000, { { 2, hint, pending > 0 and 0xFFAA00 or 0x888888 } })
 
   if ed.mode == "asteroids" then
     edPaint(4, "h:ast", 0x000000, {
@@ -3775,10 +4080,10 @@ local function edDraw()
   edPaint(by, "b:" .. pos .. ":" .. #edButtons, 0x000000, cells)
 
   if ed.input then
-    local t = ed.input.label .. " " .. ed.input.buffer .. "_"
+    local t = ed.input.label .. " " .. ed.input.buffer .. "_    enter=commit  tab=cancel"
     edPaint(H, "i:" .. t, 0x000000, { { 2, t, 0xFFAA00 } })
   elseif ed.filtering then
-    local t = "/" .. (ed.filter or "") .. "_    enter=keep  esc=clear"
+    local t = "/" .. (ed.filter or "") .. "_    enter=keep  tab=clear"
     edPaint(H, "f:" .. t, 0x000000, { { 2, t, 0xFFAA00 } })
   else
     local t = ed.msg:sub(1, W - 2)
@@ -3790,13 +4095,111 @@ end
 -- INPUT
 -- ---------------------------------------------------------------------------
 
+local function edOpenSelected()
+  local row = ed.rows[ed.sel]
+  if not row then return end
+  if row.kind == "asteroid" then
+    ed.mode, ed.asteroid = "detail", row.name
+    ed.sel, ed.scroll = 1, 0
+    edRebuild()
+    edMoveSel(1)
+  elseif row.kind == "opt" then
+    SET.activate(row.spec)
+  elseif row.kind == "par" then
+    DRILL.editAll(row.key)
+  elseif row.kind == "item" and ed.mode == "items" then
+    local t = ed.targets[row.item]
+    if t then
+      ed.mode, ed.asteroid = "detail", t.asteroid
+      ed.sel, ed.scroll = 1, 0
+      edRebuild(); edMoveSel(1)
+    else
+      edSay(row.item .. " has no asteroid mapping", 0xFFAA00)
+    end
+  end
+end
+
 local function edAction(a)
+  -- Any action other than a second CLOSE disarms the discard confirmation, so
+  -- an armed CLOSE cannot sit waiting through a dozen further edits and then
+  -- throw them away on a stray click.
+  if a ~= "close" then ed.closeArmed = false end
+
+  -- The prompt's own buttons. Handled first and returned from, because while a
+  -- prompt is open nothing else on the button row should be reachable.
+  if a == "input_ok" then
+    if ed.input then
+      local cb, buf = ed.input.onCommit, ed.input.buffer
+      ed.input = nil
+      cb(buf)
+    elseif ed.filtering then
+      ed.filtering = false; edSay("filter: " .. (ed.filter or ""))
+    end
+    return
+  elseif a == "input_cancel" then
+    if ed.input then
+      ed.input = nil; edSay("cancelled -- value unchanged")
+    elseif ed.filtering then
+      ed.filtering = false; ed.filter = nil; edRebuild(); edSay("filter cleared")
+    end
+    return
+  end
+
   if a == "close" then
+    -- REFUSE THE FIRST CLOSE IF IT WOULD LOSE WORK.
+    --
+    -- Everything typed in here lives in a working copy until edSave runs; close
+    -- used to drop the lot without a word. Two presses rather than a modal
+    -- dialog: the editor has no modal machinery and this does not justify
+    -- inventing some.
+    local pending = edDirtyCount()
+    if pending > 0 and not ed.closeArmed then
+      ed.closeArmed = true
+      edSay(string.format(
+        "%d unsaved change(s) -- s saves them, CLOSE again discards", pending), 0xFFAA00)
+      return
+    end
     ed.open = false
+    ed.closeArmed = false
     -- Same reason as on open: the panels are about to overwrite these rows, so
     -- the cache must not claim they still hold editor content.
     edInvalidate()
     drawStaticFrame()
+  elseif a == "activate" then
+    -- Space. What it activates depends on the row, which is why this lives here
+    -- beside the other row-sensitive actions rather than inline in the key
+    -- dispatch -- the dispatch table only needs to know the name.
+    local row = selectedRow()
+    if row and row.kind == "item" then
+      edToggle(row.item, ed.mode == "detail" and ed.asteroid or
+                         (ed.targets[row.item] and ed.targets[row.item].asteroid))
+      edRebuild()
+    elseif row and row.kind == "asteroid" then
+      edOpenSelected()
+    elseif row and row.kind == "par" then
+      DRILL.toggle(row.key)
+    elseif row and row.kind == "opt" then
+      SET.activate(row.spec)
+    end
+  elseif a == "type" then
+    local row = selectedRow()
+    if row and row.kind == "item" then edTypeTarget(row.item)
+    elseif row and row.kind == "par" then DRILL.editAll(row.key)
+    elseif row and row.kind == "opt" then SET.prompt(row.spec) end
+  elseif a == "step" then
+    local row = selectedRow()
+    if row and row.kind == "item" then edCycleTarget(row.item) end
+  elseif a == "changed" then
+    if ed.mode ~= "settings" then
+      edSay("changed-only applies to the settings page", 0xFFAA00)
+    else
+      ed.changedOnly = not ed.changedOnly
+      ed.sel, ed.scroll = 1, 0
+      edRebuild()
+      edMoveSel(1)
+      edSay(ed.changedOnly and "showing only settings that differ from shipped"
+                            or "showing all settings")
+    end
   elseif a == "back" then
     if ed.mode == "detail" or ed.mode == "drills" or ed.mode == "settings" then
       ed.mode, ed.asteroid = "asteroids", nil
@@ -3834,29 +4237,6 @@ local function edAction(a)
   end
 end
 
-local function edOpenSelected()
-  local row = ed.rows[ed.sel]
-  if not row then return end
-  if row.kind == "asteroid" then
-    ed.mode, ed.asteroid = "detail", row.name
-    ed.sel, ed.scroll = 1, 0
-    edRebuild()
-    edMoveSel(1)
-  elseif row.kind == "opt" then
-    SET.activate(row.spec)
-  elseif row.kind == "par" then
-    DRILL.editAll(row.key)
-  elseif row.kind == "item" and ed.mode == "items" then
-    local t = ed.targets[row.item]
-    if t then
-      ed.mode, ed.asteroid = "detail", t.asteroid
-      ed.sel, ed.scroll = 1, 0
-      edRebuild(); edMoveSel(1)
-    else
-      edSay(row.item .. " has no asteroid mapping", 0xFFAA00)
-    end
-  end
-end
 
 -- Returns true if the event was consumed.
 local function edHandle(ev)
@@ -3870,6 +4250,10 @@ local function edHandle(ev)
       end
       return true
     end
+    -- A prompt is modal to the mouse as well as the keyboard: the button row
+    -- above is OK/CANCEL while one is open, and clicking a list row underneath
+    -- it used to open a second prompt over the first.
+    if ed.input or ed.filtering then return true end
     if y >= edFirst() and y < edFirst() + edRows() then
       local idx = ed.scroll + (y - edFirst()) + 1
       local row = ed.rows[idx]
@@ -3913,15 +4297,23 @@ local function edHandle(ev)
   elseif kind == "key_down" then
     local ch, code = ev[3], ev[4]
 
+    -- CANCELLING A TEXT PROMPT.
+    --
+    -- Tab, because it is the only one of these that can work here: q is a
+    -- character you might be typing and backspace already deletes one. Delete
+    -- and Escape ride along as aliases -- see the K table's header for why
+    -- Escape never actually arrives.
+    local isCancel = (code == K.TAB or code == K.DELETE or code == K.ESC)
+
     -- Text entry swallows printable keys. Never blocks the scheduler.
     if ed.input then
-      if code == 28 then            -- enter
+      if code == K.ENTER then
         local cb, buf = ed.input.onCommit, ed.input.buffer
         ed.input = nil
         cb(buf)
-      elseif code == 1 then         -- esc
-        ed.input = nil; edSay("cancelled")
-      elseif code == 14 then        -- backspace
+      elseif isCancel then
+        ed.input = nil; edSay("cancelled -- value unchanged")
+      elseif code == K.BACKSPACE then
         ed.input.buffer = ed.input.buffer:sub(1, -2)
       elseif ch and ch >= 32 and ch < 127 then
         ed.input.buffer = ed.input.buffer .. string.char(ch)
@@ -3930,11 +4322,11 @@ local function edHandle(ev)
     end
 
     if ed.filtering then
-      if code == 28 then
+      if code == K.ENTER then
         ed.filtering = false; edSay("filter: " .. (ed.filter or ""))
-      elseif code == 1 then
+      elseif isCancel then
         ed.filtering = false; ed.filter = nil; edRebuild(); edSay("filter cleared")
-      elseif code == 14 then
+      elseif code == K.BACKSPACE then
         ed.filter = (ed.filter or ""):sub(1, -2); edRebuild()
       elseif ch and ch >= 32 and ch < 127 then
         ed.filter = (ed.filter or "") .. string.char(ch):lower(); edRebuild()
@@ -3942,42 +4334,20 @@ local function edHandle(ev)
       return true
     end
 
-    if     code == 200 then edMoveSel(-1)
-    elseif code == 208 then edMoveSel(1)
-    elseif code == 201 then edMoveSel(-edRows())
-    elseif code == 209 then edMoveSel(edRows())
-    elseif code == 199 then ed.sel = 1; edMoveSel(1); edMoveSel(-1); edFollow()
-    elseif code == 207 then ed.sel = #ed.rows; edMoveSel(-1); edMoveSel(1); edFollow()
-    elseif code == 28  then edOpenSelected()
-    elseif code == 1   then edAction("back")
-    elseif ch == 32 then
-      local row = selectedRow()
-      if row and row.kind == "item" then
-        edToggle(row.item, ed.mode == "detail" and ed.asteroid or
-                           (ed.targets[row.item] and ed.targets[row.item].asteroid))
-        edRebuild()
-      elseif row and row.kind == "asteroid" then
-        edOpenSelected()
-      elseif row and row.kind == "par" then
-        DRILL.toggle(row.key)
-      elseif row and row.kind == "opt" then
-        SET.activate(row.spec)
-      end
-    elseif ch == 116 then                                   -- t: type an amount
-      local row = selectedRow()
-      if row and row.kind == "item" then edTypeTarget(row.item)
-      elseif row and row.kind == "par" then DRILL.editAll(row.key)
-      elseif row and row.kind == "opt" then SET.prompt(row.spec) end
-    elseif ch == 84 then                                    -- T: step the ladder
-      local row = selectedRow()
-      if row and row.kind == "item" then edCycleTarget(row.item) end
-    elseif ch == 114 or ch == 82 then edAction("reset")     -- r: shipped default
-    elseif ch == 97  then edAction("add")
-    elseif ch == 47  then edAction("find")
-    elseif ch == 115 then edAction("save")
-    elseif ch == 105 then edAction("items")
-    elseif ch == 100 then edAction("drills")                -- d: drill consumables
-    elseif ch == 103 then edAction("settings")              -- g: settings page
+    -- Navigation stays a ladder: these are not actions, they advertise nothing,
+    -- and putting them in EDKEYS would only give the legend rows to skip.
+    if     code == K.UP   then edMoveSel(-1)
+    elseif code == K.DOWN then edMoveSel(1)
+    elseif code == K.PGUP then edMoveSel(-edRows())
+    elseif code == K.PGDN then edMoveSel(edRows())
+    elseif code == K.HOME then ed.sel = 1; edMoveSel(1); edMoveSel(-1); edFollow()
+    elseif code == K.END_ then ed.sel = #ed.rows; edMoveSel(-1); edMoveSel(1); edFollow()
+    elseif code == K.ENTER then edOpenSelected()
+    else
+      -- Everything else comes off EDKEYS, which is also what built the legend
+      -- above, so the two cannot disagree about what is bound.
+      local binding = edBindingFor(ch, code)
+      if binding then edAction(binding.action) end
     end
     return true
   end
@@ -4047,7 +4417,7 @@ local function drawQuiesce(line1, line2)
   gpu.setForeground(0x888888)
   gpu.set(x + math.max(0, math.floor((w - #line2) / 2)), y + 2, line2)
   gpu.setForeground(0x555555)
-  local hint = "esc to cancel"
+  local hint = "tab or q to cancel"
   gpu.set(x + math.max(0, math.floor((w - #hint) / 2)), y + 3, hint)
   -- Only the rows this box covers are now misdescribed by the cache. Dropping
   -- the whole thing here is what created the repaint loop above.
@@ -4257,7 +4627,10 @@ while true do
                   hardAt = up + config.quiesceSeconds + config.quiesceGrace }
     edPendingShown = nil
 
-  elseif ev[1] == "key_down" and ev[4] == 1 and edPending then       -- esc
+  elseif ev[1] == "key_down" and edPending
+     and (ev[4] == K.TAB or ev[4] == K.ESC or ev[3] == 113 or ev[3] == 81) then
+    -- Aborting the countdown. Escape is listed last and never fires; see the K
+    -- table's header. Without tab and q this box could not be cancelled at all.
     edPending, edPendingShown = nil, nil
     lastUIDraw = 0   -- wipe the box on the next pass
   end
@@ -4279,7 +4652,7 @@ while true do
         -- editor may feel sluggish for the next few seconds.
         edSay(busy .. " module(s) still working -- editor may lag briefly", 0xFFAA00)
       else
-        edSay("new jobs paused while this is open -- esc to resume mining")
+        edSay("new jobs paused while this is open -- tab or q to resume mining")
       end
       ed.dirty = true
     end
