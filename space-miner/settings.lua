@@ -121,8 +121,9 @@ S.list = {
     label = "Safe window fraction", help = "how much of the shortest observed run counts as safe to poll lazily" },
 
   -- --- TELEMETRY NODES -----------------------------------------------------
-  -- These reach the nodes over the air. A node that has never heard from the
-  -- broker falls back to the same defaults declared here, via node_config.lua.
+  -- These reach the nodes over the air. Each node script carries a matching
+  -- cold-start default at the top of its own file -- it loads no config -- and
+  -- takes these the moment the broker's first broadcast arrives.
   { key = "dustScanInterval", group = "nodes", type = "int", default = 10, min = 2, max = 600,
     scope = "node",
     label = "Dust scan interval", help = "seconds between ME dust scans on the dust node" },

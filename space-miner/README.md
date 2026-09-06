@@ -28,9 +28,8 @@ Each module has its own ME Interface adapter + transposer; one shared OC Databas
 
 | File | Runs on | Purpose |
 |------|---------|---------|
-| `config.lua` | broker, job node | Shipped data — drones, drills, asteroids, the optimization matrix, dust targets and drill par. No longer copied to the telemetry nodes: they read `node_config.lua` instead and are sent everything else by the broker. |
+| `config.lua` | broker, job node | Shipped data — drones, drills, asteroids, the optimization matrix, dust targets and drill par. Not copied to the telemetry nodes: they carry no config at all and are sent what they need by the broker. |
 | `settings.lua` | broker, job node | The tunable registry. Every runtime knob is declared here once with its type, legal range and one-line help; `config.lua`, the broker's settings page and the node broadcast all read the same declarations. |
-| `node_config.lua` | dust node, fluid node | Ports and fallbacks, forty lines. Everything else those nodes need arrives from the broker at runtime. |
 | `reference.lua` | nothing | Data nothing loads: item registries, cycle-mode defaults, the module filter blacklist. Carved out of `config.lua` because no code read it. |
 | `broker-mk3.lua` | broker | **The broker.** Aggregates telemetry, dispatches jobs (drone-first with a per-asteroid cap), and spawns one cooperative load task per module. Requires `/home/job_node_config.lua`, `/home/scheduler.lua`, `/home/loader.lua`, `/home/logger.lua`. |
 | `scheduler.lua` | broker | Cooperative task engine: `spawn`, `sleep`, `await`, fair `lock`. One clock (`computer.uptime`). Lets all 6 loads run concurrently without freezing the UI/telemetry. You never edit this to add features — you spawn a task. |
@@ -73,7 +72,7 @@ Each module has its own ME Interface adapter + transposer; one shared OC Databas
 ### `config.lua` — Shipped Data
 
 Loaded by the broker and by remote job nodes. **Not** by the telemetry nodes any
-more — see `node_config.lua` below. Sections:
+more — see "What a telemetry node knows on its own" below. Sections:
 
 1. **Drone registry** — maps tier keys (`lv`…`max`) to exact ME item names
 2. **Drill consumables** — maps drill material keys to tip/rod item names
@@ -113,7 +112,9 @@ is 0, what the top three drill tiers cost to keep at par — lives in
 to know a number. Read that when you want to understand a setting; use the
 editor when you want to change one.
 
-### `node_config.lua` — What a Telemetry Node Knows on Its Own
+### What a Telemetry Node Knows on Its Own
+
+**Nothing, almost.** A telemetry node is one file with no config beside it.
 
 The dust and fluid nodes used to `dofile("/home/config.lua")` for two numbers
 and a five-name list. That file is three thousand lines — the whole asteroid
@@ -122,17 +123,31 @@ a machine that then tries to hold a full ME network scan in what is left. It was
 the direct cause of the dust node's out-of-memory failures, and none of it was
 ever read there.
 
-So those nodes read `node_config.lua` instead: ports, and defaults for the
-handful of settings that reach them. Resolution order, most authoritative first:
+What each node carries locally is a labelled block at the top of its own script:
+
+- **two port numbers.** OpenComputers makes you `modem.open()` an explicit port,
+  so a node cannot discover which one to listen on — it has to know. That is the
+  one genuinely irreducible piece.
+- **cold-start defaults** for its handful of settings, which double as the
+  schema: a pushed key is accepted only if it already appears there, with the
+  same type, so a broadcast cannot invent keys or hand a string to something
+  used as a number.
+- **the fluid node only:** the five plasma tier names, highest first. A fact
+  about the game rather than a preference, and keeping it local means the
+  dashboard is populated the instant the node boots — which matters, because the
+  broker's `hasPlasma()` gate reads what this node reports.
+
+Everything else arrives from the broker. Resolution order, most authoritative
+first:
 
 1. what the broker last sent (`NODE_SETTINGS`, on the command port)
 2. `/home/node_settings.lua`, the cached copy of that — so a node restarting
    during a broker outage comes back configured rather than reverting
-3. the defaults in `node_config.lua`
+3. the inline defaults
 
-Each node's status line shows which of the three it is currently running on.
-`hw_telem.lua` goes further and loads no config at all; the one setting it
-cares about rides along with `DRILL_PAR` on its own port.
+Each node's status line shows which of the three it is running on. That
+indicator is how you catch the one new failure mode: a node whose port numbers
+do not match the broker's hears nothing at all, and sits on `defaults` forever.
 
 ### `dust_telem.lua` — Dust Storage Monitor
 
@@ -371,16 +386,16 @@ and it fetches exactly the files that role needs. What follows is what it does.
 "Waiting for telemetry..." and dispatches nothing until all three report. (Plasma
 is required because mining modules physically can't run without a plasma fluid.)
 
-**Telem nodes do not get `config.lua`.** They never read it, and parsing three
-thousand lines of asteroid data was costing the dust node the memory it needed
-for its own ME scan.
+**A telemetry node is one file.** No `config.lua` — they never read it, and
+parsing three thousand lines of asteroid data was costing the dust node the
+memory it needed for its own ME scan — and no config of any other kind either.
 
 ```
-/home/node_config.lua   (dust and fluid nodes; ports and fallbacks)
-/home/dust_telem.lua    (or fluid_telem.lua)
+/home/dust_telem.lua     (or fluid_telem.lua, or hw_telem.lua)
 ```
 
-The hardware node needs `hw_telem.lua` and nothing else at all.
+That is the whole install. Each script carries its two port numbers at the top
+and is sent everything else by the broker.
 
 Set `targetSide` at the top of each script to the side of the OC Adapter facing
 the relevant ME Controller (dust node → dust-storage network; hardware node →

@@ -3858,9 +3858,12 @@ end
 -- NODE SETTINGS
 --
 -- The scope="node" subset of the settings registry, pushed to the dust and
--- fluid nodes on the command port. This is what lets those machines ship with
--- node_config.lua -- forty lines of ports and fallbacks -- instead of a copy of
--- config.lua they only ever read three values out of.
+-- fluid nodes on the command port. This is what lets those machines ship as a
+-- single file with no config at all, instead of a copy of config.lua they only
+-- ever read three values out of.
+--
+-- The same payload goes to every node; each one applies only the keys it holds
+-- and ignores the rest, so this does not need to know who is listening.
 --
 -- Sent on the same slow timer as the watchlist, and again immediately after a
 -- save, so an edit lands within a second rather than within a cadence. Nodes

@@ -5,12 +5,13 @@
 --          items (lowest stock/threshold ratio) and broadcasts all tracked
 --          stock levels to the broker.
 --
--- This node holds NO policy. What to scan and how often both arrive from the
--- broker; node_config.lua supplies only the ports and the fallbacks needed to
--- come up before the broker has said anything. It deliberately does not load
--- config.lua -- three thousand lines of asteroid data parsed into the memory of
--- the machine that then has to hold a full ME network scan was the direct cause
--- of this node's out-of-memory failures, and not one line of it was read here.
+-- This node holds NO policy and needs NO config file. What to scan and how
+-- often both arrive from the broker; the only thing written down here is the
+-- pair of port numbers it cannot be told over the air. It deliberately does not
+-- load config.lua -- three thousand lines of asteroid data parsed into the
+-- memory of the machine that then has to hold a full ME network scan was the
+-- direct cause of this node's out-of-memory failures, and not one line of it
+-- was read here.
 --
 -- OpenComputers Sides Reference Matrix:
 --   0 = Bottom / Down (-Y) | 1 = Top / Up (+Y) | 2 = North (-Z)
@@ -23,12 +24,37 @@ local term          = require("term")
 local event         = require("event")
 local computer      = require("computer")
 
-local node
-for _, path in ipairs({ "/home/node_config.lua", "node_config.lua" }) do
-  local ok, mod = pcall(dofile, path)
-  if ok and type(mod) == "table" and mod.ports then node = mod break end
-end
-if not node then error("Missing node_config.lua - re-run install-medina.") end
+-- ---------------------------------------------------------------------------
+-- WIRING
+--
+-- The only things this node cannot be told over the air. OpenComputers makes
+-- you modem.open() an explicit port number, so a node cannot discover which
+-- port to listen on -- it has to know. That makes these two integers
+-- irreducible, and they are the entire local configuration of this machine.
+--
+-- They must match config.ports on the broker. fluid_telem.lua and hw_telem.lua
+-- carry the same pair for the same reason; SETTINGS.md lists all four places.
+-- Change them together, or this node simply never hears anything -- which the
+-- status line shows as a settings source stuck on "defaults".
+-- ---------------------------------------------------------------------------
+local PORT_TELEMETRY = 2026   -- outbound: this node -> broker
+local PORT_COMMAND   = 2027   -- inbound:  broker -> this node
+
+-- Cold-start values, and the schema for what a push may contain: applySettings
+-- accepts a key only if it already appears here, with the same type. Replaced
+-- by the cache on boot and by the broker's NODE_SETTINGS whenever it arrives.
+-- The broker's defaults for these live in settings.lua; see SETTINGS.md.
+local settings = {
+  dustScanInterval = 10,
+  wirelessStrength = 400,
+  nodeDashboard    = true,
+}
+
+local SETTINGS_CACHE = "/home/node_settings.lua"
+
+-- Where the values above came from, for the status line. A node still showing
+-- "defaults" long after boot is not hearing the broker.
+local settingsSource = "defaults"
 
 if not component.isAvailable("modem") then error("Missing network card.") end
 if not component.isAvailable("gpu")   then error("Requires GPU.")         end
@@ -69,10 +95,55 @@ end
 local gpu      = component.gpu
 local nodeName = "MEDINA-DustRelay"
 
-node.loadCache()
-modem.setStrength(node.settings.wirelessStrength)
+-- ---------------------------------------------------------------------------
+-- SETTINGS FROM THE BROKER
+--
+-- Accept only keys this node already holds, and only with the same type. A
+-- broadcast does not get to invent keys or hand a string to something used as
+-- a number -- `settings` above is the schema as well as the defaults.
+--
+-- Returns how many values actually moved, so a caller can skip re-applying
+-- side effects (modem strength) when a re-broadcast changed nothing.
+-- ---------------------------------------------------------------------------
+local function applySettings(values)
+  if type(values) ~= "table" then return 0 end
+  local changed = 0
+  for key, cur in pairs(settings) do
+    local v = values[key]
+    if v ~= nil and type(v) == type(cur) and v ~= cur then
+      settings[key] = v
+      changed = changed + 1
+    end
+  end
+  return changed
+end
+
+local function saveSettingsCache()
+  local f = io.open(SETTINGS_CACHE, "w")
+  if not f then return end
+  f:write("return {\n")
+  for key, v in pairs(settings) do
+    if type(v) == "number" then
+      f:write(string.format("  %s = %s,\n", key, tostring(v)))
+    elseif type(v) == "boolean" then
+      f:write(string.format("  %s = %s,\n", key, v and "true" or "false"))
+    end
+  end
+  f:write("}\n")
+  f:close()
+end
+
+do
+  local ok, cached = pcall(dofile, SETTINGS_CACHE)
+  if ok and type(cached) == "table" then
+    applySettings(cached)
+    settingsSource = "cache"
+  end
+end
+
+modem.setStrength(settings.wirelessStrength)
 gpu.setResolution(80, 25)
-modem.open(node.ports.command)   -- inbound: broker -> this node
+modem.open(PORT_COMMAND)   -- inbound: broker -> this node
 
 -- ---------------------------------------------------------------------------
 -- WATCHLIST
@@ -136,11 +207,16 @@ local function handleMessage(_, _, _, _, _, rawMsg)
   if msg.protocol ~= "MEDINA_COMMAND" then return end
 
   if msg.payloadType == "NODE_SETTINGS" then
-    if node.handlePush(msg) then
+    -- An empty or malformed push is ignored outright rather than resetting a
+    -- working node to its defaults.
+    if type(msg.data) ~= "table" or not next(msg.data) then return end
+    settingsSource = "broker"
+    if applySettings(msg.data) > 0 then
+      saveSettingsCache()
       -- Strength is the only setting with a side effect to re-apply. The scan
       -- interval is read live by the wait loop, so a change to it lands
       -- immediately even mid-wait.
-      modem.setStrength(node.settings.wirelessStrength)
+      modem.setStrength(settings.wirelessStrength)
     end
     return
   end
@@ -256,7 +332,7 @@ local function updateDashboard(list)
   gpu.setForeground(0x555555)
   term.setCursor(2, 4)
   io.write(string.format("watchlist: %-8s (%d items)   settings: %-8s   scan: %ds   ",
-    listSource, listCount, node.source, node.settings.dustScanInterval))
+    listSource, listCount, settingsSource, settings.dustScanInterval))
   term.setCursor(55, 2)
   io.write("LAST_SYNC: " .. os.date("%X"))
 
@@ -283,7 +359,7 @@ local function updateDashboard(list)
   end
 end
 
-if node.settings.nodeDashboard then drawStaticFrame() end
+if settings.nodeDashboard then drawStaticFrame() end
 
 -- Reused for the same reason as `stocks`: one table per broadcast, every scan.
 local payload = {}
@@ -296,7 +372,7 @@ while true do
     scanDustStock()
   end
 
-  if node.settings.nodeDashboard then
+  if settings.nodeDashboard then
     updateDashboard(buildSortedList())
   end
 
@@ -307,7 +383,7 @@ while true do
     payload[name] = { stock = stocks[name] or 0 }
   end
 
-  modem.broadcast(node.ports.telemetry, serialization.serialize({
+  modem.broadcast(PORT_TELEMETRY, serialization.serialize({
     protocol    = "MEDINA_TELEMETRY",
     sender      = nodeName,
     payloadType = "DUST_UPDATE",
@@ -319,7 +395,7 @@ while true do
   -- than turned into a deadline up front, so a push that shortens it takes
   -- effect during the very wait it arrived in.
   local waitFrom = computer.uptime()
-  while computer.uptime() - waitFrom < node.settings.dustScanInterval do
+  while computer.uptime() - waitFrom < settings.dustScanInterval do
     local ev = { event.pull(0.5, "modem_message") }
     if ev[1] == "modem_message" then handleMessage(table.unpack(ev)) end
   end

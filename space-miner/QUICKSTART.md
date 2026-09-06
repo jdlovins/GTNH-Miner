@@ -66,12 +66,11 @@ wget RAW_BASE/detect_module.lua         /home/detect_module.lua
 wget RAW_BASE/job_node_config.example.lua /home/job_node_config.lua
 ```
 
-**On the dust monitor node (required)** — note it does *not* get `config.lua`.
-It reads `node_config.lua` for ports, and the broker pushes it what to scan:
+**On the dust monitor node (required)** — one file. No `config.lua`, no config
+of any kind; the broker pushes it what to scan and how often:
 
 ```
-wget RAW_BASE/node_config.lua /home/node_config.lua
-wget RAW_BASE/dust_telem.lua  /home/dust_telem.lua
+wget RAW_BASE/dust_telem.lua /home/dust_telem.lua
 ```
 
 **On the hardware monitor node (required)** — one file, no config at all; the
@@ -81,11 +80,10 @@ broker pushes it everything it needs:
 wget RAW_BASE/hw_telem.lua /home/hw_telem.lua
 ```
 
-**On the plasma/fluid monitor node (required):**
+**On the plasma/fluid monitor node (required)** — one file, same as above:
 
 ```
-wget RAW_BASE/node_config.lua  /home/node_config.lua
-wget RAW_BASE/fluid_telem.lua  /home/fluid_telem.lua
+wget RAW_BASE/fluid_telem.lua /home/fluid_telem.lua
 ```
 
 > ⚠️ The broker will **not mine** until **all three** monitor nodes are reporting

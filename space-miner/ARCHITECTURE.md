@@ -157,12 +157,13 @@ MEDINA (Modular Extraction and Dispatch Intelligence Network Array) is a wireles
 - Whatever the broker's `config.conditions` currently holds, pushed over the wire
 - Only items below threshold trigger mining jobs
 
-**No config.lua.** This node reads `node_config.lua` — ports and fallbacks, forty
-lines — and gets everything else from the broker. Loading the 3000-line
-`config.lua` for two values was the direct cause of this node's out-of-memory
-failures, since it then has to hold a full ME network scan in what is left. A
-node that has never heard from the broker scans nothing and says so, rather than
-guessing from a local copy that may have drifted.
+**No config file at all.** This node is one script. It carries its two port
+numbers at the top — OpenComputers makes you `modem.open()` an explicit port, so
+that much cannot be pushed — and gets everything else from the broker. Loading
+the 3000-line `config.lua` for two values was the direct cause of this node's
+out-of-memory failures, since it then has to hold a full ME network scan in what
+is left. A node that has never heard from the broker scans nothing and says so,
+rather than guessing from a local copy that may have drifted.
 
 ---
 
@@ -225,9 +226,12 @@ needs to be rate-limited uses `computer.uptime()`, never a loop counter.
 - **Outbound (Port 2026):** Broadcasts FLUID_UPDATE payload every `fluidScanInterval` (10s default)
 - **Inbound (Port 2027):** Receives NODE_SETTINGS from the broker
 
-Same as the dust node: `node_config.lua` only, no `config.lua`. The scan loop
-waits in short hops rather than `os.sleep`, so a settings push lands during the
-wait it arrived in rather than up to an interval later.
+Same as the dust node: one script, no config file. It also carries the five
+plasma tier names locally — a fact about the game, not a preference, and holding
+it here means the dashboard and the `hasPlasma()` gate are populated the instant
+the node boots. The scan loop waits in short hops rather than `os.sleep`, so a
+settings push lands during the wait it arrived in rather than up to an interval
+later.
 
 **Plasma Tiers Monitored:**
 1. Helium Plasma

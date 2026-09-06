@@ -27,9 +27,11 @@ local RAW = "https://raw.githubusercontent.com/jdlovins/GTNH-Miner/main/space-mi
 --
 -- config.lua is three thousand lines of asteroid data. It used to be installed
 -- everywhere, including on the telemetry nodes, which read three values out of
--- it and then ran out of memory holding an ME network scan. The nodes get
--- node_config.lua instead -- ports and fallbacks, forty lines -- and everything
--- else is pushed to them by the broker at runtime.
+-- it and then ran out of memory holding an ME network scan.
+--
+-- A telemetry node is now ONE FILE. The only thing written down on it is the
+-- pair of port numbers it cannot be told over the air; everything else is
+-- pushed by the broker at runtime.
 local ROLES = {
   ["broker"] = {
     label = "Broker (main computer)",
@@ -42,7 +44,7 @@ local ROLES = {
   },
   ["dust"] = {
     label = "Dust monitor node (required)",
-    files = { "dust_telem.lua", "node_config.lua" },
+    files = { "dust_telem.lua" },
     note = "run: dust_telem  (what to scan is pushed by the broker -- give it ~30s)",
   },
   ["hw"] = {
@@ -52,7 +54,7 @@ local ROLES = {
   },
   ["fluid"] = {
     label = "Fluid/plasma monitor node (required)",
-    files = { "fluid_telem.lua", "node_config.lua" },
+    files = { "fluid_telem.lua" },
     note = "Set targetSide at the top of fluid_telem.lua, then run: fluid_telem",
   },
   ["jobnode"] = {
@@ -205,7 +207,7 @@ if choice == 6 then
   -- real job_node_config.lua).
   print("\nInstalling EVERYTHING from " .. RAW .. "\n")
   local everything = {
-    "config.lua", "settings.lua", "node_config.lua", "reference.lua",
+    "config.lua", "settings.lua", "reference.lua",
     "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
     "list_components.lua", "detect_module.lua", "detect_sides.lua", "find_item.lua",
     "dust_telem.lua", "hw_telem.lua", "fluid_telem.lua", "job_node.lua",

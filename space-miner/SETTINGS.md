@@ -301,16 +301,23 @@ all the way to constant costs another fourteen for 0.6s.
 
 These are marked `scope = "node"` in `settings.lua`, which means the broker
 broadcasts them and the dust, fluid and hardware nodes apply them live. **This is
-why those machines no longer carry `config.lua`.** They ship with
-[`node_config.lua`](node_config.lua) — ports and the same defaults, about forty
-lines — and cache whatever the broker last sent to `/home/node_settings.lua`, so
-a node that restarts during a broker outage still comes up correctly configured.
+why those machines carry no config file at all** — each telemetry node is a
+single script. It holds its two port numbers and a small block of cold-start
+defaults at the top, and caches whatever the broker last sent to
+`/home/node_settings.lua`, so a node that restarts during a broker outage still
+comes up correctly configured.
+
+That defaults block doubles as the schema: a pushed key is accepted only if it
+already appears there, with the same type. The broker sends the same payload to
+every node, and each one ignores the keys it does not hold.
 
 Resolution order on a node, most authoritative first:
 
 1. what the broker last sent
 2. the cached copy of that
-3. `node_config.lua` defaults
+3. the inline defaults at the top of the script
+
+Each node's status line shows which of the three it is on.
 
 ### `dustScanInterval` / `fluidScanInterval`
 
@@ -405,8 +412,23 @@ config.ports = {
 
 Changing a port from inside the editor would disconnect the fleet from the
 machine doing the changing, and the nodes have no way to be told about the new
-number — the message telling them would go out on it. So ports are edited in
-`config.lua` and `node_config.lua` together, deliberately, with a restart.
+number — the message telling them would go out on it. OpenComputers also makes a
+node `modem.open()` an explicit port, so it cannot discover one.
+
+**Four files hold these numbers and they must agree:**
+
+| file | ports |
+|---|---|
+| `config.lua` | all three |
+| `dust_telem.lua` | 2026 out, 2027 in |
+| `fluid_telem.lua` | 2026 out, 2027 in |
+| `hw_telem.lua` | 2026 out, 2025 in |
+
+That is the deliberate trade for a telemetry node being one file: a labelled
+two-line constant at the top of each script that uses it, rather than a config
+file existing to hold it. Change one alone and that node stops hearing the
+broker — its status line sits on `settings: defaults`, which is the symptom to
+look for.
 
 **Why the hardware node gets its own port** rather than listening on `command`:
 the `DUST_WATCHLIST` broadcast carries every tracked dust item, and the hw node
@@ -415,8 +437,9 @@ unserialize that packet every 30s only to discard it. 2025 was already opened by
 `hw_telem` for a query protocol that never got a client, so this costs nothing
 new.
 
-Note that `hw_telem.lua` hardcodes 2025 — it does not load any config. Changing
-the number in one place and not the other silently stops drill auto-crafting.
+The hw node is the one where a mismatch is quiet rather than visible: it has no
+settings-source indicator, so a wrong `hardware` port just stops drill
+auto-crafting with no symptom on either dashboard.
 
 ---
 

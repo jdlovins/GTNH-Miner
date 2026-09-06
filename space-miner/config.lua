@@ -2869,11 +2869,14 @@ config.conditions = {
 --
 -- Ports stay out of the editor deliberately: changing one from inside the broker
 -- would disconnect the fleet from the machine doing the changing, and the packet
--- telling the nodes about the new number would go out on it. Edit them here and
--- in node_config.lua together, then restart both ends.
+-- telling the nodes about the new number would go out on it.
 --
--- hw_telem.lua hardcodes 2025 and loads no config at all, so changing `hardware`
--- here alone silently stops drill auto-crafting.
+-- The telemetry nodes load no config at all, so each carries its own copy at the
+-- top of its script. Four files hold these numbers and they must agree:
+-- config.lua, dust_telem.lua, fluid_telem.lua and hw_telem.lua. Change one alone
+-- and that node simply stops hearing the broker -- its dashboard shows a
+-- settings source stuck on "defaults", and for hw_telem, drill auto-crafting
+-- silently stops.
 --------------------------------------------------------------------------------
 config.ports = {
   telemetry = 2026, -- inbound to broker: telem nodes + job nodes -> broker
