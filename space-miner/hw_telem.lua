@@ -538,7 +538,6 @@ local function scanAssets()
   if useFilter then return scanFiltered() end
   return scanFull()
 end
-end
 
 local function updateDashboard(assets)
   -- Drone column (left, rows 7-20)
