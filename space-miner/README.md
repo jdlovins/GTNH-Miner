@@ -31,7 +31,9 @@ Each module has its own ME Interface adapter + transposer; one shared OC Databas
 | `config.lua` | broker, job node | Shipped data — drones, drills, asteroids, the optimization matrix, dust targets and drill par. Not copied to the telemetry nodes: they carry no config at all and are sent what they need by the broker. |
 | `settings.lua` | broker, job node | The tunable registry. Every runtime knob is declared here once with its type, legal range and one-line help; `config.lua`, the broker's settings page and the node broadcast all read the same declarations. |
 | `reference.lua` | nothing | Data nothing loads: item registries, cycle-mode defaults, the module filter blacklist. Carved out of `config.lua` because no code read it. |
-| `broker-mk3.lua` | broker | **The broker.** Aggregates telemetry, dispatches jobs (drone-first with a per-asteroid cap), and spawns one cooperative load task per module. Requires `/home/job_node_config.lua`, `/home/scheduler.lua`, `/home/loader.lua`, `/home/logger.lua`. |
+| `broker-mk3.lua` | broker | **The broker.** Aggregates telemetry, dispatches jobs (drone-first with a per-asteroid cap), draws the dashboard, and spawns one cooperative load task per module. Requires `/home/job_node_config.lua`, `/home/scheduler.lua`, `/home/loader.lua`, `/home/logger.lua`, `/home/module_api.lua`, `/home/editor.lua`. |
+| `editor.lua` | broker | The in-game condition editor (press `E`) — asteroids, items, drill consumables and the settings page. Split out of `broker-mk3.lua`, which had reached Lua's 200-locals-per-chunk limit. Takes its dependencies through `editor.init(deps)` and touches no hardware at load, which is also what lets the test suite drive it on a desktop. |
+| `module_api.lua` | broker, job node | The GTNH 2.8 / 2.9 mining-module parameter API, in one place. Probed per adapter at boot; `gtVersion` forces it. |
 | `scheduler.lua` | broker | Cooperative task engine: `spawn`, `sleep`, `await`, fair `lock`. One clock (`computer.uptime`). Lets all 6 loads run concurrently without freezing the UI/telemetry. You never edit this to add features — you spawn a task. |
 | `loader.lua` | broker | One module's consumable-load sequence, run as a scheduler task. Confirms database fingerprints by read-back and routes items into the input bus by identity (not slot position). |
 | `logger.lua` | broker | Logging with a configurable backend (file / console / Loki). Disabled by default — ERROR/WARN still written to `/tmp/spacemining.log`. Configured from the editor's settings page. |
@@ -414,6 +416,8 @@ Copy these to the broker computer:
 /home/settings.lua
 /home/job_node_config.lua    (your module hardware addresses)
 /home/broker-mk3.lua
+/home/editor.lua
+/home/module_api.lua
 /home/scheduler.lua
 /home/loader.lua
 /home/logger.lua

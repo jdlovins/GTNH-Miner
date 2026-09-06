@@ -146,9 +146,36 @@ end
 ck("every default is legal", badDefault, nil)
 
 -- =============================================================================
-section("broker-mk3.lua editor -- bindings and the unsaved-change count")
+section("editor.lua -- bindings and the unsaved-change count")
 -- =============================================================================
-local broker = slurp("broker-mk3.lua")
+-- This section used to scrape functions out of broker-mk3.lua with regexes,
+-- because that file asserts a modem on line 60 and cannot be loaded on a
+-- desktop. The editor is its own module now and takes its dependencies through
+-- init(), so the tests load the REAL thing and call the REAL functions.
+local editor = dofile(ROOT .. "/editor.lua")
+
+-- Nothing here touches hardware; gpu is nil and the paint functions are simply
+-- never called. W >= 90 so the drills page believes it has a wide screen.
+local gen = 0
+local edcfg = {
+  settingsSpec = S,
+  conditions  = {}, dustTargets = {}, drillPar = {}, settings = {},
+  drones = {}, drills = {}, asteroids = {},
+}
+editor.init{
+  config = edcfg, gpu = nil, W = 120, H = 50,
+  brokerState = { dust = {}, drones = {}, drills = {} },
+  drillKeyOrder = {}, usableDrillKeys = function() return {} end,
+  formatQty = tostring, drawStaticFrame = function() end,
+  resetDustScroll = function() end,
+  edTouch = function() gen = gen + 1 end,
+  edGen = function() return gen end,
+}
+ck("editor loads without hardware", type(editor.init), "function")
+ck("editor exposes isOpen",         type(editor.isOpen), "function")
+ck("editor starts closed",          editor.isOpen(), false)
+
+local E = editor._internal
 
 -- THE ASSERTION THAT WOULD HAVE CAUGHT THE ESCAPE BUG.
 --
@@ -157,85 +184,87 @@ local broker = slurp("broker-mk3.lua")
 -- Before EDKEYS existed the legend was three hand-written strings, they drifted
 -- from the dispatch ladder, and the editor spent a long release telling people
 -- to press a key Minecraft never delivers.
-local edkeys = broker:match("local EDKEYS = %{.-\n%}")
-ck("EDKEYS table found", edkeys ~= nil, true)
-
+--
+-- EDKEYS is a real table here; the set of handled actions still comes from the
+-- source, because edAction is an if/elseif chain with no else and an unknown
+-- action is silently a no-op rather than an error.
+local edsrc = slurp("editor.lua")
 local handled = {}
-for name in broker:gmatch('a == "([a-z_]+)"') do handled[name] = true end
+for name in edsrc:gmatch('a == "([a-z_]+)"') do handled[name] = true end
 
--- Strip the outer braces before iterating: %b{} on the whole declaration
--- matches the table itself as one balanced pair, not its rows.
-local body = edkeys:match("^local EDKEYS = %{(.*)%}$")
-
-local unhandled, advertised = nil, 0
-for entry in body:gmatch("%b{}") do
-  local action = entry:match('action = "([a-z_]+)"')
-  if action and not handled[action] then unhandled = action end
-  if entry:find("hint =") then advertised = advertised + 1 end
+local unhandled, advertised, tabBound, tabHinted, escAlias, escHinted = nil, 0, false, false, false, false
+for _, bind in ipairs(E.EDKEYS) do
+  if bind.action and not handled[bind.action] then unhandled = bind.action end
+  if bind.hint then
+    advertised = advertised + 1
+    if bind.hint == "tab=back" then tabHinted = true end
+    if bind.hint:find("esc") then escHinted = true end
+  end
+  if bind.code == E.K.TAB then tabBound = true end
+  if bind.code == E.K.ESC then escAlias = true end
 end
 ck("every bound action is handled", unhandled, nil)
 ck("the legend is not empty",       advertised > 8, true)
 
 -- Tab must be bound as a cancel, and it must be the one the legend names --
 -- q and backspace cannot do this job in a text field.
-ck("tab is bound",        edkeys:find("K%.TAB") ~= nil, true)
-ck("tab is advertised",   edkeys:find('hint = "tab=back"') ~= nil, true)
-ck("escape kept as alias", edkeys:find("K%.ESC") ~= nil, true)
-ck("no esc= in the legend", edkeys:find('hint = "[^"]*esc') , nil)
+ck("tab is bound",          tabBound, true)
+ck("tab is advertised",     tabHinted, true)
+ck("escape kept as alias",  escAlias, true)
+ck("no esc= in the legend", escHinted, false)
 
--- edDirtyCount is self-contained: it reads `ed`, `config`, `edGen` and
--- DEFAULT_TARGET and calls nothing. Lift it out and run it against fakes.
-local src = broker:match("(local function edDirtyCount%(%).-\n  return n\nend)")
-ck("edDirtyCount extracted", src ~= nil, true)
+-- isCancelKey is what the broker's quiesce countdown asks, so the two cannot
+-- drift. Every alias must answer yes; an ordinary key must not.
+ck("tab cancels",       editor.isCancelKey(nil, E.K.TAB), true)
+ck("escape cancels",    editor.isCancelKey(nil, E.K.ESC), true)
+ck("backspace cancels", editor.isCancelKey(nil, E.K.BACKSPACE), true)
+ck("q cancels",         editor.isCancelKey(113, nil), true)
+ck("s does not cancel", editor.isCancelKey(115, nil), false)
 
-local env = { pairs = pairs, ipairs = ipairs, type = type, DEFAULT_TARGET = 5000000,
-              edGen = 0, edDirtyGen = -1, edDirtyCached = 0 }
-env.ed, env.config = {}, {}
-local chunk = assert(load(src .. "\nreturn edDirtyCount", "edDirtyCount", "t", env))
-local dirty = chunk()
+-- Requests are drained, not merely read: the broker broadcasts on them, so a
+-- read that left the flag set would rebroadcast every pass.
+local w, pr, n = editor.takeRequests()
+ck("no requests pending at rest", (w or pr or n) and true or false, false)
 
--- A freshly loaded editor mirrors config exactly and owes nothing.
+-- edDirtyCount against the module's own working copies.
+local ed = E.ed
 local function reset()
-  env.edGen = env.edGen + 1
-  env.config = {
-    conditions  = { { itemName = "Infinity", amountToMaintain = 1000 },
-                    { itemName = "Naquadah", amountToMaintain = 2000 } },
-    dustTargets = { Infinity = { asteroid = "Infinity Catalyst", priority = 1 } },
-    drillPar    = { steel = { tips = 64, rods = 64, batch = 64 } },
-    settings    = { tipsPerLoad = 128, fastReload = false },
-  }
-  env.ed = {
-    enabled   = { Infinity = true, Naquadah = true },
-    threshold = { Infinity = 1000, Naquadah = 2000 },
-    targets   = { Infinity = { asteroid = "Infinity Catalyst", priority = 1 } },
-    par       = { steel = { tips = 64, rods = 64, batch = 64 } },
-    settings  = { tipsPerLoad = 128, fastReload = false },
-  }
+  gen = gen + 1
+  edcfg.conditions  = { { itemName = "Infinity", amountToMaintain = 1000 },
+                        { itemName = "Naquadah", amountToMaintain = 2000 } }
+  edcfg.dustTargets = { Infinity = { asteroid = "Infinity Catalyst", priority = 1 } }
+  edcfg.drillPar    = { steel = { tips = 64, rods = 64, batch = 64 } }
+  edcfg.settings    = { tipsPerLoad = 128, fastReload = false }
+  ed.enabled   = { Infinity = true, Naquadah = true }
+  ed.threshold = { Infinity = 1000, Naquadah = 2000 }
+  ed.targets   = { Infinity = { asteroid = "Infinity Catalyst", priority = 1 } }
+  ed.par       = { steel = { tips = 64, rods = 64, batch = 64 } }
+  ed.settings  = { tipsPerLoad = 128, fastReload = false }
 end
-local function count() env.edGen = env.edGen + 1 return dirty() end
+local function count() gen = gen + 1 return E.dirtyCount() end
 
 reset() ck("clean editor owes nothing",   count(), 0)
-reset() env.ed.settings.tipsPerLoad = 256
+reset() ed.settings.tipsPerLoad = 256
         ck("changed setting counts",       count(), 1)
-        env.ed.settings.tipsPerLoad = 128
+        ed.settings.tipsPerLoad = 128
         ck("changed back is clean again",  count(), 0)
-reset() env.ed.settings.fastReload = true
+reset() ed.settings.fastReload = true
         ck("a false->true bool counts",    count(), 1)
-reset() env.ed.threshold.Infinity = 9999
+reset() ed.threshold.Infinity = 9999
         ck("changed threshold counts",     count(), 1)
-reset() env.ed.enabled.Naquadah = nil
+reset() ed.enabled.Naquadah = nil
         ck("untracking an item counts",    count(), 1)
-reset() env.ed.enabled.Tengam = true; env.ed.threshold.Tengam = 500
+reset() ed.enabled.Tengam = true; ed.threshold.Tengam = 500
         ck("tracking a new item counts",   count(), 1)
-reset() env.ed.targets.Infinity.asteroid = "Somewhere Else"
+reset() ed.targets.Infinity.asteroid = "Somewhere Else"
         ck("remapped dust counts",         count(), 1)
-reset() env.ed.par.steel.tips = 32
+reset() ed.par.steel.tips = 32
         ck("changed drill par counts",     count(), 1)
-reset() env.ed.par.steel = nil
+reset() ed.par.steel = nil
         ck("dropped drill par counts",     count(), 1)
-reset() env.ed.par.titanium = { tips = 64, rods = 64, batch = 64 }
+reset() ed.par.titanium = { tips = 64, rods = 64, batch = 64 }
         ck("added drill par counts",       count(), 1)
-reset() env.ed.settings.tipsPerLoad = 256; env.ed.threshold.Infinity = 1
+reset() ed.settings.tipsPerLoad = 256; ed.threshold.Infinity = 1
         ck("changes add up",               count(), 2)
 
 -- =============================================================================
@@ -247,6 +276,9 @@ section("broker-mk3.lua -- the drone / kit availability pool")
 -- a busy module used to be charged even when the ME sweep had ALREADY stopped
 -- counting its drone, so the pool went negative and a genuinely free drone
 -- would not dispatch.
+-- availableDrones/availableKits stayed in the broker -- they are dispatch, not
+-- editing -- so these still come out of its source.
+local broker = slurp("broker-mk3.lua")
 local poolSrc = broker:match("(local HW_STALE = .-\nlocal function availableKits.-\n  return avail\nend)")
 ck("pool functions extracted", poolSrc ~= nil, true)
 

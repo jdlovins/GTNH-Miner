@@ -37,7 +37,7 @@ local ROLES = {
     label = "Broker (main computer)",
     files = { "config.lua", "settings.lua",
               "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
-              "module_api.lua",
+              "module_api.lua", "editor.lua",
               "list_components.lua", "detect_module.lua", "detect_sides.lua", "find_item.lua",
               "migrate_drill.lua" },
     config = { ["job_node_config.example.lua"] = "job_node_config.lua" },

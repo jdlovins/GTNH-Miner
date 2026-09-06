@@ -115,6 +115,8 @@ MEDINA (Modular Extraction and Dispatch Intelligence Network Array) is a wireles
 - `settings.lua` — the tunable registry: every runtime knob declared once with its type, legal range and one-line help. `config.lua` seeds defaults from it, the editor's settings page is built from it, and the node broadcast is the subset marked `scope = "node"`. See SETTINGS.md.
 - `scheduler.lua` — cooperative task engine (spawn / sleep / await / lock; one clock via `computer.uptime`)
 - `loader.lua` — per-module load sequence, run as a task; read-back confirmation + identity-based item routing
+- `editor.lua` — the in-game condition editor (press `E`). Dependencies arrive through `editor.init(deps)`; the broker asks it only `isOpen()`, `handle(ev)`, `draw()` and `takeRequests()`. It was split out when `broker-mk3.lua` reached Lua's limit of 200 locals per chunk — the same layout `space-pumping` already uses.
+- `module_api.lua` — the GTNH 2.8 / 2.9 mining-module parameter API. Every version-dependent call to a module controller lives here and nowhere else.
 - `logger.lua` — configurable logging (file / console / Loki); disabled by default, ERROR/WARN to `/tmp/spacemining.log`
 
 **Network:**
