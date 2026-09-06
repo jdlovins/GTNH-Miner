@@ -101,7 +101,12 @@ io.write("reading  " .. CONFIG_PATH .. "\n")
 -- Already updated? Then this file's drill values are the new shipped ones and
 -- there is nothing of yours left in it to rescue. Say so plainly rather than
 -- reporting "no changes found", which would read as reassurance.
-if old.drillLoadFields then
+-- `settingsSpec` is the marker for a config.lua that carries the settings
+-- registry, which is every version that has an overlay at all. It replaced
+-- `drillLoadFields`, which was the marker while the five load fields were a
+-- table of their own -- checking for that now would call every current
+-- config.lua "old" and offer to migrate settings out of it that are not there.
+if old.settingsSpec or old.shippedSettings then
   io.write("\nThis config.lua is ALREADY the new version -- it has the drill overlay\n")
   io.write("built in, so whatever you had hand-edited was overwritten by the update.\n")
   io.write("\nIf you have a backup, point this script at it:\n")
@@ -217,7 +222,7 @@ out[#out + 1] = "--                shipped table, so untouched entries still fol
 out[#out + 1] = "--                config.lua."
 out[#out + 1] = "--   drillPar     restock floors you changed. Merged per material;"
 out[#out + 1] = "--                false means stop auto-crafting that material."
-out[#out + 1] = "--   drillLoad    load-buffer settings you changed. Merged per field."
+out[#out + 1] = "--   settings     tunables you changed, validated against settings.lua."
 out[#out + 1] = "--"
 out[#out + 1] = "-- The drill blocks below were migrated out of config.lua by migrate_drill."
 out[#out + 1] = ""
@@ -260,13 +265,44 @@ for _, key in ipairs(PAR_ORDER) do
 end
 out[#out + 1] = "  },"
 
-out[#out + 1] = "  drillLoad = {"
+-- The five load fields are ordinary settings now, so they are written into the
+-- `settings` block rather than a `drillLoad` one of their own.
+--
+-- Everything ELSE already in that block is copied through untouched. This
+-- script rewrites user_config.lua whole, and it is the only block here that can
+-- hold values this script knows nothing about -- dropping them would silently
+-- undo every unrelated setting the editor had saved.
+out[#out + 1] = "  settings = {"
+local settingsOut = {}
+local settingKeys = {}
+for key, v in pairs(type(user.settings) == "table" and user.settings or {}) do
+  settingsOut[key] = v
+  settingKeys[#settingKeys + 1] = key
+end
 for _, key in ipairs(LOAD_ORDER) do
+  -- Migrated value first, then anything a previous run left in either block.
   local v = loadOut[key]
   if v == nil and type(user.drillLoad) == "table" then v = user.drillLoad[key] end
   if type(v) == "number" then
-    out[#out + 1] = string.format("    %-16s = %d,", key, v)
+    if settingsOut[key] == nil then settingKeys[#settingKeys + 1] = key end
+    settingsOut[key] = v
   end
+end
+table.sort(settingKeys)
+for _, key in ipairs(settingKeys) do
+  local v = settingsOut[key]
+  local lit
+  if type(v) == "string" then lit = QUOTE .. v .. QUOTE
+  elseif type(v) == "boolean" then lit = v and "true" or "false"
+  elseif type(v) == "number" then lit = tostring(v)
+  end
+  -- Bracket a dotted key: `logging.enabled = x` is a syntax error in a table
+  -- constructor. Only preserved keys can be dotted -- the five migrated ones
+  -- never are -- but this file is rewritten whole, so a key it does not
+  -- understand still has to come out valid.
+  local name = key:find(".", 1, true)
+    and string.format("[%s%s%s]", QUOTE, key, QUOTE) or key
+  if lit then out[#out + 1] = string.format("    %-24s = %s,", name, lit) end
 end
 out[#out + 1] = "  },"
 out[#out + 1] = "}"

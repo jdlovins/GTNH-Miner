@@ -28,14 +28,17 @@ Each module has its own ME Interface adapter + transposer; one shared OC Databas
 
 | File | Runs on | Purpose |
 |------|---------|---------|
-| `config.lua` | *all nodes* | Master config — drones, drills, asteroids, plasmas, optimization matrix, dust targets and thresholds. Copy to `/home/config.lua` on every computer. |
+| `config.lua` | broker, job node | Shipped data — drones, drills, asteroids, the optimization matrix, dust targets and drill par. No longer copied to the telemetry nodes: they read `node_config.lua` instead and are sent everything else by the broker. |
+| `settings.lua` | broker, job node | The tunable registry. Every runtime knob is declared here once with its type, legal range and one-line help; `config.lua`, the broker's settings page and the node broadcast all read the same declarations. |
+| `node_config.lua` | dust node, fluid node | Ports and fallbacks, forty lines. Everything else those nodes need arrives from the broker at runtime. |
+| `reference.lua` | nothing | Data nothing loads: item registries, cycle-mode defaults, the module filter blacklist. Carved out of `config.lua` because no code read it. |
 | `broker-mk3.lua` | broker | **The broker.** Aggregates telemetry, dispatches jobs (drone-first with a per-asteroid cap), and spawns one cooperative load task per module. Requires `/home/job_node_config.lua`, `/home/scheduler.lua`, `/home/loader.lua`, `/home/logger.lua`. |
 | `scheduler.lua` | broker | Cooperative task engine: `spawn`, `sleep`, `await`, fair `lock`. One clock (`computer.uptime`). Lets all 6 loads run concurrently without freezing the UI/telemetry. You never edit this to add features — you spawn a task. |
 | `loader.lua` | broker | One module's consumable-load sequence, run as a scheduler task. Confirms database fingerprints by read-back and routes items into the input bus by identity (not slot position). |
-| `logger.lua` | broker | Logging with a configurable backend (file / console / Loki). Disabled by default — ERROR/WARN still written to `/tmp/spacemining.log`. Configure under `config.logging`. |
-| `dust_telem.lua` | dust node **(required)** | Queries the dust-storage ME subnet every 120 s; broadcasts tracked item stocks to the broker. Broker won't dispatch without it. |
+| `logger.lua` | broker | Logging with a configurable backend (file / console / Loki). Disabled by default — ERROR/WARN still written to `/tmp/spacemining.log`. Configured from the editor's settings page. |
+| `dust_telem.lua` | dust node **(required)** | Queries the dust-storage ME subnet on the interval the broker sets; broadcasts tracked item stocks back. What to scan is pushed by the broker, so this node holds no policy of its own. Broker won't dispatch without it. |
 | `hw_telem.lua` | hw node **(required)** | Scans the hardware-staging ME network every 10 s for drone counts and drill kit pairs. Broker won't dispatch without it. |
-| `fluid_telem.lua` | fluid node **(required)** | Queries the plasma ME fluid network every 10 s; broadcasts plasma volumes. Modules need plasma to run, so the broker won't dispatch without it. |
+| `fluid_telem.lua` | fluid node **(required)** | Queries the plasma ME fluid network on the interval the broker sets; broadcasts plasma volumes. Modules need plasma to run, so the broker won't dispatch without it. |
 | `job_node.lua` | remote worker *(optional)* | Legacy remote worker for additional modules on a separate computer. Retained for future multi-node fleets; not required for the single-broker setup. |
 
 ---
@@ -67,30 +70,85 @@ Each module has its own ME Interface adapter + transposer; one shared OC Databas
 
 ## Component Detail
 
-### `config.lua` — Shared Master Configuration
+### `config.lua` — Shipped Data
 
-Loaded by every node with `dofile("/home/config.lua")`. Sections:
+Loaded by the broker and by remote job nodes. **Not** by the telemetry nodes any
+more — see `node_config.lua` below. Sections:
 
 1. **Drone registry** — maps tier keys (`lv`…`max`) to exact ME item names
 2. **Drill consumables** — maps drill material keys to tip/rod item names
-3. **Module specs** — max parallels, power, and computation per MK tier
-4. **Plasma overdrive specs** — τ (time discount), λ (size bonus), mB per parallel
-5. **Cycle mode defaults** — distance sweep range/step for dynamic mode
+3. **Drone→drill map** — which material each drone tier burns
+4. **Module specs** — max parallels, power, and computation per MK tier
+5. **Plasma overdrive specs** — τ (time discount), λ (size bonus), mB per parallel
 6. **Asteroid database** — 41 asteroids with materials, weights, size range, distance range, computation, EU/t, drone tier bounds, and spawn weight
 7. **Optimization matrix** — per `[moduleTier][asteroid][droneKey]` optimal distance (pre-computed from the Space Elevator Calculator spreadsheet)
-8. **Dust target registry** — maps each tracked dust/item name to its source asteroid and a priority number
-9. **Module filter blacklist** — high-volume junk ores to exclude from module output
+8. **Asteroid outputs** — each asteroid's direct yield, extracted from the installed jar
+9. **Dust target registry** — maps each tracked dust/item name to its source asteroid and a priority number
 10. **Dust stock thresholds** — `config.conditions` — what the broker uses to decide when to mine
-11. **Dispatch** — `config.asteroidCap`: how many modules may work the same asteroid. Default is automatic — half the fleet plus one while several asteroids are wanted, and no limit when only one is, since the cap exists to divide the fleet between competing needs and there is nothing to divide against a single target. Pin it to a number, or `"all"` to never limit. `config.reserveWhileMining`: charge a drone and a full load of kits for every working module rather than only for commitments telemetry has not seen yet — off by default, since it holds back a spare drone per busy module; turn it on if the hardware node’s figures lag enough that two modules end up promised the same drone
-12. **Network settings** — `config.ports` (telemetry=2026; command=2027 reserved for optional remote job nodes; hardware=2025 for `DRILL_PAR` to the hw node), `config.pipelineCheckDelay` (default 120 s), `config.drillPar` (per-material stock the hw node auto-crafts back up to)
+11. **Ports** — `config.ports` (telemetry=2026, command=2027, hardware=2025)
+12. **Tunables** — seeded from `settings.lua`, then the user overlay applied
+13. **Drill restock par** — per-material stock the hw node auto-crafts back up to
+14. **User overlay** — `/home/user_config.lua` merged in
 
----
+Everything that used to sit at the bottom of this file as a hand-tuned scalar
+under a page of prose is now declared in `settings.lua` and edited in game.
+
+### `settings.lua` — The Tunable Registry
+
+One declaration per knob: its config key, its type (`bool` / `int` / `number` /
+`choice` / `text`), its default, its legal range, and one line of what it does.
+
+Three things read it, and they all read the same declarations:
+
+- **`config.lua`** seeds `config.<key>` with the default, then applies your
+  overlay through the same validation the editor uses.
+- **the broker's settings page** is *built from it* — a knob declared in
+  `settings.lua` appears in the editor, in its group, editable in the way its
+  type implies, with no change to `broker-mk3.lua` at all.
+- **the telemetry nodes** are sent the `scope = "node"` subset over the air.
+
+The long-form reasoning — the run-poll measurements, why `maxConcurrentLoads`
+is 0, what the top three drill tiers cost to keep at par — lives in
+**[SETTINGS.md](SETTINGS.md)**, not in a comment on a machine that only wanted
+to know a number. Read that when you want to understand a setting; use the
+editor when you want to change one.
+
+### `node_config.lua` — What a Telemetry Node Knows on Its Own
+
+The dust and fluid nodes used to `dofile("/home/config.lua")` for two numbers
+and a five-name list. That file is three thousand lines — the whole asteroid
+database, the output tables, the optimization matrix — parsed into the memory of
+a machine that then tries to hold a full ME network scan in what is left. It was
+the direct cause of the dust node's out-of-memory failures, and none of it was
+ever read there.
+
+So those nodes read `node_config.lua` instead: ports, and defaults for the
+handful of settings that reach them. Resolution order, most authoritative first:
+
+1. what the broker last sent (`NODE_SETTINGS`, on the command port)
+2. `/home/node_settings.lua`, the cached copy of that — so a node restarting
+   during a broker outage comes back configured rather than reverting
+3. the defaults in `node_config.lua`
+
+Each node's status line shows which of the three it is currently running on.
+`hw_telem.lua` goes further and loads no config at all; the one setting it
+cares about rides along with `DRILL_PAR` on its own port.
 
 ### `dust_telem.lua` — Dust Storage Monitor
 
 **Hardware:** T2 wireless card · T3 GPU · T3 screen · OC Adapter on the **dust-storage ME Controller**
 
-Reads `config.conditions` to know which items and thresholds to track. Queries `adapter.getItemsInNetwork()` and broadcasts a `DUST_UPDATE` payload every `pipelineCheckDelay` seconds (120 s by default — matched to the ore processing pipeline delay so the broker sees real post-processing inventory levels).
+Scans what the broker tells it to. The watchlist is `config.conditions`, pushed
+over the command port as `DUST_WATCHLIST` and cached locally, so what you track
+is edited in one place and this node cannot drift out of step with it. Queries
+`getItemsInNetwork()` on the `dustScanInterval` (10 s by default) and broadcasts
+a `DUST_UPDATE` payload with the stock of every watched label.
+
+A node that has never heard from the broker scans nothing and says so on its
+status line. That is deliberate: the local fallback it used to have could only
+be a stale guess at what the broker wanted, and a wrong watchlist reads on the
+dashboard as "we have none of this, mine it urgently". The broker re-sends every
+`watchlistInterval` (30 s), so the wait is short.
 
 **Display (80×25):**
 ```
@@ -119,7 +177,7 @@ Sorted by fill ratio ascending. Color: red < 25%, amber < 75%, cyan < 100%, dim 
 
 **Hardware:** T2 wireless card · T3 GPU · T3 screen · OC Adapter on the **plasma ME Fluid Controller**
 
-Scans for all five plasmas by exact name. Determines the highest-tier plasma currently in stock (from `config.plasmaKeyOrder`, tier-descending). Broadcasts `FLUID_UPDATE` every 10 s with all plasma volumes — the broker uses this for plasma selection regardless of mode.
+Scans for all five plasmas by exact name. Determines the highest-tier plasma currently in stock (from `node.plasmaOrder`, tier-descending). Broadcasts `FLUID_UPDATE` on the `fluidScanInterval` (10 s by default) with all plasma volumes — the broker uses this for plasma selection regardless of mode.
 
 **Display (80×25):**
 ```
@@ -303,34 +361,42 @@ RUNNING amber · LOADING yellow · ERROR red · IDLE dim.
 
 ## Deployment
 
-### 1. Shared config
+The easy way is `install-medina.lua`: run it on each computer, pick the role,
+and it fetches exactly the files that role needs. What follows is what it does.
 
-Copy `config.lua` to `/home/config.lua` on **every** computer in the system.
-
-### 2. Telemetry nodes
+### 1. Telemetry nodes
 
 **All three telem nodes are required** — dust (`dust_telem.lua`), hardware
 (`hw_telem.lua`), and fluid/plasma (`fluid_telem.lua`). The broker stays at
 "Waiting for telemetry..." and dispatches nothing until all three report. (Plasma
 is required because mining modules physically can't run without a plasma fluid.)
 
-Each telem node needs only its own script and `config.lua`:
+**Telem nodes do not get `config.lua`.** They never read it, and parsing three
+thousand lines of asteroid data was costing the dust node the memory it needed
+for its own ME scan.
 
 ```
-/home/config.lua
-/home/dust_telem.lua    (or hw_telem.lua / fluid_telem.lua)
+/home/node_config.lua   (dust and fluid nodes; ports and fallbacks)
+/home/dust_telem.lua    (or fluid_telem.lua)
 ```
+
+The hardware node needs `hw_telem.lua` and nothing else at all.
 
 Set `targetSide` at the top of each script to the side of the OC Adapter facing
 the relevant ME Controller (dust node → dust-storage network; hardware node →
 the network holding your drones/drill bits). Boot and leave running.
 
-### 3. Broker MK3 (primary deployment)
+On first boot a dust node has nothing to scan until the broker pushes it a
+watchlist, which happens within 30 seconds. Its status line says so while it
+waits.
+
+### 2. Broker MK3 (primary deployment)
 
 Copy these to the broker computer:
 
 ```
 /home/config.lua
+/home/settings.lua
 /home/job_node_config.lua    (your module hardware addresses)
 /home/broker-mk3.lua
 /home/scheduler.lua
@@ -344,10 +410,13 @@ Copy these to the broker computer:
    - per module: `tier`, `moduleAddr` (module controller adapter), `ifaceAddr` (ME interface adapter), `transposerAddr`, `interfaceSide`, `inputBusSide`
    - Find addresses with `list_components.lua`, or add modules with `detect_module.lua`.
 2. Run `broker-mk3.lua`. It prompts for **priority mode** (Threshold / Rarity), then draws the dashboard and begins dispatching once telemetry arrives.
+3. Press **E** for the editor. Everything else is tuned from there — what to
+   mine on the asteroid pages, drill consumables on `d`, and every other setting
+   in the system on `g`. Nothing needs you to stop the broker and edit Lua.
 
 To stop it, break the script with **Ctrl+Alt+C** in the OC console.
 
-### 4. Multi-node fleets (future / optional)
+### 3. Multi-node fleets (future / optional)
 
 The single broker is limited by the host computer's component budget (≈6 modules on a typical bus; far more on a creative component bus). The shared database caps the fleet at **27 modules** (81 slots ÷ 3). To scale past one broker's component limit, `job_node.lua` can run remote workers on additional computers — each driving its own modules and partitioning into the shared database. This is the path back toward the multi-elevator architecture; the per-asteroid cap already scales with total module count.
 
@@ -398,25 +467,67 @@ The single broker is limited by the host computer's component budget (≈6 modul
 
 ## Config file ownership
 
-Three files, three writers, one writer each. They never overwrite each other.
+Four files, one writer each. They never overwrite each other.
 
 | file | written by | contains |
 |---|---|---|
 | `config.lua` | this repo | shipped tables plus the generated `asteroidOutputs` block. Regenerated wholesale, so never hand-edit it in game. |
-| `user_config.lua` | the in-game editor (press `E`) | what you track, any dust→asteroid mappings you added, and your drill par and load-buffer overrides. Safe to hand-edit — the editor writes only what differs from the shipped values, so a hand-edit survives a save. |
+| `settings.lua` | this repo | the declarations every tunable is defined by: type, range, default, one-line help. Also regenerated wholesale. |
+| `user_config.lua` | the in-game editor (press `E`) | what you track, dust→asteroid mappings you added, your drill par, and every setting you changed. Safe to hand-edit — the editor writes only what differs from the shipped values, so a hand-edit survives a save. |
+| `job_node_config.lua` | `detect_module` / `detect_sides` | your hardware addresses and transposer sides. |
 
-Pressing `E` does not open the editor immediately: it starts a ten second
-countdown during which **no new jobs are dispatched**, so loads already running
-can finish and the broker drains to idle. The editor competes with the loader
-for OpenComputers' per-tick component call budget, so it is least responsive
-exactly when the broker is busiest — quiescing first is what makes it fast. Work
-in flight is never interrupted, which is why this is a countdown rather than a
+Nothing in this list needs to be edited by hand to run the system. That is the
+point of the editor: press `E`, change what you want, press `s`, and it applies
+live and is written to the one file updates never touch.
+
+### The editor
+
+Pressing `E` does not open it immediately: it starts a ten second countdown
+during which **no new jobs are dispatched**, so loads already running can finish
+and the broker drains to idle. The editor competes with the loader for
+OpenComputers' per-tick component call budget, so it is least responsive exactly
+when the broker is busiest — quiescing first is what makes it fast. Work in
+flight is never interrupted, which is why this is a countdown rather than a
 pause: freezing the scheduler would let loader timeouts expire against the wall
 clock and fail a load that was fine. `esc` cancels the countdown, and dispatch
 stays suspended for as long as the editor is open.
-| `job_node_config.lua` | `detect_module` / `detect_sides` | your hardware addresses and transposer sides. |
 
-`config.lua` applies `user_config.lua` as an overlay at the end:
+Four pages:
+
+| key | page | what it holds |
+|---|---|---|
+| — | asteroids / detail / items | what to mine and how much of it to keep |
+| `d` | drills | tips and rods per load, and the restock par per material |
+| `g` | settings | every other tunable in the system |
+| `/` | *(filter)* | narrows whichever page you are on |
+
+On the settings page `space` flips a boolean or cycles a choice in place, `t`
+types a value, and `r` restores the shipped default. Anything you have moved off
+its default is marked with a `*`, so a page of defaults reads as untouched and
+the one line you changed three weeks ago is still findable. `s` saves.
+
+The page is **built from `settings.lua`** — the broker names none of these
+settings itself. Declaring a knob there is the whole job of adding one here.
+
+### The overlay
+
+`config.lua` applies `user_config.lua` at the end:
+
+- **`settings`** — merged per key and validated against the declaration in
+  `settings.lua`. A value outside its legal range, or a key from a newer
+  version, is reported at boot and ignored; the broker carries on with the
+  default rather than refusing to start.
+
+  ```lua
+  settings = {
+    tipsPerLoad         = 256,
+    fastReload          = true,
+    asteroidCap         = "all",
+    ["logging.enabled"] = true,
+  }
+  ```
+
+  See **[SETTINGS.md](SETTINGS.md)** for what each one does.
 
 - **`conditions`** — yours replaces the shipped list outright. What you stock is
   your call.
@@ -434,44 +545,29 @@ stays suspended for as long as the editor is open.
   }
   ```
 
-  Editable in game: press `E`, then `d` for the drill page. Keep any par at or
-  above the larger of `tipsPerLoad`/`rodsPerLoad` (128) — that is the kit floor
-  dispatch enforces, and below it a material can sit "at par", never be crafted,
-  and still refuse to dispatch. The page shows that floor and warns when a value
-  you type falls under it. `config.drillCraftSlots` sets how many crafts may run
-  at once; set it to your AE2 crafting CPU count. Rounding down only slows
-  restocking, whereas setting it too high produces rejected requests.
+  Editable in game: press `E`, then `d`. Keep any par at or above the larger of
+  `tipsPerLoad`/`rodsPerLoad` (128) — that is the kit floor dispatch enforces,
+  and below it a material can sit "at par", never be crafted, and still refuse
+  to dispatch. The page shows that floor and warns when a value you type falls
+  under it.
 
   Each material carries two numbers: `tips`/`rods` are the stock **floor** that
   triggers a craft, and `batch` is the **request size** — always sent whole,
-  never the shortfall, so a material sitting just under its floor cannot tie up
-  a crafting CPU for a token amount. The trade is overshoot: a floor of 4096
-  with a batch of 4096 can land near 8k before settling. Lower `batch` to hold
-  less, or lower the floor to craft less often.
+  never the shortfall. SETTINGS.md has the full reasoning and the shipped table.
 
-  Shipped values are scaled to material cost — 4096 for
-  steel/titanium/tungstensteel, 2048 for the naquadahs, 1024 for neutronium, 256
-  for the top three tiers. Values are in items; one module refill is
-  `tipsPerLoad`/`rodsPerLoad` of each, which ships at 128.
+- **`drillLoad`** — the old home of the five load-buffer scalars, before they
+  became ordinary settings. Still read, so an upgrade loses nothing; the first
+  save from the editor folds it into `settings` and it does not come back.
 
-- **`drillLoad`** — merges per field over `tipsPerLoad`, `rodsPerLoad`,
-  `tipsToStart`, `rodsToStart` and `drillCraftSlots`. The same drill page writes
-  these, and they apply live: the loader runs inside the broker process and
-  re-reads config on every load, so a change takes effect on the next one rather
-  than at the next reboot. Par changes are re-broadcast to the hw telemetry node
-  immediately on save instead of waiting out the 30 s cadence.
+Everything applies live on save. The loader runs inside the broker process and
+re-reads config on every load, so buffer sizes take effect on the next one;
+drill par and node settings are re-broadcast immediately rather than waiting out
+the 30 s cadence.
 
-  ```lua
-  drillLoad = {
-    tipsPerLoad = 128,  -- items put in the bus per module load
-    tipsToStart = 64,   -- module starts once this many have arrived
-  }
-  ```
-
-The editor only persists mappings that are genuinely yours, compared against
-`config.shippedDustTargets` — the snapshot taken before the overlay is applied.
-Writing all of them back would freeze the shipped table and mask every future
-label correction.
+The editor only persists what is genuinely yours, compared against the snapshots
+`config.lua` takes before applying the overlay (`shippedDustTargets`,
+`shippedDrillPar`, `shippedSettings`). Writing everything back would freeze the
+shipped tables and mask every future correction.
 
 `user_config.lua` is optional. Without it the shipped defaults apply exactly as
 before, so a fresh install needs nothing extra.

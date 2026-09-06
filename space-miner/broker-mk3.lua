@@ -39,6 +39,16 @@ local getUnixTime = loggingModule.getCurrentTimestamp
 
 logger:info("========== BROKER-MK3 (v1.5) STARTUP ==========")
 
+-- Anything user_config.lua asked for that could not be honoured -- an unknown
+-- key, or a value outside the bounds its declaration allows. config.lua carries
+-- on with the default rather than refusing to boot, but silence here would mean
+-- an edit that quietly did nothing, so say so on the console as well as the log.
+for key, why in pairs(config.settingsRejected or {}) do
+  local line = "user_config.lua: ignoring " .. key .. " (" .. why .. ")"
+  logger:warn(line)
+  print(line)
+end
+
 -- Surface task crashes in the log instead of swallowing them.
 -- CRITICAL: also set loadResult so the module doesn't get stuck in LOADING forever.
 sched.onError = function(name, err)
@@ -60,7 +70,7 @@ local modem = component.modem
 if not modem.isWireless or not modem.isWireless() then
   error("Requires a T2 Wireless Network Card.")
 end
-modem.setStrength(400)
+modem.setStrength(config.wirelessStrength)
 modem.open(config.ports.telemetry)
 logger:info("Modem listening on port " .. config.ports.telemetry)
 
@@ -376,7 +386,9 @@ local dustScroll = 0
 -- real time -- so "0.2" and "10" were in a unit nobody had established and the
 -- waits they produced were whatever they happened to be. The scheduler's own
 -- header says not to mix the two; the lifecycle was doing it anyway.
-local DISPATCH_INTERVAL = 0.2
+-- Cadences live in settings.lua and are edited in game; they are read live from
+-- `config` at every use rather than copied into a local here, so an edit takes
+-- effect on the next pass instead of the next reboot.
 local lastDispatchCheck = 0
 local ERROR_TIMEOUT = 5      -- before a faulted module is recovered and reused
 local lastErrorTime = {}
@@ -987,7 +999,7 @@ local function stepDone(mod)
     mod.inactiveSinceAt = nil
     mod.nextHeartbeatAt = 0
     mod.lastRunWarnAt = 0
-    lastDispatchCheck = computer.uptime() - DISPATCH_INTERVAL
+    lastDispatchCheck = computer.uptime() - config.dispatchInterval
   end
 end
 
@@ -2253,7 +2265,7 @@ end
 --   - scheduler + module lifecycle: every iteration (loads are time-sensitive)
 --   - messages: serviced with a tiny event.pull timeout so we spin fast
 --   - UI redraw: ~4x/second (humans don't need more; GPU calls are expensive)
---   - dispatch: every DISPATCH_INTERVAL
+--   - dispatch: every config.dispatchInterval
 -- =============================================================================
 -- CONDITION EDITOR  (press E on the dashboard)
 --
@@ -2287,7 +2299,7 @@ end
 --   fail it. All text entry is incremental instead -- every keystroke arrives
 --   as an ordinary event through the same loop.
 --
--- THREE PAGES, NOT ONE:
+-- FOUR PAGES, NOT ONE:
 --   asteroids/detail/items   what to mine and how much of it to keep.
 --   drills                   the consumables that make mining possible at all --
 --                            how many tips and rods go into a module, and what
@@ -2295,10 +2307,22 @@ end
 --                            here: those numbers used to mean closing the broker
 --                            and editing Lua, and they are exactly the numbers
 --                            you want to move while watching a module stall.
+--   settings                 every other tunable in the system, built from the
+--                            declarations in settings.lua. Booleans flip in
+--                            place, choices cycle, numbers are typed and checked
+--                            against their own bounds. Nothing on this page is
+--                            named in this file, so declaring a knob over there
+--                            is the entire job of adding one here.
+--
+-- The point of the last two is that there is now no reason to leave the program.
+-- Every value that used to mean stopping the broker, editing Lua and restarting
+-- is reachable from here, applies live on save, and is written to a file updates
+-- never overwrite.
 --
 -- KEYS: up/down/pgup/pgdn/home/end move   enter drill in / commit
---       space toggle   t type amount   T step the ladder   a add downstream item
---       d drills page  / filter       s save    esc back, or close at the top level
+--       space toggle or cycle   t type a value   T step the ladder
+--       r reset to shipped      a add downstream item
+--       d drills   g settings   / filter   s save   esc back, or close at the top
 -- =============================================================================
 
 local USER_CONFIG_PATH   = "/home/user_config.lua"
@@ -2308,6 +2332,7 @@ local DEFAULT_TARGET     = 5000000
 
 local edRequestWatchlist = false   -- set on save; main loop re-broadcasts
 local edRequestPar       = false   -- ditto, for DRILL_PAR
+local edRequestNodes     = false   -- ditto, for NODE_SETTINGS
 
 -- THE DRILL PAGE, IN ONE TABLE.
 --
@@ -2318,22 +2343,24 @@ local edRequestPar       = false   -- ditto, for DRILL_PAR
 -- and helper is reachable from one name.
 local DRILL = {}
 
--- The scalar settings the page can move, in the order they are shown. Every one
--- of these is read live -- the loader runs in this process and reads config on
--- each load, and drillCraftSlots rides along with the next DRILL_PAR broadcast
--- -- so a save takes effect on the next load, not the next reboot.
+-- The load-buffer settings shown on the drills page. They are ordinary entries
+-- in the settings registry, named here only to say WHICH ones belong beside the
+-- par table -- because that is where you are standing when you want to move
+-- them. Editing one here and editing it on the settings page are the same edit
+-- against the same working copy.
 DRILL.fields = {
-  { key = "tipsPerLoad",     label = "Drill tips per load",
-    help = "tips put in the bus per module load" },
-  { key = "rodsPerLoad",     label = "Drill rods per load",
-    help = "rods put in the bus per module load" },
-  { key = "tipsToStart",     label = "Tips needed to start",
-    help = "module starts once this many have arrived" },
-  { key = "rodsToStart",     label = "Rods needed to start",
-    help = "module starts once this many have arrived" },
-  { key = "drillCraftSlots", label = "Concurrent drill crafts",
-    help = "match your AE2 crafting CPUs -- too high gets requests rejected" },
+  "tipsPerLoad", "rodsPerLoad", "tipsToStart", "rodsToStart", "drillCraftSlots",
 }
+
+-- THE SETTINGS PAGE, IN ONE TABLE -- same reason DRILL is one table: the main
+-- chunk is close enough to Lua's 200-local limit that a dozen more top-level
+-- locals would not fit.
+--
+-- The page is BUILT FROM THE REGISTRY, not written out here. Declaring a knob
+-- in settings.lua is the whole job: it appears in its group, with its help
+-- line, editable in the way its type implies, validated against its own bounds,
+-- and saved to user_config.lua. Nothing in this file names it.
+local SET = { spec = config.settingsSpec }
 
 -- Fallback for a material with no shipped par at all (the top three tiers ship
 -- with one, but a hand-trimmed config.lua may not). Deliberately small: turning
@@ -2342,7 +2369,7 @@ DRILL.fallback = { tips = 256, rods = 256, batch = 256 }
 
 local ed = {
   open = false,
-  mode = "asteroids",          -- "asteroids" | "detail" | "items" | "drills"
+  mode = "asteroids",          -- asteroids | detail | items | drills | settings
   asteroid = nil,              -- selected asteroid while in detail mode
   rows = {},                   -- row model for the current mode
   sel = 1, scroll = 0,
@@ -2351,7 +2378,7 @@ local ed = {
   enabled = {}, threshold = {},-- working copy of config.conditions
   targets = {},                -- working copy of config.dustTargets
   par = {},                    -- working copy of config.drillPar (nil = not ordered)
-  load = {},                   -- working copy of the DRILL.fields settings
+  settings = {},               -- working copy of config.settings (every knob)
   added = {},                  -- items newly mapped this session
   msg = "", msgColor = 0x888888,
   dirty = true,
@@ -2387,8 +2414,11 @@ local function edLoad()
     end
   end
 
-  ed.load = {}
-  for _, f in ipairs(DRILL.fields) do ed.load[f.key] = config[f.key] end
+  -- The whole registry, in stored form. One working copy behind both the
+  -- settings page and the drills page, so the same knob cannot hold two
+  -- different pending values depending on where you looked at it.
+  ed.settings = {}
+  for key, value in pairs(config.settings) do ed.settings[key] = value end
 end
 
 -- "naquadahAlloy" -> "Naquadah Alloy". The tip label is the only place the
@@ -2404,7 +2434,7 @@ end
 -- page shows it rather than letting you discover it as a module that refuses to
 -- go out with plenty of kits on the shelf.
 function DRILL.floor()
-  return math.max(ed.load.tipsPerLoad or 64, ed.load.rodsPerLoad or 64)
+  return math.max(ed.settings.tipsPerLoad or 64, ed.settings.rodsPerLoad or 64)
 end
 
 local function outputsFor(name)
@@ -2573,9 +2603,10 @@ function DRILL.build()
 
   rows[#rows + 1] = { kind = "header",
     text = "LOAD BUFFER  (what a module load puts in the input bus)" }
-  for _, f in ipairs(DRILL.fields) do
-    if matchesFilter(f.label) then
-      rows[#rows + 1] = { kind = "setting", field = f }
+  for _, key in ipairs(DRILL.fields) do
+    local spec = SET.spec.byKey[key]
+    if spec and (matchesFilter(spec.label) or matchesFilter(key)) then
+      rows[#rows + 1] = { kind = "opt", spec = spec }
     end
   end
 
@@ -2605,6 +2636,8 @@ local function edRebuild()
     ed.rows = buildDetail(ed.asteroid)
   elseif ed.mode == "drills" then
     ed.rows = DRILL.build()
+  elseif ed.mode == "settings" then
+    ed.rows = SET.build()
   else
     ed.rows = buildItems()
   end
@@ -2785,11 +2818,11 @@ end
 -- accident and finding out days later from a module that will not dispatch.
 function DRILL.warn(key)
   local floor = DRILL.floor()
-  if key == "tipsToStart" and (ed.load.tipsToStart or 0) > (ed.load.tipsPerLoad or 0) then
+  if key == "tipsToStart" and (ed.settings.tipsToStart or 0) > (ed.settings.tipsPerLoad or 0) then
     edSay("tips to start is above tips per load -- the loader clamps it down", 0xFFAA00)
     return
   end
-  if key == "rodsToStart" and (ed.load.rodsToStart or 0) > (ed.load.rodsPerLoad or 0) then
+  if key == "rodsToStart" and (ed.settings.rodsToStart or 0) > (ed.settings.rodsPerLoad or 0) then
     edSay("rods to start is above rods per load -- the loader clamps it down", 0xFFAA00)
     return
   end
@@ -2808,23 +2841,115 @@ function DRILL.warn(key)
   end
 end
 
-function DRILL.editSetting(f)
-  local cur = ed.load[f.key]
-  edPrompt(f.label .. "?" .. (cur and ("  (now " .. cur .. ")") or "") ..
-           "  -- " .. f.help,
+-- ---------------------------------------------------------------------------
+-- SETTINGS: EDIT, TOGGLE, RESET
+--
+-- Everything here is driven by the declaration, never by the key. A bool flips,
+-- a choice cycles, a number is typed and checked against its own bounds -- and
+-- the type-specific part of that is exactly three branches, in SET.activate.
+-- ---------------------------------------------------------------------------
+
+function SET.shipped(key) return (config.shippedSettings or {})[key] end
+
+function SET.changed(key)
+  local shipped = SET.shipped(key)
+  return shipped ~= nil and ed.settings[key] ~= shipped
+end
+
+-- Type a value. Numbers accept the same k/m suffixes as everything else in the
+-- editor; text is taken as typed. Out-of-range input is REFUSED with the bound
+-- that rejected it, rather than clamped -- a clamp hides a typo.
+function SET.prompt(spec)
+  -- A bool has nothing to type. Reaching the prompt for one -- via `t`, which
+  -- means "edit this" everywhere else in the editor -- should still do the
+  -- obvious thing rather than asking you to spell out "false".
+  if spec.type == "bool" then SET.activate(spec) return end
+
+  local cur = ed.settings[spec.key]
+  local hint = ""
+  if spec.type == "choice" then
+    hint = "  [" .. table.concat(spec.choices, " ") .. "]"
+  elseif spec.min or spec.max then
+    hint = string.format("  [%s..%s]", tostring(spec.min or "-"), tostring(spec.max or "-"))
+  end
+  edPrompt(spec.label .. "?  (now " .. SET.spec.display(spec, cur) .. ")" .. hint ..
+           "  -- " .. spec.help,
     function(txt)
       if not txt or txt == "" then edSay("unchanged") return end
-      local n = parseQty(txt)
-      if not n or n < 1 then
-        edSay("did not understand '" .. tostring(txt) .. "' -- unchanged", 0xFF4444)
+      -- parseQty understands "4k", which is how every other number in this
+      -- editor is typed -- but it FLOORS, so a fractional setting like
+      -- runPollIdle would silently become an integer if it went through there.
+      -- Fractions first for those, suffixes first for the rest, and text
+      -- settings never go near it: "4k" is a perfectly good string.
+      local candidate = txt
+      if spec.type == "number" then
+        candidate = tonumber(txt) or parseQty(txt) or txt
+      elseif spec.type == "int" then
+        candidate = parseQty(txt) or tonumber(txt) or txt
+      end
+      local value, why = SET.spec.coerce(spec, candidate)
+      if value == nil then
+        edSay(spec.label .. ": " .. tostring(why) .. " -- unchanged", 0xFF4444)
         return
       end
-      edTouch()
-      ed.load[f.key] = n
-      edSay(f.label .. " -> " .. n, 0x00FF00)
-      DRILL.warn(f.key)
-      edRebuild()
+      SET.commit(spec, value)
     end)
+end
+
+function SET.commit(spec, value)
+  edTouch()
+  ed.settings[spec.key] = value
+  edSay(spec.label .. " -> " .. SET.spec.display(spec, value), 0x00FF00)
+  DRILL.warn(spec.key)
+  edRebuild()
+end
+
+-- What space and enter do to a row, decided by the declaration. A bool or a
+-- choice moves in place -- no prompt, no typing, which is the whole point of
+-- being able to flip a setting from here.
+function SET.activate(spec)
+  if spec.type == "bool" or spec.type == "choice" then
+    SET.commit(spec, SET.spec.cycle(spec, ed.settings[spec.key]))
+  else
+    SET.prompt(spec)
+  end
+end
+
+function SET.reset(spec)
+  local shipped = SET.shipped(spec.key)
+  if shipped == nil then edSay("no shipped default for " .. spec.key, 0xFFAA00) return end
+  if ed.settings[spec.key] == shipped then edSay(spec.label .. " is already the default") return end
+  SET.commit(spec, shipped)
+  edSay(spec.label .. " reset to the shipped default: " ..
+        SET.spec.display(spec, shipped), 0x00FF00)
+end
+
+-- The page. Groups in declaration order, settings within a group in the order
+-- they are declared, so settings.lua reads the way the screen looks.
+function SET.build()
+  local rows = {}
+  for _, group in ipairs(SET.spec.groups) do
+    local body = {}
+    for _, spec in ipairs(SET.spec.list) do
+      if (spec.group or "other") == group.id then
+        if spec.type == "note" then
+          body[#body + 1] = { kind = "note", text = spec.text }
+        elseif matchesFilter(spec.label) or matchesFilter(spec.key) then
+          body[#body + 1] = { kind = "opt", spec = spec }
+        end
+      end
+    end
+    -- A group whose settings were all filtered out contributes nothing, not an
+    -- empty heading. Notes go with them: a note about rows you cannot see is
+    -- just clutter.
+    local hasOpt = false
+    for _, r in ipairs(body) do if r.kind == "opt" then hasOpt = true break end end
+    if hasOpt then
+      rows[#rows + 1] = { kind = "header", text = group.label }
+      for _, r in ipairs(body) do rows[#rows + 1] = r end
+    end
+  end
+  return rows
 end
 
 function DRILL.toggle(key)
@@ -2956,7 +3081,8 @@ local function edSave()
   out[#out + 1] = "--                config.lua."
   out[#out + 1] = "--   drillPar     restock floors you changed. Merged per material;"
   out[#out + 1] = "--                false means stop auto-crafting that material."
-  out[#out + 1] = "--   drillLoad    load-buffer settings you changed. Merged per field."
+  out[#out + 1] = "--   settings     tunables you changed, validated against settings.lua."
+  out[#out + 1] = "--                Anything not listed follows the shipped default."
   out[#out + 1] = ""
   out[#out + 1] = "return {"
 
@@ -3007,14 +3133,34 @@ local function edSave()
   end
   out[#out + 1] = "  },"
 
-  local shippedLoad = config.shippedDrillLoad or {}
-  local loadCount = 0
-  out[#out + 1] = "  drillLoad = {"
-  for _, f in ipairs(DRILL.fields) do
-    local v = ed.load[f.key]
-    if v and v ~= shippedLoad[f.key] then
-      out[#out + 1] = string.format("    %-16s = %d,", f.key, v)
-      loadCount = loadCount + 1
+  -- Settings: only what differs from the shipped default, for the same reason
+  -- as the two tables above. Written in DECLARATION order rather than pairs()
+  -- order so the file is stable across saves and a diff of it is readable.
+  --
+  -- No drillLoad block any more. Its five fields are ordinary settings now, and
+  -- writing both would leave two places claiming to hold tipsPerLoad. config.lua
+  -- still READS a legacy drillLoad, so an upgrade does not lose tuning -- but
+  -- the first save from here rewrites it into `settings` and it never comes back.
+  local setCount = 0
+  out[#out + 1] = "  settings = {"
+  for _, spec in ipairs(SET.spec.list) do
+    if spec.key and SET.changed(spec.key) then
+      local v = ed.settings[spec.key]
+      local lit
+      if type(v) == "string"  then lit = QUOTE .. v .. QUOTE
+      elseif type(v) == "boolean" then lit = v and "true" or "false"
+      else lit = tostring(v) end
+      -- A dotted key is a path into a nested table (logging.enabled), and
+      -- `logging.enabled = true` inside a table constructor is a syntax error,
+      -- not a nested write. Bracket it. The overlay reads these back with
+      -- pairs() and looks each one up in the registry by its full dotted name,
+      -- so the string form is what it wants.
+      local name = spec.key:find(".", 1, true)
+        and string.format("[%s%s%s]", QUOTE, spec.key, QUOTE)
+        or spec.key
+      out[#out + 1] = string.format("    %-24s = %s,   -- default %s", name, lit,
+        SET.spec.display(spec, SET.shipped(spec.key)))
+      setCount = setCount + 1
     end
   end
   out[#out + 1] = "  },"
@@ -3048,13 +3194,18 @@ local function edSave()
   dustScroll         = 0
   edRequestWatchlist = true
 
-  -- Apply the drill side live too. The loader reads config on every load, so the
-  -- buffer sizes take effect on the next one; par has to go over the wire, which
-  -- is what edRequestPar asks the main loop to do rather than waiting out the
-  -- 30s broadcast cadence.
-  for _, f in ipairs(DRILL.fields) do
-    if ed.load[f.key] then config[f.key] = ed.load[f.key] end
+  -- Apply the settings live, through the SAME mapping config.lua used at boot,
+  -- so a knob cannot behave one way after a reboot and another after an edit.
+  -- The loader and the dispatch loop read config on every pass, so nothing here
+  -- needs a restart.
+  for key, value in pairs(ed.settings) do
+    config.settings[key] = value
+    SET.spec.applyOne(config, key, value)
   end
+  -- Anything with scope="node" has to reach the nodes, which is what this asks
+  -- the main loop to do rather than waiting out the broadcast cadence.
+  edRequestNodes = true
+
   local newPar = {}
   for key, p in pairs(ed.par) do
     newPar[key] = { tips = p.tips, rods = p.rods, batch = p.batch }
@@ -3066,24 +3217,28 @@ local function edSave()
   edTouch()
 
   edSay(string.format(
-    "saved %d tracked, %d own mappings, %d drill par, %d load setting(s) -> applied live",
-    #conds, mineCount, parCount, loadCount), 0x00FF00)
+    "saved %d tracked, %d own mappings, %d drill par, %d setting(s) -> applied live",
+    #conds, mineCount, parCount, setCount), 0x00FF00)
 end
 
 local edButtons = {}
 local function edLayoutButtons()
   local defs
   if ed.mode == "asteroids" then
-    defs = { { "ITEMS", "items" }, { "DRILLS", "drills" }, { "FIND", "find" },
-             { "SAVE", "save" }, { "CLOSE", "close" } }
+    defs = { { "ITEMS", "items" }, { "DRILLS", "drills" }, { "SETTINGS", "settings" },
+             { "FIND", "find" }, { "SAVE", "save" }, { "CLOSE", "close" } }
   elseif ed.mode == "detail" then
-    defs = { { "BACK", "back" }, { "ADD", "add" }, { "FIND", "find" }, { "SAVE", "save" }, { "CLOSE", "close" } }
-  elseif ed.mode == "drills" then
-    defs = { { "ASTEROIDS", "asteroids" }, { "FIND", "find" }, { "SAVE", "save" },
-             { "CLOSE", "close" } }
-  else
-    defs = { { "ASTEROIDS", "asteroids" }, { "DRILLS", "drills" }, { "FIND", "find" },
+    defs = { { "BACK", "back" }, { "ADD", "add" }, { "FIND", "find" },
              { "SAVE", "save" }, { "CLOSE", "close" } }
+  elseif ed.mode == "drills" then
+    defs = { { "ASTEROIDS", "asteroids" }, { "SETTINGS", "settings" }, { "FIND", "find" },
+             { "SAVE", "save" }, { "CLOSE", "close" } }
+  elseif ed.mode == "settings" then
+    defs = { { "ASTEROIDS", "asteroids" }, { "DRILLS", "drills" }, { "FIND", "find" },
+             { "RESET", "reset" }, { "SAVE", "save" }, { "CLOSE", "close" } }
+  else
+    defs = { { "ASTEROIDS", "asteroids" }, { "DRILLS", "drills" }, { "SETTINGS", "settings" },
+             { "FIND", "find" }, { "SAVE", "save" }, { "CLOSE", "close" } }
   end
   edButtons = {}
   local x = 2
@@ -3209,6 +3364,8 @@ local function edDraw()
     title = "CONDITION EDITOR  /  " .. tostring(ed.asteroid)
   elseif ed.mode == "drills" then
     title = "CONDITION EDITOR  /  drill consumables"
+  elseif ed.mode == "settings" then
+    title = "CONDITION EDITOR  /  settings"
   else
     title = "CONDITION EDITOR  /  all tracked items"
   end
@@ -3218,8 +3375,14 @@ local function edDraw()
   for _ in pairs(ed.enabled) do n = n + 1 end
   local hint
   if ed.mode == "drills" then
-    hint = string.format("space=on/off  enter=edit all three  t=edit  /=find  s=save  esc=back%s",
+    hint = string.format("space=on/off  enter=edit all three  t=edit  g=settings  /=find  s=save  esc=back%s",
       ed.filter and ("  |  filter: " .. ed.filter) or "")
+  elseif ed.mode == "settings" then
+    local changed = 0
+    for key in pairs(ed.settings) do if SET.changed(key) then changed = changed + 1 end end
+    hint = string.format(
+      "%d changed from shipped  |  space=toggle/cycle  t=type  r=reset  /=find  s=save  esc=back%s",
+      changed, ed.filter and ("  |  filter: " .. ed.filter) or "")
   else
     hint = string.format(
       "%d tracked  |  space=toggle  t=type amount  T=step  a=add  d=drills  /=find  s=save  esc=back%s",
@@ -3231,6 +3394,11 @@ local function edDraw()
     edPaint(4, "h:ast", 0x000000, {
       { X_NAME, "ASTEROID", 0x888888 }, { X_A, "MODULE", 0x888888 },
       { X_B, "DRONES", 0x888888 },      { X_C, "TRACKED", 0x888888 },
+    })
+  elseif ed.mode == "settings" then
+    edPaint(4, "h:settings", 0x000000, {
+      { X_NAME, "SETTING", 0x888888 }, { X_A, "VALUE", 0x888888 },
+      { X_C, "WHAT IT DOES", 0x888888 },
     })
   elseif ed.mode == "drills" then
     edPaint(4, "h:drills", 0x000000, {
@@ -3271,11 +3439,25 @@ local function edDraw()
       elseif row.kind == "note" then
         cells[1] = { 6, row.text, 0x555555 }
 
-      elseif row.kind == "setting" then
-        local f = row.field
-        cells[#cells+1] = { X_NAME, f.label, 0x00FFFF }
-        cells[#cells+1] = { X_A, tostring(ed.load[f.key] or "-"), 0x00FF00 }
-        cells[#cells+1] = { X_C, f.help:sub(1, W - X_C), 0x666666 }
+      elseif row.kind == "opt" then
+        local spec = row.spec
+        local value = ed.settings[spec.key]
+        -- A boolean gets a checkbox, because that is what a boolean is and
+        -- because the checkbox is also the click target. Everything else shows
+        -- its value in the VALUE column and is typed or cycled.
+        if spec.type == "bool" then
+          cells[#cells+1] = { X_MARK, value and "[x]" or "[ ]",
+                              value and 0x00FFFF or 0x555555 }
+        end
+        -- Anything moved off its shipped default is marked, so a page of
+        -- defaults reads as untouched at a glance and the one line you changed
+        -- three weeks ago is still findable.
+        local moved = SET.changed(spec.key)
+        cells[#cells+1] = { X_NAME, (moved and "* " or "  ") .. spec.label,
+                            moved and 0xFFFFFF or 0x00FFFF }
+        cells[#cells+1] = { X_A, SET.spec.display(spec, value),
+                            moved and 0xFFAA00 or 0x00FF00 }
+        cells[#cells+1] = { X_C, spec.help:sub(1, W - X_C), 0x666666 }
 
       elseif row.kind == "par" then
         local par  = ed.par[row.key]
@@ -3387,7 +3569,7 @@ local function edAction(a)
     edInvalidate()
     drawStaticFrame()
   elseif a == "back" then
-    if ed.mode == "detail" or ed.mode == "drills" then
+    if ed.mode == "detail" or ed.mode == "drills" or ed.mode == "settings" then
       ed.mode, ed.asteroid = "asteroids", nil
       ed.sel, ed.scroll = 1, 0
       edRebuild()
@@ -3402,6 +3584,15 @@ local function edAction(a)
     ed.sel, ed.scroll = 1, 0
     edRebuild()
     edMoveSel(1)   -- row 1 is a header
+  elseif a == "settings" then
+    ed.mode, ed.asteroid = "settings", nil
+    ed.sel, ed.scroll = 1, 0
+    edRebuild()
+    edMoveSel(1)   -- row 1 is a header
+  elseif a == "reset" then
+    local row = selectedRow()
+    if row and row.kind == "opt" then SET.reset(row.spec)
+    else edSay("select a setting first -- R restores its shipped default", 0xFFAA00) end
   elseif a == "asteroids" then
     ed.mode, ed.asteroid = "asteroids", nil; ed.sel, ed.scroll = 1, 0; edRebuild()
   elseif a == "add" then
@@ -3422,8 +3613,8 @@ local function edOpenSelected()
     ed.sel, ed.scroll = 1, 0
     edRebuild()
     edMoveSel(1)
-  elseif row.kind == "setting" then
-    DRILL.editSetting(row.field)
+  elseif row.kind == "opt" then
+    SET.activate(row.spec)
   elseif row.kind == "par" then
     DRILL.editAll(row.key)
   elseif row.kind == "item" and ed.mode == "items" then
@@ -3457,8 +3648,15 @@ local function edHandle(ev)
         ed.sel = idx
         if row.kind == "asteroid" then
           edOpenSelected()
-        elseif row.kind == "setting" then
-          DRILL.editSetting(row.field)
+        elseif row.kind == "opt" then
+          -- Clicking the VALUE column opens the prompt, so a long choice list
+          -- can be typed rather than cycled through. A bool has nothing to
+          -- type, so it toggles wherever you click it.
+          if x >= X_A and x < X_C and row.spec.type ~= "bool" then
+            SET.prompt(row.spec)
+          else
+            SET.activate(row.spec)
+          end
         elseif row.kind == "par" then
           -- Click the column you want rather than walking all three.
           if     x >= X_A and x < X_B then DRILL.editField(row.key, "tips")
@@ -3533,22 +3731,24 @@ local function edHandle(ev)
         edOpenSelected()
       elseif row and row.kind == "par" then
         DRILL.toggle(row.key)
-      elseif row and row.kind == "setting" then
-        DRILL.editSetting(row.field)
+      elseif row and row.kind == "opt" then
+        SET.activate(row.spec)
       end
     elseif ch == 116 then                                   -- t: type an amount
       local row = selectedRow()
       if row and row.kind == "item" then edTypeTarget(row.item)
       elseif row and row.kind == "par" then DRILL.editAll(row.key)
-      elseif row and row.kind == "setting" then DRILL.editSetting(row.field) end
+      elseif row and row.kind == "opt" then SET.prompt(row.spec) end
     elseif ch == 84 then                                    -- T: step the ladder
       local row = selectedRow()
       if row and row.kind == "item" then edCycleTarget(row.item) end
+    elseif ch == 114 or ch == 82 then edAction("reset")     -- r: shipped default
     elseif ch == 97  then edAction("add")
     elseif ch == 47  then edAction("find")
     elseif ch == 115 then edAction("save")
     elseif ch == 105 then edAction("items")
     elseif ch == 100 then edAction("drills")                -- d: drill consumables
+    elseif ch == 103 then edAction("settings")              -- g: settings page
     end
     return true
   end
@@ -3556,24 +3756,8 @@ local function edHandle(ev)
   return false
 end
 
--- Seconds between dashboard repaints.
---
--- This was 0.25 when every repaint cost 223 component calls and spanned several
--- ticks -- the panels painted progressively, which is why the screen looked
--- continuously busy. With the row cache an unchanged frame costs nothing, so the
--- interval stopped being a throttle and became the only source of latency:
--- updates arrived in four visible steps a second with nothing moving between.
---
--- Worst case here (every row changing on every frame) is ~800 calls/second,
--- which is what the old code spent unconditionally. The realistic case is zero.
--- 0.25 was sized for 223-call repaints. Zero is now the cost of an unchanged
--- frame, so the interval had become the only latency -- but going to 0.05 was
--- overcorrecting: the panels still rebuild their row strings every frame, so
--- 20fps meant five times the Lua work for a screen that mostly does not change.
--- 0.1 is 2.5x more responsive than the original and 2.5x the CPU, on a broker
--- whose CPU budget matters because six loaders share it.
-local UI_INTERVAL = 0.1
-local lastUIDraw  = 0
+-- Dashboard repaint cadence: config.uiInterval. See SETTINGS.md for why 0.1.
+local lastUIDraw = 0
 
 -- ---------------------------------------------------------------------------
 -- QUIESCING BEFORE THE EDITOR
@@ -3590,16 +3774,10 @@ local lastUIDraw  = 0
 --
 -- If loads are still running when the countdown ends we keep waiting rather
 -- than open into the exact contention this exists to avoid -- but only up to
--- QUIESCE_GRACE, so a wedged module cannot lock you out of the editor.
+-- config.quiesceGrace, so a wedged module cannot lock you out of the editor.
+--
+-- Both timings are settings (quiesceSeconds, quiesceGrace); see SETTINGS.md.
 -- ---------------------------------------------------------------------------
-local QUIESCE_SECONDS = 10   -- countdown before the editor opens
--- Extra wait for in-flight work once the countdown ends, then open regardless.
--- Generous on purpose: a three-item load confirms each fingerprint by read-back
--- and waits on ME delivery (ARRIVE_TIMEOUT alone is 15s per item), so a healthy
--- load on a laggy server can easily outlast a short grace -- and opening early
--- lands you in exactly the contention this feature exists to avoid.
-local QUIESCE_GRACE   = 60
-
 local edPending = nil        -- { openAt, hardAt } while counting down
 local edPendingShown = nil   -- last text painted, so we only repaint on change
 local edPendingPaints = -1   -- dashPaints when we last drew it, to detect damage
@@ -3661,8 +3839,7 @@ end
 -- Sent on startup and re-sent periodically, so a node that boots later (or
 -- restarts) picks it up without having to ask.
 -- ---------------------------------------------------------------------------
-local WATCHLIST_INTERVAL = 30   -- seconds between re-broadcasts
-local lastWatchlistSend  = 0
+local lastWatchlistSend = 0
 
 local function broadcastWatchlist()
   local list = {}
@@ -3674,6 +3851,32 @@ local function broadcastWatchlist()
     sender      = nodeId,
     payloadType = "DUST_WATCHLIST",
     data        = list,
+  }))
+end
+
+-- ---------------------------------------------------------------------------
+-- NODE SETTINGS
+--
+-- The scope="node" subset of the settings registry, pushed to the dust and
+-- fluid nodes on the command port. This is what lets those machines ship with
+-- node_config.lua -- forty lines of ports and fallbacks -- instead of a copy of
+-- config.lua they only ever read three values out of.
+--
+-- Sent on the same slow timer as the watchlist, and again immediately after a
+-- save, so an edit lands within a second rather than within a cadence. Nodes
+-- cache what they receive, so one that restarts during a broker outage comes
+-- back configured rather than reverting to its fallbacks.
+--
+-- The hw node is not an audience here: it stays off the command port (see the
+-- note beside config.ports), and the one setting it cares about,
+-- drillCraftSlots, already rides along with DRILL_PAR on its own port.
+-- ---------------------------------------------------------------------------
+local function broadcastNodeSettings()
+  modem.broadcast(config.ports.command, serial.serialize({
+    protocol    = "MEDINA_COMMAND",
+    sender      = nodeId,
+    payloadType = "NODE_SETTINGS",
+    data        = config.settingsSpec.nodePayload(config.settings),
   }))
 end
 
@@ -3734,6 +3937,7 @@ end
 -- otherwise be 30s away, and a node that just started sits on "Awaiting par"
 -- long enough to look broken.
 pcall(broadcastDrillPar)
+pcall(broadcastNodeSettings)
 
 while true do
   -- 1. Service one inbound message. Very short timeout: returns immediately if a
@@ -3768,7 +3972,8 @@ while true do
   elseif ev[1] == "key_down" and ev[3] == 101 and not edPending then  -- "e"
     -- Do not open yet: start quiescing. See QUIESCING above.
     local up = computer.uptime()
-    edPending = { openAt = up + QUIESCE_SECONDS, hardAt = up + QUIESCE_SECONDS + QUIESCE_GRACE }
+    edPending = { openAt = up + config.quiesceSeconds,
+                  hardAt = up + config.quiesceSeconds + config.quiesceGrace }
     edPendingShown = nil
 
   elseif ev[1] == "key_down" and ev[4] == 1 and edPending then       -- esc
@@ -3816,11 +4021,17 @@ while true do
     edRequestPar = false
   end
 
+  if edRequestNodes then
+    broadcastNodeSettings()
+    edRequestNodes = false
+  end
+
   -- 1b. Re-publish the dust watchlist on its own slow cadence.
   local nowW = computer.uptime()
-  if nowW - lastWatchlistSend >= WATCHLIST_INTERVAL then
+  if nowW - lastWatchlistSend >= config.watchlistInterval then
     broadcastWatchlist()
-    broadcastDrillPar()  -- one timer, two audiences; par changes just as rarely
+    broadcastDrillPar()      -- one timer, three audiences; all three change rarely
+    broadcastNodeSettings()
     lastWatchlistSend = nowW
   end
 
@@ -3855,7 +4066,7 @@ while true do
       lastUIDraw = up
     end
   else
-    if up - lastUIDraw >= UI_INTERVAL then
+    if up - lastUIDraw >= config.uiInterval then
       drawUI()
       lastUIDraw = up
     end
@@ -3905,7 +4116,7 @@ while true do
   --    starting more, so the broker drains to idle and stays there.
   local now = computer.uptime()
   if brokerState.telemetryReady and not ed.open and not edPending
-     and (now - lastDispatchCheck >= DISPATCH_INTERVAL) then
+     and (now - lastDispatchCheck >= config.dispatchInterval) then
     dispatchBatch()
     lastDispatchCheck = now
   end

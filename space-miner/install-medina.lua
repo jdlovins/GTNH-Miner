@@ -23,14 +23,18 @@
 local component = require("component")
 local RAW = "https://raw.githubusercontent.com/jdlovins/GTNH-Miner/main/space-miner"
 
--- Files every role needs.
-local COMMON = { "config.lua" }
-
--- Files per role (in addition to COMMON).
+-- There is no COMMON list any more, and that is the point.
+--
+-- config.lua is three thousand lines of asteroid data. It used to be installed
+-- everywhere, including on the telemetry nodes, which read three values out of
+-- it and then ran out of memory holding an ME network scan. The nodes get
+-- node_config.lua instead -- ports and fallbacks, forty lines -- and everything
+-- else is pushed to them by the broker at runtime.
 local ROLES = {
   ["broker"] = {
     label = "Broker (main computer)",
-    files = { "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
+    files = { "config.lua", "settings.lua",
+              "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
               "list_components.lua", "detect_module.lua", "detect_sides.lua", "find_item.lua",
               "migrate_drill.lua" },
     config = { ["job_node_config.example.lua"] = "job_node_config.lua" },
@@ -38,22 +42,24 @@ local ROLES = {
   },
   ["dust"] = {
     label = "Dust monitor node (required)",
-    files = { "dust_telem.lua" },
-    note = "Set targetSide at the top of dust_telem.lua, then run: dust_telem",
+    files = { "dust_telem.lua", "node_config.lua" },
+    note = "run: dust_telem  (what to scan is pushed by the broker -- give it ~30s)",
   },
   ["hw"] = {
     label = "Hardware monitor node (required)",
     files = { "hw_telem.lua" },
-    note = "Set targetSide at the top of hw_telem.lua, then run: hw_telem",
+    note = "run: hw_telem  (loads no config at all -- the broker pushes what it needs)",
   },
   ["fluid"] = {
     label = "Fluid/plasma monitor node (required)",
-    files = { "fluid_telem.lua" },
+    files = { "fluid_telem.lua", "node_config.lua" },
     note = "Set targetSide at the top of fluid_telem.lua, then run: fluid_telem",
   },
   ["jobnode"] = {
     label = "Remote job node (optional, multi-node fleets)",
-    files = { "job_node.lua", "list_components.lua", "detect_module.lua", "detect_sides.lua", "find_item.lua" },
+    files = { "config.lua", "settings.lua",
+              "job_node.lua", "list_components.lua", "detect_module.lua",
+              "detect_sides.lua", "find_item.lua" },
     config = { ["job_node_config.example.lua"] = "job_node_config.lua" },
     note = "Edit /home/job_node_config.lua (give it a unique nodeId), then run: job_node",
   },
@@ -103,7 +109,7 @@ local function backupConfig()
 
   -- Text match rather than dofile: this runs before the new config lands, and a
   -- half-written or hand-broken file should not stop the install.
-  return body:find("drillLoadFields", 1, true) == nil
+  return body:find("settingsSpec", 1, true) == nil
 end
 
 local hadOldConfig = false
@@ -133,7 +139,8 @@ local function drillNotice()
   print("  migrate_drill /home/config.lua.bak")
   print("")
   print("It writes them to user_config.lua, which updates never touch.")
-  print("From then on edit them in the broker: press E, then d.")
+  print("From then on edit them in the broker: press E, then d for drills")
+  print("or g for every other setting.")
   print("------------------------------------------------------------")
 end
 
@@ -147,9 +154,6 @@ local function installRole(key)
 
   local allOk = true
   hadOldConfig = backupConfig()
-  for _, f in ipairs(COMMON) do
-    if not fetch(f) then allOk = false end
-  end
   for _, f in ipairs(role.files) do
     if not fetch(f) then allOk = false end
   end
@@ -201,7 +205,8 @@ if choice == 6 then
   -- real job_node_config.lua).
   print("\nInstalling EVERYTHING from " .. RAW .. "\n")
   local everything = {
-    "config.lua", "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
+    "config.lua", "settings.lua", "node_config.lua", "reference.lua",
+    "broker-mk3.lua", "scheduler.lua", "loader.lua", "logger.lua",
     "list_components.lua", "detect_module.lua", "detect_sides.lua", "find_item.lua",
     "dust_telem.lua", "hw_telem.lua", "fluid_telem.lua", "job_node.lua",
     "migrate_drill.lua",

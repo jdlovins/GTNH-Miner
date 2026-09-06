@@ -29,7 +29,7 @@ MEDINA (Modular Extraction and Dispatch Intelligence Network Array) is a wireles
         │  DUST TELEMETRY │ │ HW TELEMETRY│ │ FLUID TELEMETRY│
         │  dust_telem.lua │ │hw_telem.lua │ │fluid_telem.lua │
         │ (DUST_UPDATE)   │ │(HW_UPDATE)  │ │(FLUID_UPDATE)  │
-        │  every 120s     │ │ every 10s   │ │  every 10s     │
+        │  every 10s      │ │ every 10s   │ │  every 10s     │
         └────────┬────────┘ └──────┬──────┘ └───────┬────────┘
                  │                 │                 │
          ┌───────▼─────────────────▼─────────────────▼──────┐
@@ -112,13 +112,15 @@ MEDINA (Modular Extraction and Dispatch Intelligence Network Array) is a wireles
 - Per module: module-controller adapter, ME-interface adapter, transposer
 
 **Supporting modules (on the same computer):**
+- `settings.lua` — the tunable registry: every runtime knob declared once with its type, legal range and one-line help. `config.lua` seeds defaults from it, the editor's settings page is built from it, and the node broadcast is the subset marked `scope = "node"`. See SETTINGS.md.
 - `scheduler.lua` — cooperative task engine (spawn / sleep / await / lock; one clock via `computer.uptime`)
 - `loader.lua` — per-module load sequence, run as a task; read-back confirmation + identity-based item routing
 - `logger.lua` — configurable logging (file / console / Loki); disabled by default, ERROR/WARN to `/tmp/spacemining.log`
 
 **Network:**
 - **Inbound (Port 2026):** telemetry from dust_telem / hw_telem / fluid_telem
-- **Port 2027:** reserved for optional remote job nodes (unused in the single-broker setup)
+- **Outbound (Port 2027):** DUST_WATCHLIST and NODE_SETTINGS to the dust and fluid nodes; also carries jobs to optional remote job nodes
+- **Outbound (Port 2025):** DRILL_PAR to the hw node
 
 **State Tracked:**
 - Dust levels (stock vs. thresholds), drone counts, drill kits, plasma levels — from telemetry
@@ -133,6 +135,7 @@ MEDINA (Modular Extraction and Dispatch Intelligence Network Array) is a wireles
 **Boot Configuration:**
 - Priority mode prompt: "threshold" (lowest stock/target ratio first) or "rarity" (highest dust priority first, then ratio)
 - (Plasma mode selection is not implemented; plasma is supplied by a hardware ME Fluid Export Bus.)
+- Everything else is configured from the in-game editor: press **E**, then the asteroid pages for what to mine, `d` for drill consumables, and `g` for every other setting. Changes apply live and are written to `/home/user_config.lua`.
 - Stop the broker with **Ctrl+Alt+C** in the OC console.
 
 ---
@@ -147,12 +150,19 @@ MEDINA (Modular Extraction and Dispatch Intelligence Network Array) is a wireles
 - ME Controller or ME Interface (read-only access to dust storage)
 
 **Network:**
-- **Outbound (Port 2026):** Broadcasts DUST_UPDATE payload every 120 seconds
-- Payload: dust item names and current stock counts
+- **Outbound (Port 2026):** Broadcasts DUST_UPDATE payload every `dustScanInterval` (10s default)
+- **Inbound (Port 2027):** Receives DUST_WATCHLIST (what to scan) and NODE_SETTINGS (how often, how far) from the broker
 
 **Monitored Items:**
-- All 80+ dust types tracked in `config.conditions`
+- Whatever the broker's `config.conditions` currently holds, pushed over the wire
 - Only items below threshold trigger mining jobs
+
+**No config.lua.** This node reads `node_config.lua` — ports and fallbacks, forty
+lines — and gets everything else from the broker. Loading the 3000-line
+`config.lua` for two values was the direct cause of this node's out-of-memory
+failures, since it then has to hold a full ME network scan in what is left. A
+node that has never heard from the broker scans nothing and says so, rather than
+guessing from a local copy that may have drifted.
 
 ---
 
@@ -212,8 +222,12 @@ needs to be rate-limited uses `computer.uptime()`, never a loop counter.
 - Fluid Tank or Fluid Transposer (reads plasma levels)
 
 **Network:**
-- **Outbound (Port 2026):** Broadcasts FLUID_UPDATE payload every 10 seconds
-- Payload: plasma tank levels (mB) for all 5 plasma tiers
+- **Outbound (Port 2026):** Broadcasts FLUID_UPDATE payload every `fluidScanInterval` (10s default)
+- **Inbound (Port 2027):** Receives NODE_SETTINGS from the broker
+
+Same as the dust node: `node_config.lua` only, no `config.lua`. The scan loop
+waits in short hops rather than `os.sleep`, so a settings push lands during the
+wait it arrived in rather than up to an interval later.
 
 **Plasma Tiers Monitored:**
 1. Helium Plasma
@@ -266,10 +280,10 @@ needs to be rate-limited uses `computer.uptime()`, never a loop counter.
 
 | Component | Purpose | Port | Frequency | Direction |
 |-----------|---------|------|-----------|-----------|
-| **Broker MK3** | Central controller, UI, dispatch, drives local modules | 2026 in (2027 out only for optional remote nodes) | — | Receives telemetry; loads/runs its own modules |
-| **Dust Telem** | Monitors dust storage levels | 2026 in | 120s | → Broker |
+| **Broker MK3** | Central controller, UI, dispatch, drives local modules | 2026 in, 2027 out, 2025 out | — | Receives telemetry; pushes watchlist / node settings / drill par |
+| **Dust Telem** | Monitors dust storage levels | 2026 out, 2027 in | 10s | → Broker, ← DUST_WATCHLIST + NODE_SETTINGS |
 | **HW Telem** | Scans drone/drill kit inventory, auto-crafts drill consumables to par | 2026 out, 2025 in | 10s (nominal) | → Broker, ← DRILL_PAR |
-| **Fluid Telem** | Reads plasma tank levels | 2026 in | 10s | → Broker |
+| **Fluid Telem** | Reads plasma tank levels | 2026 out, 2027 in | 10s | → Broker, ← NODE_SETTINGS |
 | **Job Nodes** | Execute mining jobs on modules | 2026 in, 2027 out | Per job | ← Broker commands, → Status updates |
 
 ---
@@ -342,6 +356,35 @@ Job nodes send status updates:
 }
 ```
 
+### MEDINA_COMMAND / NODE_SETTINGS (Broker → Dust and Fluid Nodes, Port 2027)
+
+Broadcasts the `scope = "node"` subset of the settings registry, on the same
+timer as the dust watchlist and again immediately after an edit is saved:
+
+```lua
+{
+  protocol    = "MEDINA_COMMAND",
+  sender      = "broker-id",
+  payloadType = "NODE_SETTINGS",
+  data        = {
+    dustScanInterval  = 10,
+    fluidScanInterval = 10,
+    wirelessStrength  = 400,
+    nodeDashboard     = true,
+    drillCraftSlots   = 2,
+  }
+}
+```
+
+**Notes:**
+- This is what lets the dust and fluid nodes ship without `config.lua`
+- Nodes cache what they receive to `/home/node_settings.lua`, so one that
+  restarts during a broker outage comes back configured rather than reverting
+- A node accepts only the keys it knows, and only with the right type; an
+  empty or malformed push is ignored rather than resetting a working node
+- The hw node is not an audience: it stays off this port (see the note on
+  DRILL_PAR below), and the one setting it cares about rides along with its own
+
 ### MEDINA_COMMAND (Broker → HW Telem Node, Port 2025)
 
 Broker broadcasts drill consumable par levels, every 30s on the same timer as the
@@ -403,12 +446,18 @@ Broker broadcasts mining jobs:
 
 ## Configuration
 
-All mining parameters are defined in `config.lua`:
+Nothing here needs to be edited by hand. Press `E` on the broker: the asteroid
+pages choose what to mine, `d` the drill consumables, and `g` every other
+tunable in the system. Saving applies live and writes `/home/user_config.lua`,
+which updates never overwrite.
+
+Runtime tunables are declared in `settings.lua` and documented in `SETTINGS.md`.
+Shipped mining data lives in `config.lua`:
 
 - **Asteroids:** Material compositions, size ranges, valid distance and drone tier ranges, computation and power requirements
 - **Drones:** 14 tiers from MK-I (LV) to MK-XIV (MAX)
 - **Drills:** 9 material tiers (Steel through Transcendent Metal)
-- **Drill par:** `config.drillPar` — per-material stock levels the hw node auto-crafts back up to. Two numbers per material: `tips`/`rods` are the stock **floor** that triggers a craft, `batch` is the **request size**. The node asks for a whole batch, never the shortfall — requesting the exact deficit meant a material just under its floor tied up a crafting CPU for a token amount. Scaled to material cost: 4096 for steel/titanium/tungstensteel, 2048 for the naquadahs, 1024 for neutronium, 256 for the top three tiers (values in items; one module refill is 64 of each). All nine are listed because all nine are dispatchable: the gate in `tryDispatch()` is `config.drills`, not `config.drillRegistry` (which nothing reads). A material left out of `drillPar` still dispatches and still burns kits — it just never restocks. Note the top three tiers are expensive to craft unattended; lower those pars or set them `false` in `user_config.lua` if you would rather approve those by hand
+- **Drill par:** `config.drillPar` — per-material stock levels the hw node auto-crafts back up to. `tips`/`rods` are the stock **floor** that triggers a craft, `batch` is the **request size**, always sent whole. See SETTINGS.md for the full reasoning and the shipped table
 - **Plasmas:** 5 tiers with consumption rates, time discounts, and size bonuses
 - **Optimization Matrix:** Pre-computed optimal distances per [module tier][asteroid][drone tier]
 - **Dust Targets:** Mapping of dust items to source asteroids and mining priorities

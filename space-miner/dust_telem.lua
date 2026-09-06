@@ -3,7 +3,14 @@
 -- File:    dust_telem.lua
 -- Purpose: Queries the dust storage ME subnet; displays the 10 most critical
 --          items (lowest stock/threshold ratio) and broadcasts all tracked
---          stock levels to the broker on port 2026.
+--          stock levels to the broker.
+--
+-- This node holds NO policy. What to scan and how often both arrive from the
+-- broker; node_config.lua supplies only the ports and the fallbacks needed to
+-- come up before the broker has said anything. It deliberately does not load
+-- config.lua -- three thousand lines of asteroid data parsed into the memory of
+-- the machine that then has to hold a full ME network scan was the direct cause
+-- of this node's out-of-memory failures, and not one line of it was read here.
 --
 -- OpenComputers Sides Reference Matrix:
 --   0 = Bottom / Down (-Y) | 1 = Top / Up (+Y) | 2 = North (-Z)
@@ -16,7 +23,12 @@ local term          = require("term")
 local event         = require("event")
 local computer      = require("computer")
 
-local config = dofile("/home/config.lua")
+local node
+for _, path in ipairs({ "/home/node_config.lua", "node_config.lua" }) do
+  local ok, mod = pcall(dofile, path)
+  if ok and type(mod) == "table" and mod.ports then node = mod break end
+end
+if not node then error("Missing node_config.lua - re-run install-medina.") end
 
 if not component.isAvailable("modem") then error("Missing network card.") end
 if not component.isAvailable("gpu")   then error("Requires GPU.")         end
@@ -42,20 +54,25 @@ if me.getItemsInNetwork == nil then
   error("ME device cannot query the network - check it is joined to the dust subnet.")
 end
 do
-  local ok, err = pcall(me.getItemsInNetwork)
+  -- Two distinct failures, and only one of them is a throw. An unpowered or
+  -- channel-starved network does not raise: the call returns nil plus a reason
+  -- string, so pcall reports success and the reason lands in the THIRD value.
+  local ok, items, why = pcall(me.getItemsInNetwork)
   if not ok then
-    -- Report what actually went wrong: on a large network this is usually an
-    -- out-of-memory throw, not a wiring problem, and the two need different fixes.
-    error("ME query failed: " .. tostring(err))
+    error("ME query failed: " .. tostring(items))
+  elseif items == nil then
+    error("ME query returned nothing: " .. (why or "no reason given")
+      .. " - check the network is powered and the interface has a channel.")
   end
 end
 
 local gpu      = component.gpu
 local nodeName = "MEDINA-DustRelay"
 
-modem.setStrength(400)
+node.loadCache()
+modem.setStrength(node.settings.wirelessStrength)
 gpu.setResolution(80, 25)
-modem.open(config.ports.command)   -- inbound: broker -> this node (watchlist)
+modem.open(node.ports.command)   -- inbound: broker -> this node
 
 -- ---------------------------------------------------------------------------
 -- WATCHLIST
@@ -70,19 +87,26 @@ modem.open(config.ports.command)   -- inbound: broker -> this node (watchlist)
 -- Resolution order:
 --   1. whatever the broker last sent (authoritative)
 --   2. the cached copy of that, so a restart here survives a broker outage
---   3. this machine's config.conditions, so a standalone node still works
+--
+-- There is no third option any more. A node that has never heard from the
+-- broker scans nothing and says so on its status line, which is the honest
+-- answer -- the old local fallback could only ever be a stale guess at what
+-- the broker wanted, and a wrong watchlist reads as "we have none of this,
+-- mine it urgently".
 -- ---------------------------------------------------------------------------
 local WATCHLIST_CACHE = "/home/dust_watchlist.lua"
 
 local thresholds  = {}
-local listSource  = "local config"
+local listSource  = "none"
 local listCount   = 0
+local listDirty   = true   -- the sorted view below is rebuilt when this is set
 
 local function applyWatchlist(list, source)
   thresholds = list
   listSource = source
   listCount  = 0
   for _ in pairs(list) do listCount = listCount + 1 end
+  listDirty = true
 end
 
 local function saveWatchlist(list)
@@ -100,21 +124,27 @@ do
   local ok, cached = pcall(dofile, WATCHLIST_CACHE)
   if ok and type(cached) == "table" and next(cached) then
     applyWatchlist(cached, "cache")
-  else
-    local fallback = {}
-    for _, cond in ipairs(config.conditions) do
-      fallback[cond.itemName] = cond.amountToMaintain
-    end
-    applyWatchlist(fallback, "local config")
   end
 end
 
--- Accept a watchlist push from the broker. Cached so the next restart does not
--- have to wait for the broker to come back before it can scan anything.
+-- Accept pushes from the broker: the watchlist, and the node settings that say
+-- how often to scan and how far to talk. Both are cached so the next restart
+-- does not have to wait for the broker to come back.
 local function handleMessage(_, _, _, _, _, rawMsg)
   local ok, msg = pcall(serialization.unserialize, rawMsg)
   if not ok or type(msg) ~= "table" then return end
   if msg.protocol ~= "MEDINA_COMMAND" then return end
+
+  if msg.payloadType == "NODE_SETTINGS" then
+    if node.handlePush(msg) then
+      -- Strength is the only setting with a side effect to re-apply. The scan
+      -- interval is read live by the wait loop, so a change to it lands
+      -- immediately even mid-wait.
+      modem.setStrength(node.settings.wirelessStrength)
+    end
+    return
+  end
+
   if msg.payloadType ~= "DUST_WATCHLIST" or type(msg.data) ~= "table" then return end
   if not next(msg.data) then return end   -- never let an empty list blind us
   applyWatchlist(msg.data, "broker")
@@ -126,15 +156,28 @@ end
 -- indistinguishable at a glance -- so record which one it was.
 local scanState = { ok = true, err = nil, seen = 0, matched = 0 }
 
+-- Reused across scans. Rebuilding these two tables every 10 seconds meant a
+-- fresh entry table per watched item, ~90 of them, discarded immediately -- on
+-- the machine in this fleet with the least memory to spare and the largest
+-- single allocation (the network scan) to make right afterwards.
+local stocks = {}
+local sorted = {}
+
+local function byRatio(a, b) return a.ratio < b.ratio end
+
 local function scanDustStock()
-  local stocks = {}
-  local success, items = pcall(me.getItemsInNetwork)
-  if not success or not items then
-    -- Most likely out of memory: getItemsInNetwork builds a table entry per
-    -- stack, and on a large main network that can exceed what this machine
-    -- has left after loading config.lua.
-    scanState = { ok = false, err = tostring(items), seen = 0, matched = 0 }
-    return stocks
+  for k in pairs(stocks) do stocks[k] = nil end
+
+  -- `why` is the third value on purpose: a nil return is not a throw, so the
+  -- reason arrives alongside the nil rather than in pcall's error slot.
+  local success, items, why = pcall(me.getItemsInNetwork)
+  if not success then
+    scanState = { ok = false, err = "threw: " .. tostring(items), seen = 0, matched = 0 }
+    return
+  elseif items == nil then
+    scanState = { ok = false, err = "returned nil: " .. (why or "no reason given"),
+                  seen = 0, matched = 0 }
+    return
   end
 
   local seen, matched = 0, 0
@@ -148,17 +191,27 @@ local function scanDustStock()
     end
   end
   scanState = { ok = true, err = nil, seen = seen, matched = matched }
-  return stocks
 end
 
-local function buildSortedList(stocks)
-  local list = {}
-  for name, threshold in pairs(thresholds) do
-    local stock = stocks[name] or 0
-    table.insert(list, { name=name, stock=stock, threshold=threshold, ratio=stock/threshold })
+-- The row objects are allocated once per watchlist change and then mutated in
+-- place. Only the sort order and the numbers move between scans; the set of
+-- items does not.
+local function buildSortedList()
+  if listDirty then
+    for i = #sorted, 1, -1 do sorted[i] = nil end
+    for name, threshold in pairs(thresholds) do
+      sorted[#sorted + 1] = { name = name, stock = 0, threshold = threshold, ratio = 0 }
+    end
+    listDirty = false
   end
-  table.sort(list, function(a, b) return a.ratio < b.ratio end)
-  return list
+  for i = 1, #sorted do
+    local row = sorted[i]
+    row.threshold = thresholds[row.name] or row.threshold
+    row.stock     = stocks[row.name] or 0
+    row.ratio     = row.threshold > 0 and (row.stock / row.threshold) or 0
+  end
+  table.sort(sorted, byRatio)
+  return sorted
 end
 
 local function drawStaticFrame()
@@ -180,13 +233,13 @@ local function formatQty(n)
   else return tostring(n) end
 end
 
-local function updateDashboard(sorted)
+local function updateDashboard(list)
   -- Display top 10 most critical items (rows 7-16)
   for i = 1, 10 do
     local row = 6 + i
     term.setCursor(2, row)
     gpu.fill(2, row, 76, 1, " ")
-    local item = sorted[i]
+    local item = list[i]
     if item then
       local pct = item.ratio > 0 and math.floor(item.ratio * 100) or 0
       local color
@@ -197,23 +250,26 @@ local function updateDashboard(sorted)
       gpu.setForeground(color)
       -- Right-align stock/target in 20-char field
       local stockTarget = string.format("%10s / %8s", formatQty(item.stock), formatQty(item.threshold))
-      local line = string.format("  %-29s  %20s  %3d%%",
-        item.name, stockTarget, pct)
-      io.write(line)
+      io.write(string.format("  %-29s  %20s  %3d%%", item.name, stockTarget, pct))
     end
   end
   gpu.setForeground(0x555555)
   term.setCursor(2, 4)
-  io.write(string.format("watchlist: %-13s (%d items)   ", listSource, listCount))
+  io.write(string.format("watchlist: %-8s (%d items)   settings: %-8s   scan: %ds   ",
+    listSource, listCount, node.source, node.settings.dustScanInterval))
   term.setCursor(55, 2)
   io.write("LAST_SYNC: " .. os.date("%X"))
 
   -- Why the board is empty, when it is. "0 seen" means the query died; "N seen
-  -- / 0 matched" means it worked and no label on this network is on the list.
+  -- / 0 matched" means it worked and no label on this network is on the list;
+  -- an empty watchlist means the broker has not reached us yet.
   local row = 17
   gpu.fill(2, row, 76, 1, " ")
   term.setCursor(2, row)
-  if not scanState.ok then
+  if listCount == 0 then
+    gpu.setForeground(0xFFAA00)
+    io.write("no watchlist yet - waiting for the broker to push one (it re-sends every 30s)")
+  elseif not scanState.ok then
     gpu.setForeground(0xFF4444)
     io.write(string.sub("SCAN FAILED: " .. (scanState.err or "?"), 1, 76))
   elseif scanState.matched == 0 then
@@ -227,31 +283,43 @@ local function updateDashboard(sorted)
   end
 end
 
-drawStaticFrame()
+if node.settings.nodeDashboard then drawStaticFrame() end
+
+-- Reused for the same reason as `stocks`: one table per broadcast, every scan.
+local payload = {}
 
 while true do
-  local stocks = scanDustStock()
-  local sorted = buildSortedList(stocks)
-  updateDashboard(sorted)
+  -- Skip the ME query entirely while there is nothing to look for. It is by far
+  -- the most expensive thing this node does, and with an empty watchlist every
+  -- result of it is discarded.
+  if listCount > 0 then
+    scanDustStock()
+  end
+
+  if node.settings.nodeDashboard then
+    updateDashboard(buildSortedList())
+  end
 
   -- Stock only: the broker holds the thresholds it sent us, and echoing them
   -- back just gave a stale node a way to overwrite live policy.
-  local payload = {}
+  for k in pairs(payload) do payload[k] = nil end
   for name in pairs(thresholds) do
     payload[name] = { stock = stocks[name] or 0 }
   end
 
-  modem.broadcast(config.ports.telemetry, serialization.serialize({
+  modem.broadcast(node.ports.telemetry, serialization.serialize({
     protocol    = "MEDINA_TELEMETRY",
     sender      = nodeName,
     payloadType = "DUST_UPDATE",
     data        = payload
   }))
 
-  -- Wait out the scan interval in short hops so a watchlist push is picked up
-  -- promptly instead of up to 10s late.
-  local nextScan = computer.uptime() + 10
-  while computer.uptime() < nextScan do
+  -- Wait out the scan interval in short hops so a push is picked up promptly
+  -- instead of a whole interval late. The interval is read on every hop rather
+  -- than turned into a deadline up front, so a push that shortens it takes
+  -- effect during the very wait it arrived in.
+  local waitFrom = computer.uptime()
+  while computer.uptime() - waitFrom < node.settings.dustScanInterval do
     local ev = { event.pull(0.5, "modem_message") }
     if ev[1] == "modem_message" then handleMessage(table.unpack(ev)) end
   end

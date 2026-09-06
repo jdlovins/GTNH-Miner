@@ -3,7 +3,11 @@
 -- File:    fluid_telem.lua
 -- Purpose: Monitors plasma overdrive fuels via an ME fluid network adapter;
 --          renders a status dashboard and broadcasts all plasma volumes to
---          the broker on port 2026 so it can make plasma selection decisions.
+--          the broker so it can make plasma selection decisions.
+--
+-- Like the dust node, this one carries no policy and no config.lua. Ports and
+-- fallbacks come from node_config.lua; the scan interval and modem strength are
+-- pushed by the broker. See SETTINGS.md.
 --
 -- OpenComputers Sides Reference Matrix:
 --   0 = Bottom / Down (-Y) | 1 = Top / Up (+Y) | 2 = North (-Z)
@@ -13,12 +17,19 @@
 local component     = require("component")
 local serialization = require("serialization")
 local term          = require("term")
+local event         = require("event")
+local computer      = require("computer")
 
-local config = dofile("/home/config.lua")
+local node
+for _, path in ipairs({ "/home/node_config.lua", "node_config.lua" }) do
+  local ok, mod = pcall(dofile, path)
+  if ok and type(mod) == "table" and mod.ports then node = mod break end
+end
+if not node then error("Missing node_config.lua - re-run install-medina.") end
 
-if not component.isAvailable("modem")   then error("Missing network card.")         end
+if not component.isAvailable("modem")         then error("Missing network card.") end
 if not component.isAvailable("me_controller") then error("Missing ME Controller.") end
-if not component.isAvailable("gpu")            then error("Requires GPU.")           end
+if not component.isAvailable("gpu")           then error("Requires GPU.")          end
 
 local modem = component.modem
 if not modem.isWireless or not modem.isWireless() then
@@ -29,17 +40,21 @@ local me_ctrl  = component.me_controller
 local gpu      = component.gpu
 local nodeName = "MEDINA-FluidRelay"
 
-modem.setStrength(400)
+node.loadCache()
+modem.setStrength(node.settings.wirelessStrength)
 gpu.setResolution(80, 25)
+modem.open(node.ports.command)   -- inbound: broker -> this node (settings)
 
--- Row positions for each plasma in the display (keyed by full plasma name)
-local rowMap = {
-  ["Helium Plasma"]        = 6,
-  ["Bismuth Plasma"]       = 7,
-  ["Radon Plasma"]         = 8,
-  ["Technetium Plasma"]    = 9,
-  ["Plutonium 241 Plasma"] = 10
-}
+-- Row positions in the display. Built from node.plasmaOrder so the five names
+-- exist in exactly one place -- they used to be written out here as well as in
+-- config.lua, which is two lists to keep in step for no gain.
+local rowMap  = {}
+local rowFirst = 6
+for i, name in ipairs(node.plasmaOrder) do
+  -- plasmaOrder is highest tier first; the dashboard has always read lowest
+  -- tier at the top, so the rows count backwards.
+  rowMap[name] = rowFirst + (#node.plasmaOrder - i)
+end
 
 local function drawStaticFrame()
   term.clear()
@@ -48,12 +63,12 @@ local function drawStaticFrame()
   print(" MEDINA RELAY NETWORK  |  NODE: " .. nodeName)
   print("================================================================================")
   gpu.setForeground(0xFFFFFF)
-  term.setCursor(1, 5)  print("  [ PLASMA OVERDRIVE STOCK ]")
-  term.setCursor(1, 6)  print("  Helium Plasma:        ")
-  term.setCursor(1, 7)  print("  Bismuth Plasma:       ")
-  term.setCursor(1, 8)  print("  Radon Plasma:         ")
-  term.setCursor(1, 9)  print("  Technetium Plasma:    ")
-  term.setCursor(1, 10) print("  Plutonium 241 Plasma: ")
+  term.setCursor(1, 5) print("  [ PLASMA OVERDRIVE STOCK ]")
+  for name, row in pairs(rowMap) do
+    term.setCursor(3, row)
+    io.write(name .. ":")
+  end
+  term.setCursor(1, rowFirst + #node.plasmaOrder)
   print("\n--------------------------------------------------------------------------------")
   print("  [ HIGHEST AVAILABLE PLASMA ]")
   print("  Active Plasma:  ")
@@ -65,7 +80,6 @@ end
 local function updateDashboard(plasmaVolumes, dominant, dominantVolume)
   -- Clear value fields and rewrite amounts
   for _, row in pairs(rowMap) do gpu.fill(24, row, 20, 1, " ") end
-  gpu.setForeground(0xFFFFFF)
   for name, amount in pairs(plasmaVolumes) do
     local row = rowMap[name]
     if row then
@@ -88,16 +102,22 @@ local function updateDashboard(plasmaVolumes, dominant, dominantVolume)
   end
 
   gpu.setForeground(0x555555)
+  term.setCursor(2, 4)
+  io.write(string.format("settings: %-8s   scan: %ds   ", node.source,
+    node.settings.fluidScanInterval))
   term.setCursor(55, 2)
   io.write("LAST_SYNC: " .. os.date("%X"))
 end
 
+-- Reused rather than rebuilt: this runs every few seconds forever, and the set
+-- of keys never changes.
+local volumes = {}
+
 local function scanPlasmaStock()
-  local volumes = {}
   for name in pairs(rowMap) do volumes[name] = 0 end
 
-  local highestVolume   = 0
-  local dominantPlasma  = ""
+  local highestVolume  = 0
+  local dominantPlasma = ""
 
   local success, networkFluids = pcall(me_ctrl.getFluidsInNetwork)
   if success and networkFluids then
@@ -106,8 +126,8 @@ local function scanPlasmaStock()
         volumes[fluid.label] = fluid.amount
       end
     end
-    -- Find the highest-tier plasma that has stock (plasmaKeyOrder is descending tier)
-    for _, plasmaName in ipairs(config.plasmaKeyOrder) do
+    -- Find the highest-tier plasma that has stock (plasmaOrder is descending tier)
+    for _, plasmaName in ipairs(node.plasmaOrder) do
       if (volumes[plasmaName] or 0) > 0 then
         dominantPlasma = plasmaName
         highestVolume  = volumes[plasmaName]
@@ -119,18 +139,36 @@ local function scanPlasmaStock()
   return volumes, dominantPlasma, highestVolume
 end
 
-drawStaticFrame()
+local function handleMessage(_, _, _, _, _, rawMsg)
+  local ok, msg = pcall(serialization.unserialize, rawMsg)
+  if not ok or type(msg) ~= "table" then return end
+  if node.handlePush(msg) then
+    modem.setStrength(node.settings.wirelessStrength)
+  end
+end
+
+if node.settings.nodeDashboard then drawStaticFrame() end
 
 while true do
   local plasmaVolumes, dominant, dominantVolume = scanPlasmaStock()
-  updateDashboard(plasmaVolumes, dominant, dominantVolume)
+  if node.settings.nodeDashboard then
+    updateDashboard(plasmaVolumes, dominant, dominantVolume)
+  end
 
-  modem.broadcast(config.ports.telemetry, serialization.serialize({
+  modem.broadcast(node.ports.telemetry, serialization.serialize({
     protocol    = "MEDINA_TELEMETRY",
     sender      = nodeName,
     payloadType = "FLUID_UPDATE",
-    data        = { plasmas=plasmaVolumes }
+    data        = { plasmas = plasmaVolumes }
   }))
 
-  os.sleep(10)
+  -- Was os.sleep(10), which meant a settings push sat in the queue for up to a
+  -- full interval and, worse, that this node could not be reconfigured at all
+  -- while it slept. Short hops instead, with the interval read on each one so a
+  -- change lands during the very wait it arrived in.
+  local waitFrom = computer.uptime()
+  while computer.uptime() - waitFrom < node.settings.fluidScanInterval do
+    local ev = { event.pull(0.5, "modem_message") }
+    if ev[1] == "modem_message" then handleMessage(table.unpack(ev)) end
+  end
 end

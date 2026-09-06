@@ -59,31 +59,33 @@ wget RAW_BASE/broker-mk3.lua            /home/broker-mk3.lua
 wget RAW_BASE/scheduler.lua             /home/scheduler.lua
 wget RAW_BASE/loader.lua                /home/loader.lua
 wget RAW_BASE/config.lua                /home/config.lua
+wget RAW_BASE/settings.lua              /home/settings.lua
 wget RAW_BASE/logger.lua                /home/logger.lua
 wget RAW_BASE/list_components.lua       /home/list_components.lua
 wget RAW_BASE/detect_module.lua         /home/detect_module.lua
 wget RAW_BASE/job_node_config.example.lua /home/job_node_config.lua
 ```
 
-**On the dust monitor node (required):**
+**On the dust monitor node (required)** — note it does *not* get `config.lua`.
+It reads `node_config.lua` for ports, and the broker pushes it what to scan:
 
 ```
-wget RAW_BASE/config.lua    /home/config.lua
-wget RAW_BASE/dust_telem.lua /home/dust_telem.lua
+wget RAW_BASE/node_config.lua /home/node_config.lua
+wget RAW_BASE/dust_telem.lua  /home/dust_telem.lua
 ```
 
-**On the hardware monitor node (required):**
+**On the hardware monitor node (required)** — one file, no config at all; the
+broker pushes it everything it needs:
 
 ```
-wget RAW_BASE/config.lua  /home/config.lua
 wget RAW_BASE/hw_telem.lua /home/hw_telem.lua
 ```
 
 **On the plasma/fluid monitor node (required):**
 
 ```
-wget RAW_BASE/config.lua    /home/config.lua
-wget RAW_BASE/fluid_telem.lua /home/fluid_telem.lua
+wget RAW_BASE/node_config.lua  /home/node_config.lua
+wget RAW_BASE/fluid_telem.lua  /home/fluid_telem.lua
 ```
 
 > ⚠️ The broker will **not mine** until **all three** monitor nodes are reporting
@@ -100,28 +102,27 @@ wget RAW_BASE/fluid_telem.lua /home/fluid_telem.lua
 
 ## 2. Choose what to mine
 
-Open `/home/config.lua` and find the `config.conditions` section. This is your
-shopping list — one line per item you want kept in stock:
+Run the broker and press **E**. That opens the editor, which is where everything
+in this system is configured — you should not need to leave the program or edit
+a Lua file at all.
 
-```lua
-config.conditions = {
-  { itemName="Diamond",      amountToMaintain=qty("50m") },
-  { itemName="Tungsten Dust", amountToMaintain=qty("10m") },
-}
-```
+Pick an asteroid, see what it yields, and press `space` on the items you want
+kept in stock. `t` types a target amount. `s` saves.
 
-- **`itemName`** must match the in-game item name **exactly** (spelling and
-  capitalization). This is the #1 thing people get wrong.
-- **`amountToMaintain`** is your target. `qty("50m")` = 50 million, `"10m"` = ten
-  million, `"5k"` = five thousand.
-- A line starting with `--` is **turned off**. Remove the dashes to enable it; add
-  them to disable it.
+- Item names must match the in-game name **exactly** — the editor takes them
+  from the asteroid tables, so picking from a list is safer than typing.
+- Targets are typed as `50m`, `10m`, `5k`.
+- `d` opens the drill page: how many tips and rods go into a module load, and
+  the stock level at which the hardware node crafts more.
+- `g` opens the settings page: every other tunable, each one flipped, cycled or
+  typed in place. See [SETTINGS.md](SETTINGS.md) for what they do.
+
+Saving writes `/home/user_config.lua` — the one file updates never overwrite —
+and applies live. Nothing needs a restart.
 
 MEDINA already knows which asteroid produces each common dust, which drones can
-mine it, and the best distance to use (in the `dustTargets`, asteroid, and
-optimization sections — you usually don't need to touch those).
-
----
+mine it, and the best distance to use, so you usually only choose *what* and
+*how much*.
 
 ## 3. Tell it about your modules
 
@@ -182,7 +183,7 @@ To stop the broker: **Ctrl+Alt+C** in the console.
 | A module just **waits / never loads** | You may have no drone in that asteroid's tier range, or no matching drill kit. Check the right panel. |
 | Stuck on **"Waiting for telemetry..."** | The broker needs ALL THREE telem nodes (dust, hardware, fluid) reporting before it dispatches. Make sure all three telem computers are running and each `targetSide` is correct. |
 | Dashboard shows **"NO PLASMA - MINING BLOCKED"** | Modules can't run without a plasma fluid. Make sure you have one of the supported plasmas (Helium / Bismuth / Radon / Technetium / Plutonium-241) and that it's piped into each module's input hatch. |
-| Want to see what's happening | Logging is off by default; set `config.logging.enabled = true` in `config.lua`. Logs go to `/tmp/spacemining.log`. |
+| Want to see what's happening | Logging is off by default. Press `E`, then `g`, and turn **Logging enabled** ON with `space`. Logs go to `/tmp/spacemining.log`. |
 
 ---
 
