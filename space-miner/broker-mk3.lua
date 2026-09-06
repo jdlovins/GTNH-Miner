@@ -307,6 +307,42 @@ local drillKeyOrder = {
   "naquadahAlloy", "neutronium", "cosmicNeutronium", "infinity", "transcendentMetal"
 }
 
+-- Which drill materials can this base actually consume right now?
+--
+-- Par for a material we have no drone for is pure noise: it cannot be
+-- dispatched, so the kits are never spent, and on a network without the pattern
+-- it produces a permanent row of red on both dashboards. Worse, for the top
+-- tiers it would queue genuinely expensive crafts for hardware not owned.
+--
+-- Lives up here rather than beside broadcastDrillPar, its only caller until
+-- now, because the editor's drill page has to say the same thing: a par you
+-- just switched on for a tier you own no drone for is not going out, and
+-- silently not going out is how it would otherwise look like a broken save.
+local function usableDrillKeys()
+  local keys = {}
+
+  -- Drones sitting in the staging network.
+  for droneKey, count in pairs(brokerState.drones) do
+    if (count or 0) > 0 then
+      local tier = config.droneTierKeys[droneKey]
+      local dk   = tier and config.droneDrillMap[tier]
+      if dk then keys[dk] = true end
+    end
+  end
+
+  -- Plus anything a busy module is holding. A drone loaded into a running
+  -- module is NOT in the ME network, so it reports zero above -- and dropping
+  -- its material from par mid-run is exactly backwards, since that is the
+  -- material actively being consumed.
+  for _, mod in ipairs(modules) do
+    if mod.status ~= "IDLE" and mod.job and mod.job.drillKey then
+      keys[mod.job.drillKey] = true
+    end
+  end
+
+  return keys
+end
+
 for _, cond in ipairs(config.conditions) do
   brokerState.dust[cond.itemName] = { stock = 0, threshold = cond.amountToMaintain }
 end
@@ -2251,9 +2287,18 @@ end
 --   fail it. All text entry is incremental instead -- every keystroke arrives
 --   as an ordinary event through the same loop.
 --
+-- THREE PAGES, NOT ONE:
+--   asteroids/detail/items   what to mine and how much of it to keep.
+--   drills                   the consumables that make mining possible at all --
+--                            how many tips and rods go into a module, and what
+--                            stock level triggers a craft. Same reason it lives
+--                            here: those numbers used to mean closing the broker
+--                            and editing Lua, and they are exactly the numbers
+--                            you want to move while watching a module stall.
+--
 -- KEYS: up/down/pgup/pgdn/home/end move   enter drill in / commit
 --       space toggle   t type amount   T step the ladder   a add downstream item
---       / filter       s save           esc back, or close at the top level
+--       d drills page  / filter       s save    esc back, or close at the top level
 -- =============================================================================
 
 local USER_CONFIG_PATH   = "/home/user_config.lua"
@@ -2262,10 +2307,42 @@ local TARGET_LADDER      = { 1000000, 2000000, 5000000, 10000000, 25000000, 5000
 local DEFAULT_TARGET     = 5000000
 
 local edRequestWatchlist = false   -- set on save; main loop re-broadcasts
+local edRequestPar       = false   -- ditto, for DRILL_PAR
+
+-- THE DRILL PAGE, IN ONE TABLE.
+--
+-- Everything else in this file is a plain top-level local, and this would be
+-- too if there were room: the main chunk sits within a handful of Lua's
+-- 200-local limit, and a dozen more would not fit. Namespacing one feature is
+-- the cheap way out, and it happens to read well -- every drill-page constant
+-- and helper is reachable from one name.
+local DRILL = {}
+
+-- The scalar settings the page can move, in the order they are shown. Every one
+-- of these is read live -- the loader runs in this process and reads config on
+-- each load, and drillCraftSlots rides along with the next DRILL_PAR broadcast
+-- -- so a save takes effect on the next load, not the next reboot.
+DRILL.fields = {
+  { key = "tipsPerLoad",     label = "Drill tips per load",
+    help = "tips put in the bus per module load" },
+  { key = "rodsPerLoad",     label = "Drill rods per load",
+    help = "rods put in the bus per module load" },
+  { key = "tipsToStart",     label = "Tips needed to start",
+    help = "module starts once this many have arrived" },
+  { key = "rodsToStart",     label = "Rods needed to start",
+    help = "module starts once this many have arrived" },
+  { key = "drillCraftSlots", label = "Concurrent drill crafts",
+    help = "match your AE2 crafting CPUs -- too high gets requests rejected" },
+}
+
+-- Fallback for a material with no shipped par at all (the top three tiers ship
+-- with one, but a hand-trimmed config.lua may not). Deliberately small: turning
+-- a material on should not commit the base to an expensive unattended craft.
+DRILL.fallback = { tips = 256, rods = 256, batch = 256 }
 
 local ed = {
   open = false,
-  mode = "asteroids",          -- "asteroids" | "detail" | "items"
+  mode = "asteroids",          -- "asteroids" | "detail" | "items" | "drills"
   asteroid = nil,              -- selected asteroid while in detail mode
   rows = {},                   -- row model for the current mode
   sel = 1, scroll = 0,
@@ -2273,6 +2350,8 @@ local ed = {
   input = nil,                 -- { label, buffer, onCommit }
   enabled = {}, threshold = {},-- working copy of config.conditions
   targets = {},                -- working copy of config.dustTargets
+  par = {},                    -- working copy of config.drillPar (nil = not ordered)
+  load = {},                   -- working copy of the DRILL.fields settings
   added = {},                  -- items newly mapped this session
   msg = "", msgColor = 0x888888,
   dirty = true,
@@ -2296,6 +2375,36 @@ local function edLoad()
   for item, t in pairs(config.dustTargets) do
     ed.targets[item] = { asteroid = t.asteroid, priority = t.priority or 99 }
   end
+
+  -- A material ABSENT from config.drillPar is not an error, it is the "never
+  -- order this" state -- so absence is carried through as nil rather than
+  -- filled in with a default, and the page draws it unchecked.
+  ed.par = {}
+  for key, p in pairs(config.drillPar or {}) do
+    if type(p) == "table" then
+      ed.par[key] = { tips = p.tips or 0, rods = p.rods or 0,
+                      batch = p.batch or p.tips or 0 }
+    end
+  end
+
+  ed.load = {}
+  for _, f in ipairs(DRILL.fields) do ed.load[f.key] = config[f.key] end
+end
+
+-- "naquadahAlloy" -> "Naquadah Alloy". The tip label is the only place the
+-- printable name exists; the key is camelCase and config.drills has no name
+-- field of its own.
+function DRILL.name(key)
+  local d = config.drills[key]
+  if d and d.tip then return (d.tip:gsub(" Drill Tip$", "")) end
+  return key
+end
+
+-- The kit floor tryDispatch() actually enforces. Derived, never stored, so the
+-- page shows it rather than letting you discover it as a module that refuses to
+-- go out with plenty of kits on the shelf.
+function DRILL.floor()
+  return math.max(ed.load.tipsPerLoad or 64, ed.load.rodsPerLoad or 64)
 end
 
 local function outputsFor(name)
@@ -2445,12 +2554,57 @@ local function buildItems()
   return rows
 end
 
+-- DRILL CONSUMABLES PAGE
+--
+-- Two sections, because they answer two different questions and get tuned at
+-- different times:
+--
+--   LOAD BUFFER   how much a module is given, and how little it will settle for
+--                 before starting. Tuned when loads feel slow or modules stall
+--                 mid-run.
+--   RESTOCK PAR   when the hw node auto-crafts more, and how many it asks for.
+--                 Tuned when a material keeps running dry, or when an expensive
+--                 tier is crafting more eagerly than you want.
+--
+-- The two are coupled through the dispatch floor, which is why that derived
+-- number is spelled out between them rather than left to be rediscovered.
+function DRILL.build()
+  local rows = {}
+
+  rows[#rows + 1] = { kind = "header",
+    text = "LOAD BUFFER  (what a module load puts in the input bus)" }
+  for _, f in ipairs(DRILL.fields) do
+    if matchesFilter(f.label) then
+      rows[#rows + 1] = { kind = "setting", field = f }
+    end
+  end
+
+  local usable = usableDrillKeys()
+  local floor  = DRILL.floor()
+  rows[#rows + 1] = { kind = "note", text = string.format(
+    "a module will not be dispatched unless %d kits of its material are in stock" ..
+    "  (the larger of the two per-load figures)", floor) }
+
+  rows[#rows + 1] = { kind = "header",
+    text = "RESTOCK PAR  (fall below the floor and a whole batch is crafted)" }
+  for _, key in ipairs(drillKeyOrder) do
+    local name = DRILL.name(key)
+    if matchesFilter(name) then
+      rows[#rows + 1] = { kind = "par", key = key, name = name, usable = usable[key] }
+    end
+  end
+
+  return rows
+end
+
 local function edRebuild()
   edTouch()
   if ed.mode == "asteroids" then
     ed.rows = buildAsteroids()
   elseif ed.mode == "detail" then
     ed.rows = buildDetail(ed.asteroid)
+  elseif ed.mode == "drills" then
+    ed.rows = DRILL.build()
   else
     ed.rows = buildItems()
   end
@@ -2623,6 +2777,136 @@ local function edTypeTarget(item)
 end
 
 -- ---------------------------------------------------------------------------
+-- DRILL MUTATIONS
+-- ---------------------------------------------------------------------------
+
+-- Warnings, not refusals. Every value these complain about is legal and there
+-- are reasons to want each of them; what is not acceptable is setting one by
+-- accident and finding out days later from a module that will not dispatch.
+function DRILL.warn(key)
+  local floor = DRILL.floor()
+  if key == "tipsToStart" and (ed.load.tipsToStart or 0) > (ed.load.tipsPerLoad or 0) then
+    edSay("tips to start is above tips per load -- the loader clamps it down", 0xFFAA00)
+    return
+  end
+  if key == "rodsToStart" and (ed.load.rodsToStart or 0) > (ed.load.rodsPerLoad or 0) then
+    edSay("rods to start is above rods per load -- the loader clamps it down", 0xFFAA00)
+    return
+  end
+  if key == "tipsPerLoad" or key == "rodsPerLoad" then
+    -- Raising a per-load figure raises the dispatch floor with it, which can
+    -- strand a material that was previously fine.
+    local under = {}
+    for k, par in pairs(ed.par) do
+      if math.min(par.tips or 0, par.rods or 0) < floor then under[#under + 1] = DRILL.name(k) end
+    end
+    if #under > 0 then
+      table.sort(under)
+      edSay("dispatch floor is now " .. floor .. " kits -- par is below that for " ..
+            table.concat(under, ", "), 0xFFAA00)
+    end
+  end
+end
+
+function DRILL.editSetting(f)
+  local cur = ed.load[f.key]
+  edPrompt(f.label .. "?" .. (cur and ("  (now " .. cur .. ")") or "") ..
+           "  -- " .. f.help,
+    function(txt)
+      if not txt or txt == "" then edSay("unchanged") return end
+      local n = parseQty(txt)
+      if not n or n < 1 then
+        edSay("did not understand '" .. tostring(txt) .. "' -- unchanged", 0xFF4444)
+        return
+      end
+      edTouch()
+      ed.load[f.key] = n
+      edSay(f.label .. " -> " .. n, 0x00FF00)
+      DRILL.warn(f.key)
+      edRebuild()
+    end)
+end
+
+function DRILL.toggle(key)
+  edTouch()
+  if ed.par[key] then
+    ed.par[key] = nil
+    edSay(DRILL.name(key) .. " will no longer be auto-crafted", 0xFFAA00)
+  else
+    -- Restore what this material shipped with rather than inventing a number.
+    -- The shipped pars are scaled to what each material costs to make, and that
+    -- scaling is the whole reason they are not all the same.
+    local sh = (config.shippedDrillPar or {})[key] or DRILL.fallback
+    ed.par[key] = { tips = sh.tips or 0, rods = sh.rods or 0,
+                    batch = sh.batch or sh.tips or 0 }
+    edSay(string.format("%s par %d/%d, batch %d", DRILL.name(key),
+      ed.par[key].tips, ed.par[key].rods, ed.par[key].batch), 0x00FF00)
+  end
+  edRebuild()
+end
+
+-- Set one field of one material's par.
+--
+-- Editing a material that is switched off switches it on: you cannot have meant
+-- "set the floor to 4096 and keep not ordering it".
+function DRILL.editField(key, field, andThen)
+  local par = ed.par[key]
+  local cur = par and par[field] or nil
+  local what = ({ tips = "drill tip floor", rods = "drill rod floor",
+                  batch = "craft batch size" })[field]
+  edPrompt(what .. " for " .. DRILL.name(key) .. "?" ..
+           (cur and ("  (now " .. cur .. ")") or "") .. "  e.g. 4096, 2k",
+    function(txt)
+      local n = parseQty(txt or "")
+      -- Empty means keep, which is what makes walking all three fields cheap:
+      -- enter, enter, type the one you came for.
+      if not txt or txt == "" then
+        edSay("unchanged")
+        if andThen then andThen() end
+        return
+      end
+      if not n or n < 0 then
+        edSay("did not understand '" .. tostring(txt) .. "' -- unchanged", 0xFF4444)
+        if andThen then andThen() end
+        return
+      end
+      edTouch()
+      if not ed.par[key] then
+        local sh = (config.shippedDrillPar or {})[key] or DRILL.fallback
+        ed.par[key] = { tips = sh.tips or 0, rods = sh.rods or 0,
+                        batch = sh.batch or sh.tips or 0 }
+      end
+      ed.par[key][field] = n
+      edSay(DRILL.name(key) .. " " .. what .. " -> " .. n, 0x00FF00)
+
+      local p, floor = ed.par[key], DRILL.floor()
+      if (field == "tips" or field == "rods") and n < floor then
+        -- The exact stall this feature exists to remove: stock sits at par, so
+        -- nothing is ever crafted, and dispatch still refuses the material.
+        edSay(string.format("%s: %d is below the %d-kit dispatch floor -- it can " ..
+          "sit at par and still never dispatch", DRILL.name(key), n, floor), 0xFF4444)
+      elseif p.batch < math.max(p.tips or 0, p.rods or 0) then
+        edSay(DRILL.name(key) .. ": batch is smaller than the floor -- restocking " ..
+              "will take several crafts", 0xFFAA00)
+      end
+      edRebuild()
+      if andThen then andThen() end
+    end)
+end
+
+-- Enter on a par row walks all three fields in turn -- chained prompts, the same
+-- shape edAddDownstream uses. Each link is still one non-blocking field, so a
+-- load in flight keeps progressing between keystrokes, and esc drops out of the
+-- chain wherever you are in it.
+function DRILL.editAll(key)
+  DRILL.editField(key, "tips", function()
+    DRILL.editField(key, "rods", function()
+      DRILL.editField(key, "batch")
+    end)
+  end)
+end
+
+-- ---------------------------------------------------------------------------
 -- SAVE
 --
 -- Writes ONLY /home/user_config.lua. config.lua is shipped data -- hand-kept
@@ -2634,7 +2918,13 @@ end
 -- Only mappings that are genuinely yours are persisted, worked out against
 -- config.shippedDustTargets, the snapshot config.lua takes before applying the
 -- overlay. Writing all of them back would freeze the shipped table and mask
--- every future label correction.
+-- every future label correction. The same diff is applied to drillPar and to
+-- the load scalars, against their own snapshots, for the same reason.
+--
+-- Every table the overlay reads has to be emitted here, because the file is
+-- rewritten whole. Before the drill page existed this function wrote only
+-- conditions and dustTargets, which meant a hand-written drillPar block was
+-- destroyed by the next save -- silently, since nothing reads that file back.
 -- ---------------------------------------------------------------------------
 
 local function edSave()
@@ -2664,6 +2954,9 @@ local function edSave()
   out[#out + 1] = "--   dustTargets  mappings you added or corrected. Merged over the"
   out[#out + 1] = "--                shipped table, so untouched entries still follow"
   out[#out + 1] = "--                config.lua."
+  out[#out + 1] = "--   drillPar     restock floors you changed. Merged per material;"
+  out[#out + 1] = "--                false means stop auto-crafting that material."
+  out[#out + 1] = "--   drillLoad    load-buffer settings you changed. Merged per field."
   out[#out + 1] = ""
   out[#out + 1] = "return {"
 
@@ -2687,6 +2980,45 @@ local function edSave()
       QUOTE, item, QUOTE, QUOTE, t.asteroid, QUOTE, t.priority or 99)
   end
   out[#out + 1] = "  },"
+
+  -- drillPar: only what differs from the shipped table. A material you switched
+  -- OFF that ships ON has to be written as `false` -- omitting it would just let
+  -- the shipped default come back on the next boot.
+  local shippedPar = config.shippedDrillPar or {}
+  local parOut, parCount = {}, 0
+  for _, key in ipairs(drillKeyOrder) do
+    local sh, cur = shippedPar[key], ed.par[key]
+    if cur == nil then
+      if sh then parOut[key] = false; parCount = parCount + 1 end
+    elseif not sh or sh.tips ~= cur.tips or sh.rods ~= cur.rods or sh.batch ~= cur.batch then
+      parOut[key] = cur; parCount = parCount + 1
+    end
+  end
+
+  out[#out + 1] = "  drillPar = {"
+  for _, key in ipairs(drillKeyOrder) do
+    local v = parOut[key]
+    if v == false then
+      out[#out + 1] = string.format("    %-18s = false,   -- do not auto-craft", key)
+    elseif v then
+      out[#out + 1] = string.format("    %-18s = { tips = %d, rods = %d, batch = %d },",
+        key, v.tips or 0, v.rods or 0, v.batch or 0)
+    end
+  end
+  out[#out + 1] = "  },"
+
+  local shippedLoad = config.shippedDrillLoad or {}
+  local loadCount = 0
+  out[#out + 1] = "  drillLoad = {"
+  for _, f in ipairs(DRILL.fields) do
+    local v = ed.load[f.key]
+    if v and v ~= shippedLoad[f.key] then
+      out[#out + 1] = string.format("    %-16s = %d,", f.key, v)
+      loadCount = loadCount + 1
+    end
+  end
+  out[#out + 1] = "  },"
+
   out[#out + 1] = "}"
 
   local w = io.open(USER_CONFIG_PATH, "w")
@@ -2715,23 +3047,43 @@ local function edSave()
   brokerState.dust   = newDust
   dustScroll         = 0
   edRequestWatchlist = true
+
+  -- Apply the drill side live too. The loader reads config on every load, so the
+  -- buffer sizes take effect on the next one; par has to go over the wire, which
+  -- is what edRequestPar asks the main loop to do rather than waiting out the
+  -- 30s broadcast cadence.
+  for _, f in ipairs(DRILL.fields) do
+    if ed.load[f.key] then config[f.key] = ed.load[f.key] end
+  end
+  local newPar = {}
+  for key, p in pairs(ed.par) do
+    newPar[key] = { tips = p.tips, rods = p.rods, batch = p.batch }
+  end
+  config.drillPar = newPar
+  edRequestPar    = true
   -- The dust panel caches its sorted list against edGen, and a save can change
   -- which items exist and what their thresholds are, not just their stock.
   edTouch()
 
-  edSay(string.format("saved %d tracked, %d own mappings -> user_config.lua, applied live",
-    #conds, mineCount), 0x00FF00)
+  edSay(string.format(
+    "saved %d tracked, %d own mappings, %d drill par, %d load setting(s) -> applied live",
+    #conds, mineCount, parCount, loadCount), 0x00FF00)
 end
 
 local edButtons = {}
 local function edLayoutButtons()
   local defs
   if ed.mode == "asteroids" then
-    defs = { { "ITEMS", "items" }, { "FIND", "find" }, { "SAVE", "save" }, { "CLOSE", "close" } }
+    defs = { { "ITEMS", "items" }, { "DRILLS", "drills" }, { "FIND", "find" },
+             { "SAVE", "save" }, { "CLOSE", "close" } }
   elseif ed.mode == "detail" then
     defs = { { "BACK", "back" }, { "ADD", "add" }, { "FIND", "find" }, { "SAVE", "save" }, { "CLOSE", "close" } }
+  elseif ed.mode == "drills" then
+    defs = { { "ASTEROIDS", "asteroids" }, { "FIND", "find" }, { "SAVE", "save" },
+             { "CLOSE", "close" } }
   else
-    defs = { { "ASTEROIDS", "asteroids" }, { "FIND", "find" }, { "SAVE", "save" }, { "CLOSE", "close" } }
+    defs = { { "ASTEROIDS", "asteroids" }, { "DRILLS", "drills" }, { "FIND", "find" },
+             { "SAVE", "save" }, { "CLOSE", "close" } }
   end
   edButtons = {}
   local x = 2
@@ -2744,6 +3096,15 @@ end
 
 local X_MARK, X_NAME = 2, 6
 local X_A, X_B, X_C = 44, 56, 68
+-- Fourth column, used only by the drills page: what is actually in stock, right
+-- beside the floor it is being compared against.
+--
+-- Every other column here is a fixed offset that quietly assumes a tier-3
+-- screen, which the three-panel dashboard needs anyway. This one is guarded
+-- rather than assumed, because a narrow screen would not truncate it -- it would
+-- collide with the BATCH column and print nonsense.
+DRILL.xStock    = 80
+DRILL.stockFits = W >= 90
 
 -- ---------------------------------------------------------------------------
 -- EDITOR PAINTER
@@ -2846,6 +3207,8 @@ local function edDraw()
     title = "CONDITION EDITOR  /  asteroids"
   elseif ed.mode == "detail" then
     title = "CONDITION EDITOR  /  " .. tostring(ed.asteroid)
+  elseif ed.mode == "drills" then
+    title = "CONDITION EDITOR  /  drill consumables"
   else
     title = "CONDITION EDITOR  /  all tracked items"
   end
@@ -2853,15 +3216,27 @@ local function edDraw()
 
   local n = 0
   for _ in pairs(ed.enabled) do n = n + 1 end
-  local hint = string.format(
-    "%d tracked  |  space=toggle  t=type amount  T=step  a=add  /=find  s=save  esc=back%s",
-    n, ed.filter and ("  |  filter: " .. ed.filter) or "")
+  local hint
+  if ed.mode == "drills" then
+    hint = string.format("space=on/off  enter=edit all three  t=edit  /=find  s=save  esc=back%s",
+      ed.filter and ("  |  filter: " .. ed.filter) or "")
+  else
+    hint = string.format(
+      "%d tracked  |  space=toggle  t=type amount  T=step  a=add  d=drills  /=find  s=save  esc=back%s",
+      n, ed.filter and ("  |  filter: " .. ed.filter) or "")
+  end
   edPaint(2, hint, 0x000000, { { 2, hint, 0x888888 } })
 
   if ed.mode == "asteroids" then
     edPaint(4, "h:ast", 0x000000, {
       { X_NAME, "ASTEROID", 0x888888 }, { X_A, "MODULE", 0x888888 },
       { X_B, "DRONES", 0x888888 },      { X_C, "TRACKED", 0x888888 },
+    })
+  elseif ed.mode == "drills" then
+    edPaint(4, "h:drills", 0x000000, {
+      { X_NAME, "MATERIAL / SETTING", 0x888888 }, { X_A, "TIPS", 0x888888 },
+      { X_B, "RODS", 0x888888 },                 { X_C, "BATCH", 0x888888 },
+      table.unpack(DRILL.stockFits and { { DRILL.xStock, "IN STOCK", 0x888888 } } or {}),
     })
   else
     edPaint(4, "h:" .. ed.mode, 0x000000, {
@@ -2895,6 +3270,40 @@ local function edDraw()
 
       elseif row.kind == "note" then
         cells[1] = { 6, row.text, 0x555555 }
+
+      elseif row.kind == "setting" then
+        local f = row.field
+        cells[#cells+1] = { X_NAME, f.label, 0x00FFFF }
+        cells[#cells+1] = { X_A, tostring(ed.load[f.key] or "-"), 0x00FF00 }
+        cells[#cells+1] = { X_C, f.help:sub(1, W - X_C), 0x666666 }
+
+      elseif row.kind == "par" then
+        local par  = ed.par[row.key]
+        local on   = par ~= nil
+        local fg   = on and 0x00FFFF or 0x555555
+        cells[#cells+1] = { X_MARK, on and "[x]" or "[ ]", fg }
+        cells[#cells+1] = { X_NAME, row.name, fg }
+        cells[#cells+1] = { X_A, on and tostring(par.tips)  or "-", fg }
+        cells[#cells+1] = { X_B, on and tostring(par.rods)  or "-", fg }
+        cells[#cells+1] = { X_C, on and tostring(par.batch) or "-",
+                            on and 0x888888 or 0x555555 }
+
+        -- Kits, not tips and rods separately: a kit is what a load consumes,
+        -- and it is what the dispatch floor is counted in.
+        if DRILL.stockFits then
+          local d     = brokerState.drills[row.key]
+          local kits  = (d and d.kits) or 0
+          local floor = on and math.min(par.tips or 0, par.rods or 0) or DRILL.floor()
+          cells[#cells+1] = { DRILL.xStock, tostring(kits) .. " kits",
+            (kits == 0 and 0xFF4444) or (kits >= floor and 0x00FF00) or 0xFFAA00 }
+
+          -- Par is only published for materials a drone in this base actually
+          -- uses. Say so on the row, or switching one on for a tier you do not
+          -- own looks like the save did nothing.
+          if on and not row.usable and W >= DRILL.xStock + 36 then
+            cells[#cells+1] = { DRILL.xStock + 10, "no drone -- not published", 0x666666 }
+          end
+        end
 
       elseif row.kind == "asteroid" then
         cells[#cells+1] = { X_NAME, row.name:sub(1, X_A - X_NAME - 1),
@@ -2978,15 +3387,21 @@ local function edAction(a)
     edInvalidate()
     drawStaticFrame()
   elseif a == "back" then
-    if ed.mode == "detail" then
+    if ed.mode == "detail" or ed.mode == "drills" then
       ed.mode, ed.asteroid = "asteroids", nil
       ed.sel, ed.scroll = 1, 0
       edRebuild()
+      edMoveSel(1)
     else
       edAction("close")
     end
   elseif a == "items" then
     ed.mode = "items"; ed.sel, ed.scroll = 1, 0; edRebuild()
+  elseif a == "drills" then
+    ed.mode, ed.asteroid = "drills", nil
+    ed.sel, ed.scroll = 1, 0
+    edRebuild()
+    edMoveSel(1)   -- row 1 is a header
   elseif a == "asteroids" then
     ed.mode, ed.asteroid = "asteroids", nil; ed.sel, ed.scroll = 1, 0; edRebuild()
   elseif a == "add" then
@@ -3007,6 +3422,10 @@ local function edOpenSelected()
     ed.sel, ed.scroll = 1, 0
     edRebuild()
     edMoveSel(1)
+  elseif row.kind == "setting" then
+    DRILL.editSetting(row.field)
+  elseif row.kind == "par" then
+    DRILL.editAll(row.key)
   elseif row.kind == "item" and ed.mode == "items" then
     local t = ed.targets[row.item]
     if t then
@@ -3038,6 +3457,14 @@ local function edHandle(ev)
         ed.sel = idx
         if row.kind == "asteroid" then
           edOpenSelected()
+        elseif row.kind == "setting" then
+          DRILL.editSetting(row.field)
+        elseif row.kind == "par" then
+          -- Click the column you want rather than walking all three.
+          if     x >= X_A and x < X_B then DRILL.editField(row.key, "tips")
+          elseif x >= X_B and x < X_C then DRILL.editField(row.key, "rods")
+          elseif x >= X_C and x < DRILL.xStock then DRILL.editField(row.key, "batch")
+          else DRILL.toggle(row.key) end
         elseif x >= X_A and x < X_B then
           edTypeTarget(row.item)
         else
@@ -3104,10 +3531,16 @@ local function edHandle(ev)
         edRebuild()
       elseif row and row.kind == "asteroid" then
         edOpenSelected()
+      elseif row and row.kind == "par" then
+        DRILL.toggle(row.key)
+      elseif row and row.kind == "setting" then
+        DRILL.editSetting(row.field)
       end
     elseif ch == 116 then                                   -- t: type an amount
       local row = selectedRow()
-      if row and row.kind == "item" then edTypeTarget(row.item) end
+      if row and row.kind == "item" then edTypeTarget(row.item)
+      elseif row and row.kind == "par" then DRILL.editAll(row.key)
+      elseif row and row.kind == "setting" then DRILL.editSetting(row.field) end
     elseif ch == 84 then                                    -- T: step the ladder
       local row = selectedRow()
       if row and row.kind == "item" then edCycleTarget(row.item) end
@@ -3115,6 +3548,7 @@ local function edHandle(ev)
     elseif ch == 47  then edAction("find")
     elseif ch == 115 then edAction("save")
     elseif ch == 105 then edAction("items")
+    elseif ch == 100 then edAction("drills")                -- d: drill consumables
     end
     return true
   end
@@ -3257,37 +3691,6 @@ end
 -- Goes out on config.ports.hardware, not the command port: see the note beside
 -- config.ports for why the hw node does not want the dust watchlist traffic.
 -- ---------------------------------------------------------------------------
--- Which drill materials can this base actually consume right now?
---
--- Par for a material we have no drone for is pure noise: it cannot be
--- dispatched, so the kits are never spent, and on a network without the pattern
--- it produces a permanent row of red on both dashboards. Worse, for the top
--- tiers it would queue genuinely expensive crafts for hardware not owned.
-local function usableDrillKeys()
-  local keys = {}
-
-  -- Drones sitting in the staging network.
-  for droneKey, count in pairs(brokerState.drones) do
-    if (count or 0) > 0 then
-      local tier = config.droneTierKeys[droneKey]
-      local dk   = tier and config.droneDrillMap[tier]
-      if dk then keys[dk] = true end
-    end
-  end
-
-  -- Plus anything a busy module is holding. A drone loaded into a running
-  -- module is NOT in the ME network, so it reports zero above -- and dropping
-  -- its material from par mid-run is exactly backwards, since that is the
-  -- material actively being consumed.
-  for _, mod in ipairs(modules) do
-    if mod.status ~= "IDLE" and mod.job and mod.job.drillKey then
-      keys[mod.job.drillKey] = true
-    end
-  end
-
-  return keys
-end
-
 local function broadcastDrillPar()
   local list = {}
   local usable = usableDrillKeys()
@@ -3402,6 +3805,15 @@ while true do
     broadcastWatchlist()
     lastWatchlistSend  = computer.uptime()
     edRequestWatchlist = false
+  end
+
+  -- Same for drill par. Separate flag rather than folded into the one above,
+  -- because edSave sets both and this is the only place broadcastDrillPar is in
+  -- scope -- it is defined below the editor. Without it a par change waited out
+  -- the 30s cadence, which reads as the edit not having taken.
+  if edRequestPar then
+    broadcastDrillPar()
+    edRequestPar = false
   end
 
   -- 1b. Re-publish the dust watchlist on its own slow cadence.
