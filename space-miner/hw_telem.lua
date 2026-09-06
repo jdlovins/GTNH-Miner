@@ -150,6 +150,9 @@ local orders = {}
 -- dead and allow a re-request. AE2 status objects do not survive every network
 -- hiccup, and without this a single lost handle would wedge one material
 -- permanently -- exactly the silent stall this feature exists to remove.
+--
+-- Only applies to a handle that has STOPPED ANSWERING -- see statusAlive. A
+-- craft still reporting its state is left alone however long it takes.
 local ORDER_TIMEOUT = 600
 
 -- Minimum wall-clock gap before retrying a label that had no pattern or whose
@@ -196,6 +199,22 @@ local function statusSays(status, method)
   return ok and res == true
 end
 
+-- Does this handle still answer at all?
+--
+-- statusSays cannot tell "the craft says it is not done" from "the handle is
+-- dead and threw" -- both come back false. The timeout below needs exactly that
+-- difference. A craft that is merely TAKING a long time must not be retired,
+-- because retiring it re-orders on top of a craft that is still running, and a
+-- large batch of drill tips can easily outlast a ten minute timeout.
+--
+-- That duplicate used to be invisible: with every CPU busy AE2 rejected the
+-- second request and it showed as one red line. Free up a CPU and the duplicate
+-- is accepted instead, and the same batch gets crafted twice.
+local function statusAlive(status)
+  if type(status) ~= "table" and type(status) ~= "userdata" then return false end
+  return (pcall(function() return status.isDone and status.isDone(status) end))
+end
+
 -- Derive the label list from drillLookup rather than hardcoding a third copy of
 -- these names (config.drills is the second). drillLookup already enumerates
 -- every tip and rod label; we only need it in a stable order.
@@ -218,6 +237,27 @@ end
 -- discovering it via a pcall failure on every label, every cycle.
 local canCraft = (me.getCraftables ~= nil)
 
+-- Pick the craftable that actually IS `label` out of what getCraftables handed
+-- back, rather than trusting the first entry.
+--
+-- The filter is a hint, not a guarantee: with a Pattern Repeater joining another
+-- network's patterns to this one, an unhonoured filter returns every craftable
+-- in both networks -- and craftables[1] is then some unrelated item that we
+-- would happily order thousands of. Matching on the stack's own label costs one
+-- pass over a list we already have.
+local function pickCraftable(craftables, label)
+  for i = 1, #craftables do
+    local c = craftables[i]
+    local ok, stack = pcall(function() return c.getItemStack and c.getItemStack() end)
+    if ok and type(stack) == "table" and stack.label == label then return c end
+  end
+  -- No entry exposed a label to check against. A single result came back from a
+  -- query for this label and there is nothing to confuse it with, so use it;
+  -- anything ambiguous is treated as "no pattern" instead of guessed at.
+  if #craftables == 1 then return craftables[1] end
+  return nil
+end
+
 -- Place one crafting request. Returns the new order state.
 local function requestCraft(label, amount)
   if not canCraft then
@@ -230,7 +270,13 @@ local function requestCraft(label, amount)
     return { state = "nopattern", want = amount, since = computer.uptime() }
   end
 
-  local okReq, status = pcall(function() return craftables[1].request(amount) end)
+  local craftable = pickCraftable(craftables, label)
+  craftables = nil
+  if not craftable then
+    return { state = "nopattern", want = amount, since = computer.uptime() }
+  end
+
+  local okReq, status = pcall(function() return craftable.request(amount) end)
   if not okReq or not status then
     return { state = "failed", want = amount, since = computer.uptime() }
   end
@@ -262,12 +308,17 @@ local function stepOrders(assets)
       if statusSays(o.status, "isDone") then
         orders[label] = nil
         settle[label] = { stock = o.baseStock, expires = now + SETTLE_MAX }
-      elseif statusSays(o.status, "isCanceled")
-        or statusSays(o.status, "isFailed")
-        or (now - o.since) > ORDER_TIMEOUT then
+      elseif statusSays(o.status, "isCanceled") or statusSays(o.status, "isFailed") then
         -- Nothing was delivered, so no settle window: re-order immediately if
-        -- the deficit is still real. A timed-out order is a presumed-dead status
-        -- handle, which is precisely the case we want to retry.
+        -- the deficit is still real.
+        orders[label] = nil
+      elseif (now - o.since) > ORDER_TIMEOUT and not statusAlive(o.status) then
+        -- Presumed-dead handle, which is the case the timeout was written for:
+        -- AE2 status objects do not survive every network hiccup, and without
+        -- this one lost handle would wedge a material permanently.
+        --
+        -- The aliveness check is what keeps it from ALSO retiring healthy but
+        -- slow crafts. Time alone was never evidence a craft had died.
         orders[label] = nil
       end
     elseif (now - o.since) > RETRY_INTERVAL then
@@ -352,13 +403,111 @@ local function drawStaticFrame()
   term.setCursor(2, 24) io.write("  Network Port: 2026")
 end
 
--- Reads items directly from ME network via controller
-local function scanAssets()
-  local assets = { drones={}, drillTips={}, drillRods={} }
+-- =============================================================================
+-- NETWORK SCAN
+--
+-- me.getItemsInNetwork() with no filter materialises EVERY stack in the network
+-- as its own Lua table, in one allocation. That was fine on a standalone
+-- staging network, but a Pattern Repeater grafts another network's contents
+-- onto this one and the list grows with it -- tens of thousands of entries,
+-- each a table of label/name/damage/size/nbt. This machine's heap is a couple
+-- of hundred kilobytes, so the list alone no longer fits and the node died with
+-- "not enough memory" before it could read a single count.
+--
+-- This node only ever cares about the 32 exact labels below, so ask for them by
+-- name. A filtered query is matched on the Java side and hands back a handful
+-- of entries, which makes peak memory a function of what we track rather than
+-- of how large the ME network happens to be.
+-- =============================================================================
 
-  -- Query all items in the ME network
+-- Every label worth asking about, and where its count belongs in `assets`.
+-- Built from the tables above so there is still exactly one list of names.
+local scanTargets = {}
+for _, key in ipairs(droneKeys) do
+  local label = droneNames[key]
+  -- assets.drones is keyed by full label (updateDashboard looks it up that way).
+  scanTargets[#scanTargets + 1] = { label = label, bucket = "drones", key = label }
+end
+for _, label in ipairs(drillLabels) do
+  local bucket = string.find(label, "Drill Tip", 1, true) and "drillTips" or "drillRods"
+  scanTargets[#scanTargets + 1] = { label = label, bucket = bucket, key = drillLookup[label] }
+end
+
+-- More entries than any single label could plausibly occupy. A filtered query
+-- that comes back bigger than this was not filtered at all.
+local FILTER_SANE_MAX = 64
+
+-- Total network count for one exact label, or nil if the query failed.
+local function countLabel(label)
+  local ok, items = pcall(me.getItemsInNetwork, { label = label })
+  if not ok or type(items) ~= "table" then return nil end
+  local total = 0
+  for i = 1, #items do
+    local it = items[i]
+    -- Re-check the label rather than trusting the filter. It is compared field
+    -- by field on the Java side and a loose or ignored match would otherwise
+    -- fold unrelated items into this count; an exact test costs one comparison.
+    if type(it) == "table" and it.label == label then
+      total = total + (it.size or 0)
+    end
+  end
+  return total
+end
+
+-- Is the filter actually honoured here? Decided once, at startup.
+--
+-- If it is not, a filtered call still returns the whole network -- and doing
+-- that 32 times a cycle is far worse than the single unfiltered pass we are
+-- replacing. So probe once and fall back to one full scan per cycle if the
+-- device ignores us.
+local useFilter = false
+do
+  local ok, items = pcall(me.getItemsInNetwork, { label = drillLabels[1] })
+  useFilter = ok and type(items) == "table" and #items <= FILTER_SANE_MAX
+  items = nil
+  collectgarbage()
+end
+
+-- Why the counts look the way they do, for the status line. A failed query and
+-- an empty network are indistinguishable on the board otherwise.
+local scanState = { ok = true, mode = useFilter and "filtered" or "full", err = nil }
+
+local function newAssets()
+  return { drones = {}, drillTips = {}, drillRods = {} }
+end
+
+-- 32 small queries. Returns nil if any of them failed: a partial scan reads as
+-- "the network is empty", and ordering against that would fire a craft for
+-- every material at once.
+local function scanFiltered()
+  local assets = newAssets()
+  for _, t in ipairs(scanTargets) do
+    local n = countLabel(t.label)
+    if not n then
+      scanState = { ok = false, mode = "filtered", err = "query failed: " .. t.label }
+      return nil
+    end
+    if n > 0 then assets[t.bucket][t.key] = (assets[t.bucket][t.key] or 0) + n end
+  end
+  scanState = { ok = true, mode = "filtered", err = nil }
+  return assets
+end
+
+-- Fallback for a device that ignores the filter: the original whole-network
+-- pass, which is what runs out of memory on a repeated network. Collect first
+-- so the previous cycle's garbage is not still holding the heap when the list
+-- lands, and treat the failure as a failed scan instead of letting it kill the
+-- node -- a dashboard reporting "SCAN FAILED" is far more use than a dead one.
+local function scanFull()
+  collectgarbage()
+  local assets = newAssets()
+
   local success, itemList = pcall(me.getItemsInNetwork)
-  if not success or not itemList then return assets end
+  if not success or not itemList then
+    scanState = { ok = false, mode = "full",
+                  err = success and "returned nothing" or tostring(itemList) }
+    return nil
+  end
 
   for _, item in ipairs(itemList) do
     if item.label then
@@ -375,7 +524,20 @@ local function scanAssets()
     end
   end
 
+  -- Drop the list before anything else allocates against it.
+  itemList = nil
+  collectgarbage()
+  scanState = { ok = true, mode = "full", err = nil }
   return assets
+end
+
+-- Reads items directly from ME network via controller.
+-- nil means "this cycle's numbers are not trustworthy" -- the caller keeps the
+-- previous snapshot rather than acting on a blank one.
+local function scanAssets()
+  if useFilter then return scanFiltered() end
+  return scanFull()
+end
 end
 
 local function updateDashboard(assets)
@@ -484,6 +646,22 @@ local function updateDashboard(assets)
   end
   for r = qRow, QLAST do gpu.fill(QX, r, QW, 1, " ") end
 
+  -- Scan health, bottom of the LEFT column. Row 21 is the one line there the
+  -- drone list (rows 7-20) does not repaint over, and the restock block owns
+  -- the right half of it. Free memory is on show because this node's failure
+  -- mode is running out of it -- a repeated network can grow the item list
+  -- without anything else on screen changing.
+  gpu.fill(2, 21, 36, 1, " ")
+  term.setCursor(2, 21)
+  if scanState.ok then
+    gpu.setForeground(0x555555)
+    io.write(string.format("  scan %s  free %dk",
+      scanState.mode, math.floor(computer.freeMemory() / 1024)))
+  else
+    gpu.setForeground(0xFF4444)
+    io.write(string.sub("  SCAN FAILED: " .. (scanState.err or "?"), 1, 36))
+  end
+
   gpu.setForeground(0x555555)
   term.setCursor(55, 2)
   io.write("LAST_SYNC: " .. os.date("%X"))
@@ -524,11 +702,16 @@ local function buildPayload(assets)
 end
 
 while true do
-  -- Scan the ME network for current inventory
-  lastAssets = scanAssets()
-  -- Order before drawing and before building the payload, so both reflect this
-  -- cycle's decisions rather than lagging one iteration behind.
-  stepOrders(lastAssets)
+  -- Scan the ME network for current inventory. A failed scan keeps the previous
+  -- snapshot and skips ordering: a half-read network looks like an empty one,
+  -- and ordering against that would fire a craft for every material at once.
+  local assets = scanAssets()
+  if assets then
+    lastAssets = assets
+    -- Order before drawing and before building the payload, so both reflect
+    -- this cycle's decisions rather than lagging one iteration behind.
+    stepOrders(lastAssets)
+  end
   updateDashboard(lastAssets)
 
   -- Build and broadcast periodic HW_UPDATE
@@ -539,6 +722,13 @@ while true do
     payloadType = "HW_UPDATE",
     data        = payload
   }))
+
+  -- Hand the cycle's garbage back before parking in event.pull. The scan and
+  -- the serialized packet are the two large allocations here, and collecting
+  -- them while we are idle anyway keeps the heap floor steady instead of
+  -- letting it drift up until an unlucky cycle has nowhere to allocate.
+  payload = nil
+  collectgarbage()
 
   -- Listen for Ctrl+C or broker commands (10s timeout).
   --
