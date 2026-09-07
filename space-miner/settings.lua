@@ -43,6 +43,7 @@ S.groups = {
   { id = "nodes",    label = "TELEMETRY NODES (pushed to dust/fluid/hw over the air)" },
   { id = "ui",       label = "INTERFACE       (this screen)" },
   { id = "logging",  label = "LOGGING         (see logger.lua)" },
+  { id = "hardware", label = "HARDWARE        (how many drones you own)" },
   { id = "compat",   label = "COMPATIBILITY   (which GTNH this fleet runs)" },
   { id = "other",    label = "OTHER" },
 }
@@ -194,6 +195,56 @@ S.list = {
 
   { key = "logging.bootUnixTime", group = "logging", type = "int", default = 0, min = 0,
     label = "Boot epoch", help = "real unix seconds at boot, to anchor timestamps; 0 = uptime-relative" },
+
+  -- --- HARDWARE ------------------------------------------------------------
+  -- HOW MANY DRONES YOU OWN. Declared, not measured, and that is the point.
+  --
+  -- hw_telem reports what the ME NETWORK holds, which is only ever half the
+  -- picture: a drone sitting in a module's input bus, in an interface buffer, or
+  -- mid-transfer is not in the network, so the sensor calls it missing. The
+  -- broker used to reconstruct the difference from dispatch timestamps, and
+  -- every way of getting that wrong has now been found the hard way -- a tier
+  -- frozen at a stale count, a returned drone invisible for a sweep, a drone
+  -- left in a bus invisible at boot, and a sweep timestamp that records when the
+  -- message ARRIVED rather than when the scan ran.
+  --
+  -- Tips and rods are consumed, so their counts genuinely have to be measured.
+  -- A drone is a durable asset: you own ten, they move between the network and a
+  -- bus, and nothing destroys them. So say how many there are and let the broker
+  -- keep the ledger -- free = declared - committed - held, with no window and no
+  -- timestamp anywhere in it.
+  --
+  -- Telemetry still reports drones; the dashboard shows it as an AUDIT against
+  -- these numbers, so a fleet that has drifted says so instead of quietly
+  -- mis-dispatching. Update these when you craft or lose a drone.
+  { key = "droneStock.lv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "LV drones", help = "how many Mining Drone Mk-I (LV) you own" },
+  { key = "droneStock.mv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "MV drones", help = "how many Mining Drone Mk-II (MV) you own" },
+  { key = "droneStock.hv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "HV drones", help = "how many Mining Drone Mk-III (HV) you own" },
+  { key = "droneStock.ev", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "EV drones", help = "how many Mining Drone Mk-IV (EV) you own" },
+  { key = "droneStock.iv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "IV drones", help = "how many Mining Drone Mk-V (IV) you own" },
+  { key = "droneStock.luv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "LuV drones", help = "how many Mining Drone Mk-VI (LuV) you own" },
+  { key = "droneStock.zpm", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "ZPM drones", help = "how many Mining Drone Mk-VII (ZPM) you own" },
+  { key = "droneStock.uv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "UV drones", help = "how many Mining Drone Mk-VIII (UV) you own" },
+  { key = "droneStock.uhv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "UHV drones", help = "how many Mining Drone Mk-IX (UHV) you own" },
+  { key = "droneStock.uev", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "UEV drones", help = "how many Mining Drone Mk-X (UEV) you own" },
+  { key = "droneStock.uiv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "UIV drones", help = "how many Mining Drone Mk-XI (UIV) you own" },
+  { key = "droneStock.umv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "UMV drones", help = "how many Mining Drone Mk-XII (UMV) you own" },
+  { key = "droneStock.uxv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "UXV drones", help = "how many Mining Drone Mk-XIII (UXV) you own" },
+  { key = "droneStock.max", group = "hardware", type = "int", default = 0, min = 0, max = 999,
+    label = "MAX drones", help = "how many Mining Drone Mk-XIV (MAX) you own" },
 
   -- --- COMPATIBILITY -------------------------------------------------------
   -- Which GTNH this fleet is running. Two things hang off it, module_api.lua

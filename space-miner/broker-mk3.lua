@@ -183,9 +183,6 @@ local brokerState = {
   lastParCount = 0,
   nextTarget = nil,
   telemetryReady = false,
-  -- When initModules() finished emptying the input buses. Dispatch waits for an
-  -- hw sweep newer than this; see the telemetryReady gate in the main loop.
-  bootClearedAt = 0,
   priorityMode = "threshold", -- "threshold" (lowest fill first) | "rarity" (dust priority first)
 }
 
@@ -362,22 +359,18 @@ local drillKeyOrder = {
 local function usableDrillKeys()
   local keys = {}
 
-  -- Drones sitting in the staging network.
-  for droneKey, count in pairs(brokerState.drones) do
-    if (count or 0) > 0 then
+  -- Every drone the fleet owns, whether it is in the network or in a module.
+  --
+  -- This used to read the ME figure and then re-add "anything a busy module is
+  -- holding", because a drone loaded into a running module reports as zero and
+  -- dropping its material from par mid-run is exactly backwards -- that is the
+  -- material actively being consumed. The declared fleet does not go missing
+  -- while it is being used, so the second loop is gone with the reason for it.
+  for droneKey, count in pairs(config.droneStock or {}) do
+    if (tonumber(count) or 0) > 0 then
       local tier = config.droneTierKeys[droneKey]
       local dk   = tier and config.droneDrillMap[tier]
       if dk then keys[dk] = true end
-    end
-  end
-
-  -- Plus anything a busy module is holding. A drone loaded into a running
-  -- module is NOT in the ME network, so it reports zero above -- and dropping
-  -- its material from par mid-run is exactly backwards, since that is the
-  -- material actively being consumed.
-  for _, mod in ipairs(modules) do
-    if mod.status ~= "IDLE" and mod.job and mod.job.drillKey then
-      keys[mod.job.drillKey] = true
     end
   end
 
@@ -509,25 +502,14 @@ local function returnItemsToME(mod)
     end
   end
 
-  -- REMEMBER WHAT JUST WENT BACK, AND WHEN.
-  --
-  -- Between this call and the next hw sweep the drone exists in no model at
-  -- all: it is out of mod.holding (the caller clears it), out of mod.job
-  -- (nil'd on the way to IDLE), and not yet in brokerState.drones, because the
-  -- ME figure only moves when an HW_UPDATE lands -- up to a full event.pull(10)
-  -- away, plus however long the network takes to absorb the items.
-  --
-  -- That blind spot is what put LV drones in a LuV rotation: two of the return
-  -- paths hand the module straight back to dispatch in the same breath, the
-  -- pool says no LuV, and assignOne walks down the tier list until it finds
-  -- something it can use. availableDrones reads this stamp to close the gap.
-  --
-  -- mod.holding first, deliberately: at the tryDispatch call site mod.job is
-  -- already the NEW job and mod.holding is the hardware being given back.
-  local src = mod.holding or mod.job
-  if src and src.droneKey then
-    mod.returned = { droneKey = src.droneKey, at = computer.uptime() }
-  end
+  -- Nothing is recorded here any more. This used to stamp mod.returned so the
+  -- pool could count a drone that had left the bus but not yet reached the
+  -- network -- a blind spot that only existed because the pool was derived from
+  -- what the ME could see. It is derived from the declared fleet now, and a
+  -- drone in transit never stopped being counted, so there is nothing to
+  -- remember. (The stamp was also wrong: it recorded the drone the JOB wanted,
+  -- not the one the bus HELD, so a failed load -- where no drone ever
+  -- arrived -- credited one that did not exist.)
 end
 
 -- One implementation, in loader.lua, because the loader is what allocates these
@@ -1145,26 +1127,24 @@ local function tryDispatch(mod, asteroid, droneKey, avail, availKit)
   local holds = moduleHolds(mod, droneKey, drillKey)
   local minKits = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
 
-  -- TWO GATES, AND THEY ASK DIFFERENT QUESTIONS.
+  -- ONE GATE FOR DRONES, TWO FOR KITS, AND THE DIFFERENCE IS THE POINT.
   --
-  -- The pool says whether this drone is still unpromised: it is the ME figure
-  -- minus commitments the last sweep has not seen, plus what idle modules are
-  -- holding. That is the reservation, and it is what reserveWhileMining moves.
+  -- There used to be a second drone gate on brokerState.drones -- the raw ME
+  -- figure -- asking "can this actually be FETCHED". It was there because the
+  -- pool was derived from telemetry and could disagree with it. The pool is the
+  -- declared fleet minus what modules are using now, so there is nothing left
+  -- for a second opinion to add: if the ledger says free and the network cannot
+  -- hand it over, the fleet has drifted from what you declared, and the loader
+  -- says so by name rather than this silently picking a weaker drone.
   --
-  -- The raw ME figure says whether the drone can actually be FETCHED. Those come
-  -- apart for a held drone: the pool counts it as owned (correctly -- it exists),
-  -- but it is sitting in one module's input bus, so a DIFFERENT module cannot
-  -- load it. Without the second gate that phantom gets handed to whoever is next
-  -- in pool order, the loader waits out ARRIVE_TIMEOUT for a drone the network
-  -- does not have, and the module lands in ERROR.
+  -- Kits keep both, because they ARE measured: enough unpromised, and enough
+  -- actually in the network.
   --
-  -- A module that holds the hardware needs neither: the drone never left it, and
-  -- the loader only fetches what it is short of.
+  -- A module that holds the hardware needs none of it: the drone never left it,
+  -- and the loader only fetches what it is short of.
   if not holds then
     if (avail[droneKey] or 0) <= 0 then return false end
-    if (brokerState.drones[droneKey] or 0) <= 0 then return false end
 
-    -- Same pair for kits: enough unpromised, and enough actually in the network.
     if (availKit[drillKey] or 0) < minKits then return false end
     local drill = brokerState.drills[drillKey]
     if not drill or (drill.kits or 0) < minKits then return false end
@@ -1245,67 +1225,50 @@ end
 
 -- How many of each drone are actually free to assign right now?
 --
--- strict charges every busy module, not just the ones telemetry has yet to see.
--- Callers pass config.reserveWhileMining for the dispatch pool, and false where
--- the question is which tiers this array OWNS rather than which are free.
-local function availableDrones(strict)
+-- DECLARED, MINUS WHAT IS COMMITTED. No telemetry, no timestamps, no windows.
+--
+-- This used to start from the ME figure and try to reconstruct reality from it:
+-- subtract commitments a sweep had not seen, add back what modules were holding,
+-- add back what was in flight to the network. Every one of those corrections
+-- existed because hw_telem can only see the NETWORK, and a drone in an input
+-- bus, an interface buffer, or mid-transfer is not in it. Four separate bugs
+-- came out of that seam -- a tier frozen at a stale count, a returned drone
+-- invisible for a sweep, a drone left in a bus invisible at boot, and a sweep
+-- timestamp that records arrival rather than when the scan ran.
+--
+-- config.droneStock is the fleet, stated by the operator. Everything else here
+-- is bookkeeping the broker does itself and therefore knows exactly.
+--
+-- `strict` is now meaningless for drones and is accepted only so the two pool
+-- functions keep the same shape: there is no "has telemetry seen this yet"
+-- question left to answer conservatively. availableKits still takes it and still
+-- means it -- tips and rods ARE consumed and do have to be measured.
+local function availableDrones(_strict)
   local avail = {}
-  local sync  = brokerState.lastHWSyncTime or 0
-  local now   = computer.uptime()
-  for key, count in pairs(brokerState.drones) do avail[key] = count end
+  for key, count in pairs(config.droneStock or {}) do
+    avail[key] = tonumber(count) or 0
+  end
+
   for _, mod in ipairs(modules) do
-    -- CHARGE ONLY WHAT THE SWEEP HAS NOT SEEN.
-    --
-    -- This used to read `strict or not telemetryHasSeen(mod)`, which charged
-    -- every busy module under reserveWhileMining -- including the ones the ME
-    -- figure had ALREADY stopped counting, because their drone is sitting in a
-    -- bus. That is a double subtraction, and it is what "forgot a drone" was:
-    -- two LuV busy and a third finishing a craft read as 1 - 2 = -1, so a
-    -- genuinely free drone would not dispatch. Flooring the result at zero does
-    -- not help, since -1 and 0 both mean "cannot dispatch" -- the count itself
-    -- had to stop being wrong.
-    --
-    -- Promising the same drone to two modules in one sweep is prevented by the
-    -- batch-local decrements in assignOne and tryDispatchPinned, not by this.
-    if mod.status ~= "IDLE" and mod.job and mod.job.droneKey
-       and not telemetryHasSeen(mod, strict) then
+    -- Anything not idle is using its drone, full stop. No exception for a
+    -- commitment the sweep has already accounted for, because there is no sweep
+    -- in this sum any more -- the double-charge that exception existed to
+    -- prevent cannot occur.
+    if mod.status ~= "IDLE" and mod.job and mod.job.droneKey then
       local k = mod.job.droneKey
       avail[k] = (avail[k] or 0) - 1
     end
-    -- A HELD DRONE IS OWNED. With fastReload a finished module keeps its drone
-    -- and goes IDLE with job = nil, so it is charged by nothing above -- and the
-    -- ME cannot see it either, because it is physically in the bus. Without this
-    -- it exists nowhere in the model until releaseStaleHold fires.
-    --
-    -- dispatchBatch used to add this back to its own local copy. That is gone;
-    -- doing it here is what lets the hardware panel see holds too, and keeping
-    -- both would credit every hold twice.
-    if config.fastReload and mod.holding and mod.holding.droneKey then
-      local k = mod.holding.droneKey
-      avail[k] = (avail[k] or 0) + 1
-    end
-    -- A DRONE ON ITS WAY BACK IS STILL OURS. The exact mirror of the charge
-    -- above: that one subtracts a commitment the sweep has not seen yet,
-    -- because the stock figure still counts a drone we have already taken.
-    -- This adds back one we have already given, because the stock figure does
-    -- not count it yet.
-    --
-    -- Two bounds, and both matter. `at > sync` means a sweep landing after the
-    -- return retires the stamp on its own -- past that point the ME figure
-    -- includes the drone and crediting it again would double-count. The
-    -- HW_STALE ceiling covers the hw node going quiet: sync then stops
-    -- advancing, the first test would stay true forever, and we would credit a
-    -- phantom drone for as long as the broker ran.
-    local ret = mod.returned
-    if ret and ret.droneKey then
-      if ret.at > sync and (now - ret.at) <= HW_STALE then
-        avail[ret.droneKey] = (avail[ret.droneKey] or 0) + 1
-      elseif ret.at <= sync then
-        mod.returned = nil
-      end
-    end
+    -- NOTHING IS ADDED BACK FOR A HOLD, and that is not an omission. With
+    -- fastReload a finished module keeps its drone and goes IDLE with job = nil,
+    -- so the charge above skips it -- and it is already inside the declared
+    -- total, because it never stopped being ours. The old version had to credit
+    -- holds explicitly to undo the ME figure calling them missing; there is no
+    -- ME figure here to undo. preferHolder still hands it back to the same
+    -- module, which is a routing decision, not an accounting one.
   end
-  -- Nothing downstream should have to reason about a negative pool.
+
+  -- A fleet declared smaller than what is actually committed -- you dispatched
+  -- ten and then edited the setting down to eight -- must not read as negative.
   for k, v in pairs(avail) do if v < 0 then avail[k] = 0 end end
   return avail
 end
@@ -1533,26 +1496,6 @@ local function dispatchBatch()
   local reachAvail    = strict and availableDrones(false) or avail
   local reachAvailKit = strict and availableKits(false)   or availKit
 
-  -- Drones physically between a module's bus and the ME network right now.
-  --
-  -- availableDrones counts these as owned, correctly -- they exist. But
-  -- tryDispatch's second gate reads the raw ME figure, which does NOT include
-  -- them yet, so they cannot actually be FETCHED for another module. Without
-  -- something to say "wait", assignOne reads that refusal as "this tier is
-  -- unusable" and walks down to whatever it can get, which is how a LuV
-  -- rotation acquired LV drones.
-  --
-  -- Counted per tier rather than as a flag because the count is the budget:
-  -- one module may wait per drone actually coming back, and no more.
-  local inFlight = {}
-  for _, mod in ipairs(modules) do
-    local ret = mod.returned
-    if ret and ret.droneKey and ret.at > (brokerState.lastHWSyncTime or 0)
-       and (computer.uptime() - ret.at) <= HW_STALE then
-      inFlight[ret.droneKey] = (inFlight[ret.droneKey] or 0) + 1
-    end
-  end
-
   -- Held drones and kits used to be credited back here, over this function's
   -- own copies. availableDrones/availableKits do it now, which fixes two things
   -- this version could not: a hold on a module trimmed out of idleModules by the
@@ -1696,9 +1639,39 @@ local function dispatchBatch()
     if not asteroidData then return false end
     if (astCount[asteroidName] or 0) >= cap then return false end
 
+    -- WHY A BETTER DRONE WAS NOT USED.
+    --
+    -- assignOne walks the tiers high to low and takes the first one it can
+    -- place, which means a module ending up on a weak drone is the RESULT of
+    -- several silent refusals. Three of them are legitimate -- the asteroid caps
+    -- below that tier, its drill material is short, every one is already out --
+    -- and telling them apart from the outside is guesswork. Record the first
+    -- skip so the dispatch log can name it.
+    local skipped
+    local function note(key, why)
+      if not skipped then skipped = { model = config.droneModel(key), why = why } end
+    end
+
     for _, droneKey in ipairs(config.droneKeyOrder) do
+      local droneTier = config.droneTierKeys[droneKey]
+      -- Only worth explaining for a tier we actually own; the rest is noise.
+      if droneTier and (tonumber((config.droneStock or {})[droneKey]) or 0) > 0 then
+        if droneTier > asteroidData.maxDrone or droneTier < asteroidData.minDrone then
+          note(droneKey, string.format("%s takes tier %d-%d",
+            asteroidName, asteroidData.minDrone, asteroidData.maxDrone))
+        elseif (avail[droneKey] or 0) <= 0 then
+          note(droneKey, string.format("none free (%d owned, all committed)",
+            tonumber((config.droneStock or {})[droneKey]) or 0))
+        else
+          local dk = config.droneDrillMap[droneTier]
+          if dk and (availKit[dk] or 0) < minKitsForLoad then
+            note(droneKey, string.format("%s kits %d < %d",
+              dk, availKit[dk] or 0, minKitsForLoad))
+          end
+        end
+      end
+
       if (avail[droneKey] or 0) > 0 then
-        local droneTier = config.droneTierKeys[droneKey]
         if droneTier >= asteroidData.minDrone and droneTier <= asteroidData.maxDrone then
           local drillKey = config.droneDrillMap[droneTier]
           if drillKey and (availKit[drillKey] or 0) >= minKitsForLoad then
@@ -1717,34 +1690,14 @@ local function dispatchBatch()
                 avail[droneKey]        = avail[droneKey] - 1
                 availKit[drillKey]     = availKit[drillKey] - minKitsForLoad
                 table.remove(pool, idx)
+                if skipped then
+                  logger:info("[DISPATCH] M%d <- %s on %s; passed over %s: %s",
+                    mod.index, config.droneModel(droneKey), asteroidName,
+                    skipped.model, skipped.why)
+                end
                 return true
               end
             end
-          end
-
-          -- WAIT FOR A DRONE THAT IS ON ITS WAY, RATHER THAN DROPPING BENEATH IT.
-          --
-          -- We could not place this tier, and one of them is in flight back to
-          -- the network. It lands within a sweep; committing this module to a
-          -- weaker drone now costs a module slot for the whole of the next
-          -- cycle, and with drones scarcer than modules that is a slot the good
-          -- drone needed.
-          --
-          -- INSIDE the tier-range test, so a drone coming back can only hold up
-          -- an asteroid it could actually mine. Out here it would block
-          -- substitution on every need in the list.
-          --
-          -- AFTER the attempt, never before: a LuV that IS available must still
-          -- be used when another happens to be in flight.
-          --
-          -- SPEND the credit. One module waits per drone actually coming back;
-          -- a second idle module with nothing on its way should still drop a
-          -- tier, which is a legitimate substitution and not what this guard is
-          -- for. Reading without decrementing would idle the whole pool on one
-          -- returning drone.
-          if (inFlight[droneKey] or 0) > 0 then
-            inFlight[droneKey] = inFlight[droneKey] - 1
-            return false
           end
         end
       end
@@ -2452,29 +2405,42 @@ local function drawHWPanel()
   --
   -- Both are shown, and only when they disagree, so the ordinary case stays a
   -- single number. `x0 (1 free)` is a drone held by a finished module under
-  -- fastReload: the ME cannot see it, the pool can, and that gap is worth
-  -- saying out loud rather than hiding.
+  -- DECLARED, FREE, AND WHAT THE NETWORK CAN ACTUALLY SEE.
+  --
+  -- The first two are the ledger: config.droneStock minus what modules are
+  -- using. The third is telemetry, and it is here as an AUDIT rather than as an
+  -- input -- it can only see the ME network, so a drone in a bus reads as
+  -- missing and the two legitimately differ while modules are running.
+  --
+  -- What it catches is drift: declare ten, own nine, and every cycle one load
+  -- fails for a drone that is not there. Without this line that reads as a
+  -- hardware fault. With it, the fleet says so.
   local freeDrones = POOL.freeDrones()
-  put("  DRONES IN STOCK:", 0x888888)
-  local any = false
+  put("  DRONES (declared):", 0x888888)
+  local any, declaredTotal, seenTotal = false, 0, 0
   for _, key in ipairs(config.droneKeyOrder) do
-    local count = brokerState.drones[key] or 0
+    local owned = tonumber((config.droneStock or {})[key]) or 0
     local free  = freeDrones[key] or 0
-    if count > 0 or free > 0 then
+    declaredTotal = declaredTotal + owned
+    seenTotal = seenTotal + (brokerState.drones[key] or 0)
+    if owned > 0 then
       if row > H then break end
-      -- Amber when nothing is free: the tier is owned but cannot be dispatched,
-      -- which is a different state from not owning one at all.
+      -- Amber when nothing is free: the tier is owned but every one of them is
+      -- out, which is a different state from not owning one at all.
       local color = (free > 0) and 0x00FFFF or 0xFFAA00
-      local model = config.droneModel(key)
-      if free ~= count then
-        putf(color, "  %-18s  x%d  (%d free)", model, count, free)
-      else
-        putf(color, "  %-18s  x%d", model, count)
-      end
+      putf(color, "  %-18s  %d owned  %d free", config.droneModel(key), owned, free)
       any = true
     end
   end
-  if not any then put("  [ NO DRONES IN STOCK ]", 0xFF4444) end
+  if not any then
+    put("  [ NO DRONES DECLARED ]", 0xFF4444)
+    -- Telemetry cannot set this, but it is exactly the right thing to suggest
+    -- it: a fresh install otherwise dispatches nothing and says nothing about
+    -- why.
+    if seenTotal > 0 then
+      putf(0xFFAA00, "  network sees %d -- set them on the HARDWARE page (E)", seenTotal)
+    end
+  end
 
   skip(1)
 
@@ -2684,40 +2650,14 @@ local function initModules()
       -- existed. The loads then pushed those drones back one by one, after the
       -- jobs were already committed.
       --
-      -- Read what is there BEFORE giving it back, so the drone can be stamped
-      -- as in flight below: bus -> interface -> network is not instant, and a
-      -- sweep landing before the network absorbs it would report zero again.
-      -- Anything unrecognised (leftover tips and rods) just goes back.
-      local recovered
-      if loader and loader.snapshotSide then
-        local busSize = mod.transposer.getInventorySize(mod.conf.inputBusSide) or 16
-        local inv = loader.snapshotSide(mod, mod.conf.inputBusSide, 1, busSize)
-        for slot = 1, busSize do
-          local st = inv[slot]
-          local key = st and st.label and config.droneKeyByLabel[st.label]
-          if key then recovered = key break end
-        end
-      end
-
+      -- Emptied, not inspected. A previous version read the bus first so a
+      -- recovered drone could be stamped as in flight -- needed only while the
+      -- pool came from telemetry and a drone outside the network read as gone.
+      -- The declared fleet counts it wherever it is, so putting it back is the
+      -- whole job.
       returnItemsToME(mod)
-
-      -- returnItemsToME stamps from mod.holding or mod.job, and at boot both are
-      -- nil -- so set it by hand from what the bus actually held. That puts the
-      -- drone into availableDrones' in-flight credit and makes assignOne wait
-      -- for it instead of dropping a tier, which is the whole point of doing
-      -- the read above.
-      if recovered then
-        mod.returned = { droneKey = recovered, at = computer.uptime() }
-        logger:info("[STARTUP] M%d recovered %s from the input bus",
-          mod.index, tostring(config.drones[recovered]))
-      end
     end)
   end
-
-  -- When the buses were emptied. Dispatch waits for an hw sweep NEWER than this,
-  -- because a sweep from before it is exactly the picture that is missing every
-  -- drone the fleet owns. See the telemetryReady gate in the main loop.
-  brokerState.bootClearedAt = computer.uptime()
 
   -- Said once for the whole array, not once per module: on a 2.8 world every
   -- module is in the same boat, and six identical warnings is how a real one
@@ -2726,6 +2666,19 @@ local function initModules()
     local line = "GTNH 2.8: parallel and cycle are not settable from code -- set them " ..
                  "in each module's GUI. Dispatch assumes maxParallels for the tier, so " ..
                  "computation and ETA figures are wrong if the GUI holds less."
+    logger:warn("[STARTUP] " .. line)
+    print(line)
+  end
+
+  -- An undeclared fleet dispatches nothing at all, and the dashboard panel is
+  -- the only other place that says so. Say it at boot too, where someone who
+  -- just upgraded into this change is actually looking.
+  local declared = 0
+  for _, n in pairs(config.droneStock or {}) do declared = declared + (tonumber(n) or 0) end
+  if declared == 0 then
+    local line = "No drones declared -- nothing will dispatch. Set how many you own on " ..
+                 "the editor's HARDWARE page (press E). Drone counts are configured now " ..
+                 "rather than read from the hw node, which can only see the ME network."
     logger:warn("[STARTUP] " .. line)
     print(line)
   end
@@ -3196,15 +3149,13 @@ while true do
   --    mine), hardware (drones/kits available), and fluid (plasma — modules can't
   --    run without it). Wait for all three before dispatching.
   if not brokerState.telemetryReady then
-    -- The hw clause compares against bootClearedAt rather than 0. initModules
-    -- empties every input bus, and those items travel bus -> interface ->
-    -- network -- so a sweep taken before that finished reports a network with
-    -- none of the fleet's drones in it, and dispatching against it hands every
-    -- module the weakest drone in stock. Waiting for a sweep newer than the
-    -- clear costs at most one hw cycle, on top of a telemetry wait that already
-    -- happens, and only at boot.
+    -- Back to a plain first-sweep test. This briefly compared the hw sweep
+    -- against when initModules emptied the buses, because dispatching before a
+    -- sweep had seen the returned drones handed every module the weakest drone
+    -- in stock. Drones do not come from a sweep any more; kits still do, and one
+    -- sweep is all that needs waiting for.
     brokerState.telemetryReady = (brokerState.lastDustSyncTime > 0)
-        and (brokerState.lastHWSyncTime > (brokerState.bootClearedAt or 0))
+        and (brokerState.lastHWSyncTime > 0)
         and (brokerState.lastFluidSyncTime > 0)
   end
 

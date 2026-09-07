@@ -462,6 +462,45 @@ fetch one; otherwise timestamps are uptime-relative.
 
 ---
 
+## Hardware
+
+### `droneStock.<tier>`
+
+**How many drones you own, per tier.** Fourteen integers, default 0, on the
+editor's HARDWARE page. Nothing dispatches until at least one is set.
+
+**Declared, not measured — and that is deliberate.** `hw_telem` reports what the
+ME *network* holds, which is only ever half the picture: a drone sitting in a
+module's input bus, in an interface buffer, or mid-transfer is not in the
+network, so the sensor calls it missing. The broker used to reconstruct the
+difference from dispatch timestamps, and every way of getting that wrong was
+found the hard way — a tier frozen at a stale count, a returned drone invisible
+for a sweep, a drone left in a bus invisible at boot, and a sweep timestamp
+recording when the message *arrived* rather than when the scan ran. Each produced
+the same visible symptom: modules dispatched with a weaker drone than the fleet
+actually had free.
+
+Tips and rods are *consumed*, so their counts genuinely have to be measured and
+still are. A drone is a durable asset — you own ten, they move between the
+network and a bus, and nothing destroys them. So the fleet is stated once and the
+broker keeps the ledger:
+
+```
+free = declared - committed
+```
+
+No window, no timestamp, no sweep anywhere in it.
+
+**Telemetry still reports drones, as an audit.** The hardware panel shows what
+the network can see next to what you declared. They legitimately differ while
+modules are running — that is the drone in the bus. What the line catches is
+*drift*: declare ten, own nine, and one load fails every cycle for a drone that
+is not there. Without it that reads as a hardware fault.
+
+**Update these when you craft or lose a drone.** That is the cost of the trade.
+
+---
+
 ## Compatibility
 
 ### `gtVersion`

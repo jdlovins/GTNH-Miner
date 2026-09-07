@@ -441,7 +441,8 @@ local broker = slurp("broker-mk3.lua")
 local poolSrc = broker:match("(local HW_STALE = .-\nlocal function availableKits.-\n  return avail\nend)")
 ck("pool functions extracted", poolSrc ~= nil, true)
 
-local penv = { pairs = pairs, ipairs = ipairs, math = math, tostring = tostring }
+local penv = { pairs = pairs, ipairs = ipairs, math = math, tostring = tostring,
+               tonumber = tonumber }
 local pchunk = assert(load(
   poolSrc .. "\nreturn availableDrones, availableKits", "pool", "t", penv))
 local availableDrones, availableKits = pchunk()
@@ -454,10 +455,14 @@ penv.computer = { uptime = function() return NOW end }
 -- HW_STALE (30) of NOW for the cases that mean "telemetry is current" -- past
 -- that, strict mode deliberately stops trusting the figure and charges
 -- everything, which is its own test below.
+-- `stock` is the DECLARED fleet (config.droneStock) -- drones no longer come
+-- from telemetry. brokerState still carries the drill figures, which are
+-- measured because tips and rods are actually consumed.
 local function world(stock, mods, sweptAt, kits)
-  penv.brokerState = { drones = stock, drills = kits or {}, lastHWSyncTime = sweptAt }
+  penv.brokerState = { drones = {}, drills = kits or {}, lastHWSyncTime = sweptAt }
   penv.modules = mods
-  penv.config = { fastReload = true, tipsPerLoad = 64, rodsPerLoad = 64 }
+  penv.config = { fastReload = true, tipsPerLoad = 64, rodsPerLoad = 64,
+                  droneStock = stock }
 end
 local function busy(droneKey, dispatchedAt, drillKey)
   return { status = "RUNNING",
@@ -467,81 +472,58 @@ local function holding(droneKey, drillKey)
   return { status = "IDLE", job = nil, holding = { droneKey = droneKey, drillKey = drillKey } }
 end
 
--- THE REPORTED BUG. One UHV owned, one module running it, dispatched before the
--- last sweep -- so stock already reads 0. Charging it again gave -1.
-world({ uhv = 0 }, { busy("uhv", 900) }, 990)
-ck("pre-sweep job is not charged twice", availableDrones(true).uhv, 0)
+-- THE LEDGER. free = declared - committed. No sweep, no timestamps, no windows.
+--
+-- This used to start from the ME figure and reconstruct reality with three
+-- corrections: subtract commitments a sweep had not seen, add back holds, add
+-- back drones in flight to the network. Every correction existed because
+-- hw_telem can only see the NETWORK, and a drone in a bus, a buffer, or
+-- mid-transfer is not in it. Four bugs came out of that seam. config.droneStock
+-- is the fleet now, and the broker knows exactly what it has committed.
+world({ luv = 10 }, {}, 0)
+ck("nothing running: all free",   availableDrones(true).luv, 10)
 
--- Dispatched AFTER the sweep: stock still lists it, so it must be charged.
-world({ uhv = 1 }, { busy("uhv", 995) }, 990)
-ck("post-sweep job is charged",          availableDrones(true).uhv, 0)
+world({ luv = 10 }, { busy("luv", 0), busy("luv", 0) }, 0)
+ck("two busy: two charged",       availableDrones(true).luv, 8)
 
--- THE CASE FLOORING ALONE CANNOT FIX. Two LuV busy and pre-sweep, then a third
--- lands from crafting so stock reads 1. Double-charging gave 1-2 = -1 and the
--- free drone would not dispatch; flooring turns that into 0, still wrong.
-world({ luv = 1 }, { busy("luv", 900), busy("luv", 910) }, 990)
-ck("restocked drone stays dispatchable", availableDrones(true).luv, 1)
+-- The dispatch timestamp is no longer part of the sum, so a job placed "after
+-- the last sweep" is charged exactly like one placed before it. Both of the
+-- cases these replace were about the sweep being ahead of or behind the ledger.
+world({ luv = 10 }, { busy("luv", 999999) }, 0)
+ck("dispatch time is irrelevant", availableDrones(true).luv, 9)
 
--- The user's exact fleet: 2 LuV + 1 UHV, one of each mining, sweep has landed.
-world({ luv = 1, uhv = 0 }, { busy("luv", 900), busy("uhv", 900) }, 990)
-local free = availableDrones(true)
-ck("reported fleet: luv free", free.luv, 1)
-ck("reported fleet: uhv free", free.uhv, 0)
+-- strict was reserveWhileMining's lever over how much to trust a stale sweep.
+-- With no sweep in the sum there is nothing left for it to change, and the two
+-- pools must agree -- dispatch and the reachability view can no longer disagree
+-- about how many drones exist.
+world({ luv = 10 }, { busy("luv", 0) }, 0)
+ck("strict and non-strict agree",
+   availableDrones(true).luv, availableDrones(false).luv)
 
--- A held drone is owned: invisible to the ME (it is in the bus) and to the busy
--- scan (job is nil, status IDLE), so without the credit it vanished entirely.
-world({ uhv = 0 }, { holding("uhv", "naquadah") }, 990)
-ck("held drone counts as free",  availableDrones(true).uhv, 1)
-ck("held drone counted ONCE",    availableDrones(false).uhv, 1)
+-- A HELD DRONE IS FREE, and needs no credit to be so: fastReload leaves the
+-- module IDLE with job = nil, so nothing charges it, and it never left the
+-- declared total. The old version had to add it back to undo the ME calling it
+-- missing.
+world({ luv = 10 }, { holding("luv", "tungstensteel") }, 0)
+ck("hold is free without a credit",  availableDrones(true).luv, 10)
+ck("hold is not double counted",     availableDrones(false).luv, 10)
 
--- Holds are only real when fastReload is on; otherwise stepDone returned it.
-world({ uhv = 0 }, { holding("uhv", "naquadah") }, 990)
+-- ...and that is true whether or not fastReload is on. The hold either exists
+-- or it does not; the setting decides whether one is ever taken, not whether an
+-- existing one is counted.
+world({ luv = 10 }, { holding("luv", "tungstensteel") }, 0)
 penv.config.fastReload = false
-ck("no hold credit without fastReload", availableDrones(true).uhv, 0)
+ck("hold count ignores fastReload",  availableDrones(true).luv, 10)
 penv.config.fastReload = true
 
--- A DRONE ON ITS WAY BACK TO THE NETWORK. returnItemsToME pushes the bus into
--- the ME interface and the module goes straight back to dispatch, but the stock
--- figure does not move until the next sweep -- so for up to a full hw cycle the
--- drone was counted by nothing, the pool said "no LuV", and assignOne walked
--- down the tier list and put an LV in a LuV rotation.
-local function returned(droneKey, at)
-  return { status = "IDLE", job = nil, returned = { droneKey = droneKey, at = at } }
-end
-
-world({ luv = 0 }, { returned("luv", 995) }, 990)
-ck("in-flight return counts as free", availableDrones(true).luv, 1)
-
--- Once a sweep lands after the return, the ME figure includes it. Crediting it
--- again would count the same drone twice.
-world({ luv = 1 }, { returned("luv", 900) }, 990)
-ck("swept return is not re-credited",  availableDrones(true).luv, 1)
-
--- ...and the stamp retires itself, so this cannot accumulate.
-local swept = { returned("luv", 900) }
-world({ luv = 1 }, swept, 990)
-availableDrones(true)
-ck("swept stamp is cleared",           swept[1].returned, nil)
-
--- The hw node going quiet must not manufacture a drone. sync stops advancing,
--- so `at > sync` stays true forever; the HW_STALE ceiling is what stops it.
-world({ luv = 0 }, { returned("luv", 900) }, 890)   -- returned 100s ago, HW_STALE is 30
-ck("stale return is not credited",     availableDrones(true).luv, 0)
-
--- A return and a hold are different drones and both count.
-world({ luv = 0 }, { returned("luv", 995), holding("luv", "tungstensteel") }, 990)
-ck("return and hold both count",       availableDrones(true).luv, 2)
-
--- The pool never goes negative, whatever the arithmetic upstream said.
-world({ uhv = 0 }, { busy("uhv", 995), busy("uhv", 996) }, 990)
+-- Declaring fewer drones than are already out must read as zero, not negative.
+-- Editing the fleet down mid-run is the way to get here.
+world({ uhv = 1 }, { busy("uhv", 0), busy("uhv", 0) }, 0)
 ck("pool is floored at zero", availableDrones(true).uhv, 0)
 
--- What strict still buys. If the hw node goes quiet the FIGURE is stale, so no
--- commitment counts as seen and every one is charged again -- the conservative
--- direction. Non-strict keeps trusting the timestamp.
-world({ uhv = 1 }, { busy("uhv", 900) }, 900)      -- swept 100s ago, HW_STALE is 30
-ck("strict charges when telemetry is stale",   availableDrones(true).uhv,  0)
-ck("non-strict trusts the sweep",              availableDrones(false).uhv, 1)
+-- An undeclared tier is simply not available, however many the network reports.
+world({ luv = 0 }, {}, 0)
+ck("undeclared tier is unavailable", availableDrones(true).luv, 0)
 
 -- Kits move the same way, in units of a full load.
 world({}, { busy("uhv", 900, "naquadah") }, 990, { naquadah = { kits = 64 } })
@@ -552,76 +534,63 @@ world({}, { holding("uhv", "naquadah") }, 990, { naquadah = { kits = 0 } })
 ck("held kits count as free",          availableKits(true).naquadah, 64)
 
 -- =============================================================================
-section("assignOne -- waiting for a drone instead of dropping a tier")
+section("assignOne / boot -- the sensor machinery is gone, not dormant")
 -- =============================================================================
--- assignOne closes over the whole batch (pool, avail, astCount, needs) and
--- cannot be lifted, so this checks the two properties that make the guard
--- correct rather than harmful. Both were wrong in a draft of it.
+-- Four bugs in this thread came from reconciling a broker ledger against a
+-- sensor that can only see the ME network. The fix was to stop: config.droneStock
+-- is the fleet, and everything that existed to paper over the sensor's blind
+-- spots had to be REMOVED rather than left behind to rot.
 local aSrc = broker:match("local function assignOne%(need%)(.-)\n  end\n")
 ck("assignOne extracted", aSrc ~= nil, true)
 
--- 1. AFTER the dispatch attempt, not before. Before it, a LuV that IS available
---    would be skipped whenever another happened to be in flight.
-local tryAt   = aSrc:find("tryDispatch(mod, asteroidName", 1, true)
-local guardAt = aSrc:find("if (inFlight[droneKey] or 0) > 0 then", 1, true)
-ck("guard is present",           guardAt ~= nil, true)
-ck("guard follows the attempt",  guardAt > tryAt, true)
+ck("no in-flight guard left",   aSrc:find("inFlight", 1, true), nil)
+ck("no return stamping left",   broker:find("mod.returned =", 1, true), nil)
+ck("no boot sweep gate left",   broker:find("bootClearedAt", 1, true), nil)
 
--- 2. It SPENDS the credit. One module waits per drone actually coming back; a
---    guard that only reads would idle the entire pool on a single return, which
---    is worse than the substitution it was added to prevent.
-ck("guard decrements",
-   aSrc:find("inFlight[droneKey] = inFlight[droneKey] - 1", 1, true) ~= nil, true)
+-- The raw-ME second gate in tryDispatch is gone too: the pool no longer comes
+-- from telemetry, so there is nothing for a second opinion to add.
+ck("no raw-ME dispatch gate",
+   broker:find("brokerState.drones[droneKey] or 0) <= 0", 1, true), nil)
 
--- 3. Inside the tier-range test, so a returning drone can only hold up an
---    asteroid it could actually mine. The range test opens before the guard and
---    the guard must sit between it and its close.
-local rangeAt = aSrc:find("droneTier >= asteroidData.minDrone", 1, true)
-ck("guard is inside the range test", rangeAt < guardAt, true)
+-- availableDrones reads the declared fleet, not the sweep.
+local pSrc = broker:match("local function availableDrones.-\nend")
+ck("pool seeds from droneStock",
+   pSrc:find("pairs(config.droneStock or {})", 1, true) ~= nil, true)
+ck("pool does not read telemetry",
+   pSrc:find("brokerState.drones", 1, true), nil)
 
--- And the stamp the whole thing reads has to be written where the drone
--- actually goes back.
-ck("returnItemsToME stamps the return",
-   broker:find("mod.returned = { droneKey = src.droneKey", 1, true) ~= nil, true)
-ck("stamp prefers holding over job",
-   broker:find("local src = mod.holding or mod.job", 1, true) ~= nil, true)
+-- usableDrillKeys loses the workaround that existed only because a drone in a
+-- running module reported as zero. A declared drone is owned wherever it is.
+local uSrc = broker:match("local function usableDrillKeys%(%)(.-)\nend")
+ck("drill keys from declared fleet",
+   uSrc:find("config.droneStock", 1, true) ~= nil, true)
+ck("drill keys drop the busy-module loop",
+   uSrc:find("mod.job.drillKey", 1, true), nil)
 
--- =============================================================================
-section("boot -- the input buses are last run's state too")
--- =============================================================================
--- initModules used to stop work and clear the interface configuration but leave
--- the input bus alone, so a module that was mining when the broker went down
--- kept its drone there -- outside the ME network, invisible to hw_telem, and
--- absent from the model. Every module in the fleet was then dispatched the
--- weakest drone in stock because nothing knew the good ones existed.
+-- Kits still measure, because tips and rods are actually consumed. This is the
+-- line between the two models and it should not blur.
+local kSrc = broker:match("local function availableKits.-\nend")
+ck("kits still read telemetry",
+   kSrc:find("brokerState.drills", 1, true) ~= nil, true)
+ck("kits still ask about the sweep",
+   kSrc:find("telemetryHasSeen", 1, true) ~= nil, true)
+
+-- Boot still empties the buses -- that is right on its own merits, and is what
+-- puts a drone left over from a crash back where the loader can fetch it.
 local initSrc = broker:match("(local function initModules.-\nend\n)")
-ck("initModules extracted", initSrc ~= nil, true)
-
-ck("boot empties the bus",
+ck("boot still empties the bus",
    initSrc:find("returnItemsToME(mod)", 1, true) ~= nil, true)
-ck("boot clears the interface too",
-   initSrc:find("clearInterfaceSlots(mod)", 1, true) ~= nil, true)
+ck("boot warns on an empty fleet",
+   initSrc:find("No drones declared", 1, true) ~= nil, true)
 
--- Reading BEFORE returning is what lets the drone be stamped as in flight.
--- Reversed, the bus is already empty and there is nothing left to recognise.
-local readAt   = initSrc:find("config.droneKeyByLabel[st.label]", 1, true)
-local returnAt = initSrc:find("returnItemsToME(mod)", 1, true)
-ck("bus is read before it is emptied", readAt < returnAt, true)
-ck("recovered drone is stamped",
-   initSrc:find("mod.returned = { droneKey = recovered", 1, true) ~= nil, true)
-
--- And the gate. Emptying the bus moves the drones bus -> interface -> network,
--- which is not instant, so a sweep from before the clear still reports none of
--- them. Dispatching against that is the original bug wearing a different hat.
-ck("boot records when it cleared",
-   initSrc:find("brokerState.bootClearedAt = computer.uptime()", 1, true) ~= nil, true)
-ck("hw gate compares against the clear",
-   broker:find("brokerState.lastHWSyncTime > (brokerState.bootClearedAt or 0)", 1, true) ~= nil,
-   true)
--- Specifically NOT the old unconditional test, which is satisfied by the very
--- sweep this is meant to reject.
-ck("hw gate is no longer > 0",
-   broker:find("and (brokerState.lastHWSyncTime > 0)", 1, true), nil)
+-- And dispatch says why it passed over a better drone. Without this the three
+-- legitimate reasons -- asteroid tier range, drill kits, all committed -- are
+-- indistinguishable from a bug, which is what made this thread long.
+ck("dispatch explains a skip",
+   aSrc:find("passed over %s: %s", 1, true) ~= nil, true)
+for _, why in ipairs({ "takes tier", "none free", "kits %d < %d" }) do
+  ck("skip reason: " .. why, aSrc:find(why, 1, true) ~= nil, true)
+end
 
 -- =============================================================================
 section("applyHwStock -- a tier that hits zero has to come back")
