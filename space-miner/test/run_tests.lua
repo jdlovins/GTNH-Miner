@@ -240,6 +240,17 @@ end
 ck("node lists 14 tiers",     nModels, 14)
 ck("node agrees with config", mismatched, 0)
 
+-- config.droneKeyByLabel is how the broker reads a drone back OUT of an input
+-- bus at boot -- a module mining when the broker went down still holds one, and
+-- the label is the only thing identifying it. It must be rebuilt by
+-- setGtVersion, or a "MK-" key would silently fail to match a "Mk-" bus stack
+-- and the drone would go unrecognised on exactly the packs this all exists for.
+ck("config builds the inverse",
+   cfgSrc:find("config.droneKeyByLabel[name] = key", 1, true) ~= nil, true)
+ck("inverse is inside setGtVersion",
+   cfgSrc:find("config.droneKeyByLabel = {}", 1, true)
+   > cfgSrc:find("function config.setGtVersion", 1, true), true)
+
 -- =============================================================================
 section("settings.lua -- the tunable registry")
 -- =============================================================================
@@ -574,6 +585,43 @@ ck("returnItemsToME stamps the return",
    broker:find("mod.returned = { droneKey = src.droneKey", 1, true) ~= nil, true)
 ck("stamp prefers holding over job",
    broker:find("local src = mod.holding or mod.job", 1, true) ~= nil, true)
+
+-- =============================================================================
+section("boot -- the input buses are last run's state too")
+-- =============================================================================
+-- initModules used to stop work and clear the interface configuration but leave
+-- the input bus alone, so a module that was mining when the broker went down
+-- kept its drone there -- outside the ME network, invisible to hw_telem, and
+-- absent from the model. Every module in the fleet was then dispatched the
+-- weakest drone in stock because nothing knew the good ones existed.
+local initSrc = broker:match("(local function initModules.-\nend\n)")
+ck("initModules extracted", initSrc ~= nil, true)
+
+ck("boot empties the bus",
+   initSrc:find("returnItemsToME(mod)", 1, true) ~= nil, true)
+ck("boot clears the interface too",
+   initSrc:find("clearInterfaceSlots(mod)", 1, true) ~= nil, true)
+
+-- Reading BEFORE returning is what lets the drone be stamped as in flight.
+-- Reversed, the bus is already empty and there is nothing left to recognise.
+local readAt   = initSrc:find("config.droneKeyByLabel[st.label]", 1, true)
+local returnAt = initSrc:find("returnItemsToME(mod)", 1, true)
+ck("bus is read before it is emptied", readAt < returnAt, true)
+ck("recovered drone is stamped",
+   initSrc:find("mod.returned = { droneKey = recovered", 1, true) ~= nil, true)
+
+-- And the gate. Emptying the bus moves the drones bus -> interface -> network,
+-- which is not instant, so a sweep from before the clear still reports none of
+-- them. Dispatching against that is the original bug wearing a different hat.
+ck("boot records when it cleared",
+   initSrc:find("brokerState.bootClearedAt = computer.uptime()", 1, true) ~= nil, true)
+ck("hw gate compares against the clear",
+   broker:find("brokerState.lastHWSyncTime > (brokerState.bootClearedAt or 0)", 1, true) ~= nil,
+   true)
+-- Specifically NOT the old unconditional test, which is satisfied by the very
+-- sweep this is meant to reject.
+ck("hw gate is no longer > 0",
+   broker:find("and (brokerState.lastHWSyncTime > 0)", 1, true), nil)
 
 -- =============================================================================
 section("applyHwStock -- a tier that hits zero has to come back")

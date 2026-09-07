@@ -183,6 +183,9 @@ local brokerState = {
   lastParCount = 0,
   nextTarget = nil,
   telemetryReady = false,
+  -- When initModules() finished emptying the input buses. Dispatch waits for an
+  -- hw sweep newer than this; see the telemetryReady gate in the main loop.
+  bootClearedAt = 0,
   priorityMode = "threshold", -- "threshold" (lowest fill first) | "rarity" (dust priority first)
 }
 
@@ -2671,8 +2674,50 @@ local function initModules()
       -- deliberately clears the full MAX_CFG_SLOTS -- mod.cfgHigh is unset,
       -- which is exactly the "clear everything" case.
       clearInterfaceSlots(mod)
+
+      -- AND THE BUS IS LAST RUN'S STATE TOO.
+      --
+      -- This used to be left alone, and a module that was mining when the
+      -- broker went down kept its drone in bus slot 1 -- physically outside the
+      -- ME network, so hw_telem truthfully reported none, and every module in
+      -- the fleet was dispatched an LV because the model did not know ten LuV
+      -- existed. The loads then pushed those drones back one by one, after the
+      -- jobs were already committed.
+      --
+      -- Read what is there BEFORE giving it back, so the drone can be stamped
+      -- as in flight below: bus -> interface -> network is not instant, and a
+      -- sweep landing before the network absorbs it would report zero again.
+      -- Anything unrecognised (leftover tips and rods) just goes back.
+      local recovered
+      if loader and loader.snapshotSide then
+        local busSize = mod.transposer.getInventorySize(mod.conf.inputBusSide) or 16
+        local inv = loader.snapshotSide(mod, mod.conf.inputBusSide, 1, busSize)
+        for slot = 1, busSize do
+          local st = inv[slot]
+          local key = st and st.label and config.droneKeyByLabel[st.label]
+          if key then recovered = key break end
+        end
+      end
+
+      returnItemsToME(mod)
+
+      -- returnItemsToME stamps from mod.holding or mod.job, and at boot both are
+      -- nil -- so set it by hand from what the bus actually held. That puts the
+      -- drone into availableDrones' in-flight credit and makes assignOne wait
+      -- for it instead of dropping a tier, which is the whole point of doing
+      -- the read above.
+      if recovered then
+        mod.returned = { droneKey = recovered, at = computer.uptime() }
+        logger:info("[STARTUP] M%d recovered %s from the input bus",
+          mod.index, tostring(config.drones[recovered]))
+      end
     end)
   end
+
+  -- When the buses were emptied. Dispatch waits for an hw sweep NEWER than this,
+  -- because a sweep from before it is exactly the picture that is missing every
+  -- drone the fleet owns. See the telemetryReady gate in the main loop.
+  brokerState.bootClearedAt = computer.uptime()
 
   -- Said once for the whole array, not once per module: on a 2.8 world every
   -- module is in the same boat, and six identical warnings is how a real one
@@ -3151,8 +3196,15 @@ while true do
   --    mine), hardware (drones/kits available), and fluid (plasma — modules can't
   --    run without it). Wait for all three before dispatching.
   if not brokerState.telemetryReady then
+    -- The hw clause compares against bootClearedAt rather than 0. initModules
+    -- empties every input bus, and those items travel bus -> interface ->
+    -- network -- so a sweep taken before that finished reports a network with
+    -- none of the fleet's drones in it, and dispatching against it hands every
+    -- module the weakest drone in stock. Waiting for a sweep newer than the
+    -- clear costs at most one hw cycle, on top of a telemetry wait that already
+    -- happens, and only at boot.
     brokerState.telemetryReady = (brokerState.lastDustSyncTime > 0)
-        and (brokerState.lastHWSyncTime > 0)
+        and (brokerState.lastHWSyncTime > (brokerState.bootClearedAt or 0))
         and (brokerState.lastFluidSyncTime > 0)
   end
 

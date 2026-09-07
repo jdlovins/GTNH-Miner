@@ -3072,6 +3072,18 @@ function config.setGtVersion(version)
   for key, name in pairs(config.drones) do
     config.drones[key] = moduleApi.relabel(name, version)
   end
+  -- Label -> key, for reading a drone back OUT of a module's input bus. The
+  -- broker needs it at boot: a module that was mining when the broker went down
+  -- still has its drone in the bus, and the only thing identifying it is the
+  -- label the transposer reports.
+  --
+  -- Rebuilt here rather than beside config.drones so it can never disagree with
+  -- the spelling this pack uses -- a stale "MK-" key would simply fail to match
+  -- and the drone would go unrecognised, which is the quiet half of this bug.
+  config.droneKeyByLabel = {}
+  for key, name in pairs(config.drones) do
+    config.droneKeyByLabel[name] = key
+  end
   return config.droneMark
 end
 
