@@ -505,6 +505,26 @@ local function returnItemsToME(mod)
       mod.transposer.transferItem(mod.conf.inputBusSide, mod.conf.interfaceSide, size, slot)
     end
   end
+
+  -- REMEMBER WHAT JUST WENT BACK, AND WHEN.
+  --
+  -- Between this call and the next hw sweep the drone exists in no model at
+  -- all: it is out of mod.holding (the caller clears it), out of mod.job
+  -- (nil'd on the way to IDLE), and not yet in brokerState.drones, because the
+  -- ME figure only moves when an HW_UPDATE lands -- up to a full event.pull(10)
+  -- away, plus however long the network takes to absorb the items.
+  --
+  -- That blind spot is what put LV drones in a LuV rotation: two of the return
+  -- paths hand the module straight back to dispatch in the same breath, the
+  -- pool says no LuV, and assignOne walks down the tier list until it finds
+  -- something it can use. availableDrones reads this stamp to close the gap.
+  --
+  -- mod.holding first, deliberately: at the tryDispatch call site mod.job is
+  -- already the NEW job and mod.holding is the hardware being given back.
+  local src = mod.holding or mod.job
+  if src and src.droneKey then
+    mod.returned = { droneKey = src.droneKey, at = computer.uptime() }
+  end
 end
 
 -- One implementation, in loader.lua, because the loader is what allocates these
@@ -1227,6 +1247,8 @@ end
 -- the question is which tiers this array OWNS rather than which are free.
 local function availableDrones(strict)
   local avail = {}
+  local sync  = brokerState.lastHWSyncTime or 0
+  local now   = computer.uptime()
   for key, count in pairs(brokerState.drones) do avail[key] = count end
   for _, mod in ipairs(modules) do
     -- CHARGE ONLY WHAT THE SWEEP HAS NOT SEEN.
@@ -1258,6 +1280,26 @@ local function availableDrones(strict)
     if config.fastReload and mod.holding and mod.holding.droneKey then
       local k = mod.holding.droneKey
       avail[k] = (avail[k] or 0) + 1
+    end
+    -- A DRONE ON ITS WAY BACK IS STILL OURS. The exact mirror of the charge
+    -- above: that one subtracts a commitment the sweep has not seen yet,
+    -- because the stock figure still counts a drone we have already taken.
+    -- This adds back one we have already given, because the stock figure does
+    -- not count it yet.
+    --
+    -- Two bounds, and both matter. `at > sync` means a sweep landing after the
+    -- return retires the stamp on its own -- past that point the ME figure
+    -- includes the drone and crediting it again would double-count. The
+    -- HW_STALE ceiling covers the hw node going quiet: sync then stops
+    -- advancing, the first test would stay true forever, and we would credit a
+    -- phantom drone for as long as the broker ran.
+    local ret = mod.returned
+    if ret and ret.droneKey then
+      if ret.at > sync and (now - ret.at) <= HW_STALE then
+        avail[ret.droneKey] = (avail[ret.droneKey] or 0) + 1
+      elseif ret.at <= sync then
+        mod.returned = nil
+      end
     end
   end
   -- Nothing downstream should have to reason about a negative pool.
@@ -1488,6 +1530,26 @@ local function dispatchBatch()
   local reachAvail    = strict and availableDrones(false) or avail
   local reachAvailKit = strict and availableKits(false)   or availKit
 
+  -- Drones physically between a module's bus and the ME network right now.
+  --
+  -- availableDrones counts these as owned, correctly -- they exist. But
+  -- tryDispatch's second gate reads the raw ME figure, which does NOT include
+  -- them yet, so they cannot actually be FETCHED for another module. Without
+  -- something to say "wait", assignOne reads that refusal as "this tier is
+  -- unusable" and walks down to whatever it can get, which is how a LuV
+  -- rotation acquired LV drones.
+  --
+  -- Counted per tier rather than as a flag because the count is the budget:
+  -- one module may wait per drone actually coming back, and no more.
+  local inFlight = {}
+  for _, mod in ipairs(modules) do
+    local ret = mod.returned
+    if ret and ret.droneKey and ret.at > (brokerState.lastHWSyncTime or 0)
+       and (computer.uptime() - ret.at) <= HW_STALE then
+      inFlight[ret.droneKey] = (inFlight[ret.droneKey] or 0) + 1
+    end
+  end
+
   -- Held drones and kits used to be credited back here, over this function's
   -- own copies. availableDrones/availableKits do it now, which fixes two things
   -- this version could not: a hold on a module trimmed out of idleModules by the
@@ -1655,6 +1717,31 @@ local function dispatchBatch()
                 return true
               end
             end
+          end
+
+          -- WAIT FOR A DRONE THAT IS ON ITS WAY, RATHER THAN DROPPING BENEATH IT.
+          --
+          -- We could not place this tier, and one of them is in flight back to
+          -- the network. It lands within a sweep; committing this module to a
+          -- weaker drone now costs a module slot for the whole of the next
+          -- cycle, and with drones scarcer than modules that is a slot the good
+          -- drone needed.
+          --
+          -- INSIDE the tier-range test, so a drone coming back can only hold up
+          -- an asteroid it could actually mine. Out here it would block
+          -- substitution on every need in the list.
+          --
+          -- AFTER the attempt, never before: a LuV that IS available must still
+          -- be used when another happens to be in flight.
+          --
+          -- SPEND the credit. One module waits per drone actually coming back;
+          -- a second idle module with nothing on its way should still drop a
+          -- tier, which is a legitimate substitution and not what this guard is
+          -- for. Reading without decrementing would idle the whole pool on one
+          -- returning drone.
+          if (inFlight[droneKey] or 0) > 0 then
+            inFlight[droneKey] = inFlight[droneKey] - 1
+            return false
           end
         end
       end

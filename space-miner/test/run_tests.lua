@@ -489,6 +489,38 @@ penv.config.fastReload = false
 ck("no hold credit without fastReload", availableDrones(true).uhv, 0)
 penv.config.fastReload = true
 
+-- A DRONE ON ITS WAY BACK TO THE NETWORK. returnItemsToME pushes the bus into
+-- the ME interface and the module goes straight back to dispatch, but the stock
+-- figure does not move until the next sweep -- so for up to a full hw cycle the
+-- drone was counted by nothing, the pool said "no LuV", and assignOne walked
+-- down the tier list and put an LV in a LuV rotation.
+local function returned(droneKey, at)
+  return { status = "IDLE", job = nil, returned = { droneKey = droneKey, at = at } }
+end
+
+world({ luv = 0 }, { returned("luv", 995) }, 990)
+ck("in-flight return counts as free", availableDrones(true).luv, 1)
+
+-- Once a sweep lands after the return, the ME figure includes it. Crediting it
+-- again would count the same drone twice.
+world({ luv = 1 }, { returned("luv", 900) }, 990)
+ck("swept return is not re-credited",  availableDrones(true).luv, 1)
+
+-- ...and the stamp retires itself, so this cannot accumulate.
+local swept = { returned("luv", 900) }
+world({ luv = 1 }, swept, 990)
+availableDrones(true)
+ck("swept stamp is cleared",           swept[1].returned, nil)
+
+-- The hw node going quiet must not manufacture a drone. sync stops advancing,
+-- so `at > sync` stays true forever; the HW_STALE ceiling is what stops it.
+world({ luv = 0 }, { returned("luv", 900) }, 890)   -- returned 100s ago, HW_STALE is 30
+ck("stale return is not credited",     availableDrones(true).luv, 0)
+
+-- A return and a hold are different drones and both count.
+world({ luv = 0 }, { returned("luv", 995), holding("luv", "tungstensteel") }, 990)
+ck("return and hold both count",       availableDrones(true).luv, 2)
+
 -- The pool never goes negative, whatever the arithmetic upstream said.
 world({ uhv = 0 }, { busy("uhv", 995), busy("uhv", 996) }, 990)
 ck("pool is floored at zero", availableDrones(true).uhv, 0)
@@ -507,6 +539,41 @@ world({}, { busy("uhv", 995, "naquadah") }, 990, { naquadah = { kits = 64 } })
 ck("post-sweep kits charged",          availableKits(true).naquadah, 0)
 world({}, { holding("uhv", "naquadah") }, 990, { naquadah = { kits = 0 } })
 ck("held kits count as free",          availableKits(true).naquadah, 64)
+
+-- =============================================================================
+section("assignOne -- waiting for a drone instead of dropping a tier")
+-- =============================================================================
+-- assignOne closes over the whole batch (pool, avail, astCount, needs) and
+-- cannot be lifted, so this checks the two properties that make the guard
+-- correct rather than harmful. Both were wrong in a draft of it.
+local aSrc = broker:match("local function assignOne%(need%)(.-)\n  end\n")
+ck("assignOne extracted", aSrc ~= nil, true)
+
+-- 1. AFTER the dispatch attempt, not before. Before it, a LuV that IS available
+--    would be skipped whenever another happened to be in flight.
+local tryAt   = aSrc:find("tryDispatch(mod, asteroidName", 1, true)
+local guardAt = aSrc:find("if (inFlight[droneKey] or 0) > 0 then", 1, true)
+ck("guard is present",           guardAt ~= nil, true)
+ck("guard follows the attempt",  guardAt > tryAt, true)
+
+-- 2. It SPENDS the credit. One module waits per drone actually coming back; a
+--    guard that only reads would idle the entire pool on a single return, which
+--    is worse than the substitution it was added to prevent.
+ck("guard decrements",
+   aSrc:find("inFlight[droneKey] = inFlight[droneKey] - 1", 1, true) ~= nil, true)
+
+-- 3. Inside the tier-range test, so a returning drone can only hold up an
+--    asteroid it could actually mine. The range test opens before the guard and
+--    the guard must sit between it and its close.
+local rangeAt = aSrc:find("droneTier >= asteroidData.minDrone", 1, true)
+ck("guard is inside the range test", rangeAt < guardAt, true)
+
+-- And the stamp the whole thing reads has to be written where the drone
+-- actually goes back.
+ck("returnItemsToME stamps the return",
+   broker:find("mod.returned = { droneKey = src.droneKey", 1, true) ~= nil, true)
+ck("stamp prefers holding over job",
+   broker:find("local src = mod.holding or mod.job", 1, true) ~= nil, true)
 
 -- =============================================================================
 section("applyHwStock -- a tier that hits zero has to come back")
