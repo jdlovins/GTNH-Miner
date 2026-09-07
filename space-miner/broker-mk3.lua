@@ -1845,6 +1845,17 @@ end
 -- ---------------------------------------------------------------------------
 local dashCache, dashFG = {}, nil
 
+-- ROW KEYS ARE NUMBERS, NOT STRINGS.
+--
+-- Every row used to key the cache with SLOT_M + row / SLOT_D + row / SLOT_H + row,
+-- built fresh for that row on every frame -- roughly four hundred string
+-- allocations a second whose entire job was to index a table and be dropped.
+-- The three panels share y values on different parts of the screen, which is why
+-- the key has to say which panel; a per-panel numeric base says it just as well
+-- and allocates nothing.
+local SLOT_M, SLOT_D, SLOT_H = 0, 1000, 2000
+local SLOT_SYNC, SLOT_DTAG   = 9001, 9002
+
 -- Counts rows actually repainted. The quiesce box needs to know whether the
 -- panels have drawn over it, and "did anything paint" is cheaper to answer than
 -- tracking which rows.
@@ -1862,9 +1873,9 @@ local function dashInvalidate() dashCache, dashFG = {}, nil end
 -- was supposed to be noticing the next keypress.
 local function dashInvalidateRows(y1, y2)
   for y = y1, y2 do
-    dashCache["M" .. y] = nil
-    dashCache["D" .. y] = nil
-    dashCache["H" .. y] = nil
+    dashCache[SLOT_M + y] = nil
+    dashCache[SLOT_D + y] = nil
+    dashCache[SLOT_H + y] = nil
   end
 end
 
@@ -1874,21 +1885,65 @@ end
 
 -- Write one row of a panel, clearing its column strip first. Indentation is
 -- baked into `text` so every row of a panel starts at the same x.
+-- CACHE THE INPUTS, NOT A RENDERED KEY.
+--
+-- This used to build `tostring(color) .. "|" .. text` on every call, for every
+-- row, whether or not anything had changed -- two allocations per row per frame
+-- purely to ask "is this the same as last time?". Across three panels at
+-- uiInterval that was several hundred strings a second whose only purpose was to
+-- be compared and dropped.
+--
+-- Comparing the two values directly costs nothing: Lua interns string literals,
+-- so the constant rows (which are most of them) compare by pointer.
+--
+-- The cache entry is a table that is REUSED rather than replaced, so a settled
+-- dashboard allocates nothing at all.
+-- Three writers share one cache, so each one stamps EVERY field. Leaving a stale
+-- field behind is not cosmetic: a slot blanked and then written would keep
+-- `blank = true`, and the next dashBlank would skip a row that currently holds
+-- text. Writing all of them costs nothing -- the entry table is reused.
+local function dashStamp(e, kind, text, color, fmt, a, b, c, d)
+  e.kind, e.text, e.color, e.fmt = kind, text, color, fmt
+  e.a, e.b, e.c, e.d = a, b, c, d
+end
+
 local function dashRow(slot, x, width, y, text, color)
-  local key = tostring(color) .. "|" .. text
-  if dashCache[slot] == key then return end
-  dashCache[slot] = key
+  local e = dashCache[slot]
+  if e and e.kind == "t" and e.text == text and e.color == color then return end
+  if not e then e = {}; dashCache[slot] = e end
+  dashStamp(e, "t", text, color)
   dashPaints = dashPaints + 1
   gpu.fill(x, y, width, 1, " ")
   dashSetFG(color)
   gpu.set(x, y, text)
 end
 
+-- The same, for rows whose text has to be BUILT. The format string and its
+-- arguments are compared instead of the result, so string.format runs only when
+-- the row has actually changed -- the caller no longer pays to render a row the
+-- cache is about to discard.
+--
+-- Four argument slots covers every row in this file, and every call site is in
+-- the three panels below.
+local function dashRowF(slot, x, width, y, color, fmt, a, b, c, d)
+  local e = dashCache[slot]
+  if e and e.kind == "f" and e.color == color and e.fmt == fmt
+     and e.a == a and e.b == b and e.c == c and e.d == d then return end
+  if not e then e = {}; dashCache[slot] = e end
+  dashStamp(e, "f", nil, color, fmt, a, b, c, d)
+  dashPaints = dashPaints + 1
+  gpu.fill(x, y, width, 1, " ")
+  dashSetFG(color)
+  gpu.set(x, y, string.format(fmt, a, b, c, d))
+end
+
 -- Blank a row: spacers between sections, and the tail wipe under a panel that
 -- shrank. Cached too, so a settled layout stops paying for its blank rows.
 local function dashBlank(slot, x, width, y)
-  if dashCache[slot] == "" then return end
-  dashCache[slot] = ""
+  local e = dashCache[slot]
+  if e and e.kind == "b" then return end
+  if not e then e = {}; dashCache[slot] = e end
+  dashStamp(e, "b")
   dashPaints = dashPaints + 1
   gpu.fill(x, y, width, 1, " ")
 end
@@ -1902,50 +1957,56 @@ local function drawModulePanel()
     -- Pinned/reserved modules get a "*" marker so it's clear at a glance which
     -- ones are locked to a single asteroid. Same width as the normal "  " prefix.
     local pin = mod.pinnedAsteroid and " *" or "  "
-    local text, color
+    -- The format and its arguments are chosen here and rendered by dashRowF
+    -- only if the row actually changed. A module sitting in RUNNING repaints
+    -- nothing between asteroid changes, and now formats nothing either.
+    local fmt, a, b, c, d, color
     if mod.status == "RUNNING" then
       color = 0xFFAA00
-      text = string.format("%sM%d [%-5s]  %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or "?")
+      fmt, a, b, c, d = "%sM%d [%-5s]  %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or "?"
     elseif mod.status == "LOADING" then
       color = 0xFFFF00
-      text = string.format("%sM%d [%-5s]  LOADING %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or "")
+      fmt, a, b, c, d = "%sM%d [%-5s]  LOADING %s", pin, mod.index, mod.tier, mod.job and mod.job.asteroid or ""
     elseif mod.status == "ERROR" then
       color = 0xFF4444
+      -- Still built eagerly: only an errored module pays it, and only while the
+      -- error stands.
       local errMsg = mod.lastError and (" " .. mod.lastError:sub(1, PW - 20)) or ""
-      text = string.format("%sM%d [%-5s]  ERROR%s", pin, mod.index, mod.tier, errMsg)
+      fmt, a, b, c, d = "%sM%d [%-5s]  ERROR%s", pin, mod.index, mod.tier, errMsg
     else
       color = 0x555555
       if mod.pinnedAsteroid then
-        text = string.format("%sM%d [%-5s]  IDLE (pin: %s)", pin, mod.index, mod.tier, mod.pinnedAsteroid)
+        fmt, a, b, c, d = "%sM%d [%-5s]  IDLE (pin: %s)", pin, mod.index, mod.tier, mod.pinnedAsteroid
       else
-        text = string.format("%sM%d [%-5s]  IDLE", pin, mod.index, mod.tier)
+        fmt, a, b, c = "%sM%d [%-5s]  IDLE", pin, mod.index, mod.tier
+        d = nil
       end
     end
-    dashRow("M" .. row, P1 + 1, PW, row, text, color)
+    dashRowF(SLOT_M + row, P1 + 1, PW, row, color, fmt, a, b, c, d)
     row = row + 1
 
     if (mod.status == "RUNNING") and mod.job and row <= H then
       local droneName = config.drones[mod.job.droneKey] or "?"
       local lvl = droneName:match("MK%-(.+)") or "?"
-      dashRow("M" .. row, P1 + 1, PW, row,
-        string.format("  dist=%d  drone=MK-%s  refills=%d",
-          mod.job.distance or 0, lvl, mod.refills or 0), 0xCCCCCC)
+      dashRowF(SLOT_M + row, P1 + 1, PW, row, 0xCCCCCC,
+        "  dist=%d  drone=MK-%s  refills=%d",
+        mod.job.distance or 0, lvl, mod.refills or 0)
       row = row + 1
 
       -- Load diagnostic from the most recent load of this module:
       -- "loaded 0.4s  db:1 buf:3" -- time taken + read-back poll counts.
       if mod.lastLoad and row <= H then
-        dashRow("M" .. row, P1 + 1, PW, row, "  " .. mod.lastLoad, 0x668866)
+        dashRowF(SLOT_M + row, P1 + 1, PW, row, 0x668866, "  %s", mod.lastLoad)
         row = row + 1
       end
 
       -- Blank spacer line before the next module, per layout.
       if row <= H then
-        dashBlank("M" .. row, P1 + 1, PW, row); row = row + 1
+        dashBlank(SLOT_M + row, P1 + 1, PW, row); row = row + 1
       end
     end
   end
-  for r = row, H do dashBlank("M" .. r, P1 + 1, PW, r) end
+  for r = row, H do dashBlank(SLOT_M + r, P1 + 1, PW, r) end
 end
 
 -- The sorted dust list, rebuilt only when the underlying stock actually changes.
@@ -2010,7 +2071,9 @@ local function drawDustPanel()
     end
     local tw = 18
     local tx = math.max(P2 + 1, P3 - tw - 1)
-    dashRow("DTAG", tx, tw, 4, string.format("%" .. tw .. "s", tag), color)
+    -- "%18s", literally: the old code rebuilt that format string from `tw` on
+    -- every frame. Keep the two in step if tw changes.
+    dashRow(SLOT_DTAG, tx, tw, 4, string.format("%18s", tag), color)
   end
 
   for i = dustScroll + 1, #list do
@@ -2027,8 +2090,8 @@ local function drawDustPanel()
         or (item.ratio >= 1.0) and 0x446644 or (item.ratio < 0.25) and 0xFF4444
         or (item.ratio < 0.75) and 0xFFAA00 or 0x00FFFF
     local mark = stuckOn and "x" or (item.ratio < 1.0 and "!" or " ")
-    dashRow("D" .. row, P2 + 1, PW, row,
-      string.format("  %s %-27s %3d%%", mark, item.name, pct), color)
+    dashRowF(SLOT_D + row, P2 + 1, PW, row, color,
+      "  %s %-27s %3d%%", mark, item.name, pct)
     row = row + 1
     if row > H then break end
     local detail
@@ -2047,10 +2110,10 @@ local function drawDustPanel()
     else
       detail = string.format("      %s / %s", formatQty(item.stock), formatQty(item.threshold))
     end
-    dashRow("D" .. row, P2 + 1, PW, row, detail, stuckOn and 0xFF00FF or 0x666666)
+    dashRow(SLOT_D + row, P2 + 1, PW, row, detail, stuckOn and 0xFF00FF or 0x666666)
     row = row + 1
   end
-  for r = row, H do dashBlank("D" .. r, P2 + 1, PW, r) end
+  for r = row, H do dashBlank(SLOT_D + r, P2 + 1, PW, r) end
 end
 
 -- Restock entries, ranked and cached against hwGen.
@@ -2092,7 +2155,15 @@ end
 local function drawHWPanel()
   local row = 6
   local function put(text, color)
-    if row <= H then dashRow("H" .. row, P3 + 1, PW, row, text, color) end
+    if row <= H then dashRow(SLOT_H + row, P3 + 1, PW, row, text, color) end
+    row = row + 1
+  end
+
+  -- Same, but the row text is built only if the row changed. Use this wherever
+  -- put() would have been handed a string.format or a concatenation; `put` is
+  -- for constants, which Lua interns and which therefore cost nothing.
+  local function putf(color, fmt, a, b, c, d)
+    if row <= H then dashRowF(SLOT_H + row, P3 + 1, PW, row, color, fmt, a, b, c, d) end
     row = row + 1
   end
 
@@ -2106,40 +2177,40 @@ local function drawHWPanel()
   -- wipe below only reaches rows underneath the cursor, never these.
   local function skip(n)
     for _ = 1, (n or 1) do
-      if row <= H then dashBlank("H" .. row, P3 + 1, PW, row) end
+      if row <= H then dashBlank(SLOT_H + row, P3 + 1, PW, row) end
       row = row + 1
     end
   end
 
   if brokerState.nextTarget then
-    put("  NEXT: " .. brokerState.nextTarget.asteroid, 0xFFAA00)
+    putf(0xFFAA00, "  NEXT: %s", brokerState.nextTarget.asteroid)
   else
     put("  NEXT: (idle)", 0x666666)
   end
 
   -- Show the cap dispatch actually used, not a fresh guess: it depends on how
   -- many asteroids are currently wanted, which this panel does not recompute.
-  put("  PRIORITY: " .. brokerState.priorityMode:upper() ..
-      "   CAP: " .. (brokerState.cap or asteroidCap(0)) .. "/asteroid", 0x666666)
+  putf(0x666666, "  PRIORITY: %s   CAP: %s/asteroid",
+       brokerState.priorityMode:upper(), brokerState.cap or asteroidCap(0))
 
   put("  TELEMETRY SYNC:", 0x666666)
-  put("  Dust:   " .. brokerState.lastDustSync,  getSyncColor(brokerState.lastDustSyncTime))
-  put("  Fluid:  " .. brokerState.lastFluidSync, getSyncColor(brokerState.lastFluidSyncTime))
-  put("  HW:     " .. brokerState.lastHWSync,    getSyncColor(brokerState.lastHWSyncTime))
+  putf(getSyncColor(brokerState.lastDustSyncTime),  "  Dust:   %s", brokerState.lastDustSync)
+  putf(getSyncColor(brokerState.lastFluidSyncTime), "  Fluid:  %s", brokerState.lastFluidSync)
+  putf(getSyncColor(brokerState.lastHWSyncTime),    "  HW:     %s", brokerState.lastHWSync)
   -- Outbound par. Grey dashes here mean this broker has never sent DRILL_PAR --
   -- almost always an older broker-mk3.lua, since the send is unconditional.
   -- An explicit "off" rather than a grey zero. Restock disabled and restock
   -- broken look identical on a count alone, and the grey dashes here already
   -- mean a third thing (never sent). Say which one it is.
   if config.drillRestock == false then
-    put("  PAR TX: " .. brokerState.lastParSend .. "  (auto-craft OFF)", 0x888888)
+    putf(0x888888, "  PAR TX: %s  (auto-craft OFF)", brokerState.lastParSend)
   else
-    put("  PAR TX: " .. brokerState.lastParSend .. " (" .. brokerState.lastParCount .. ")",
-        brokerState.lastParCount > 0 and 0x00FF00 or 0x555555)
+    putf(brokerState.lastParCount > 0 and 0x00FF00 or 0x555555,
+         "  PAR TX: %s (%s)", brokerState.lastParSend, brokerState.lastParCount)
   end
   skip(1)
 
-  put("  TASKS RUNNING: " .. sched.count(), 0x888888)
+  putf(0x888888, "  TASKS RUNNING: %s", sched.count())
   -- Where module time actually goes. Duty is the share spent mining rather than
   -- loading, returning or waiting for a job -- the number to compare between
   -- runs when output feels off.
@@ -2149,30 +2220,29 @@ local function drawHWPanel()
     -- how the run has gone, recent says how it is going, and reading one as the
     -- other has produced a wrong conclusion here more than once.
     local r = recentStats()
-    put(string.format("  CYCLES: %d   DUTY: %.0f%%%s", cycleStats.cycles, duty,
-        r and string.format("   last%d %.0f%%", r.n, r.duty) or ""),
-        duty >= 80 and 0x00FF00 or duty >= 60 and 0xFFAA00 or 0xFF4444)
+    putf(duty >= 80 and 0x00FF00 or duty >= 60 and 0xFFAA00 or 0xFF4444,
+         "  CYCLES: %d   DUTY: %.0f%%%s", cycleStats.cycles, duty,
+         r and string.format("   last%d %.0f%%", r.n, r.duty) or "")
     -- Divided by LOADS, not cycles. Dividing load seconds by completed cycles
     -- counted the loads of modules still running against cycles that had
     -- finished, and reported roughly double the real figure -- visibly at odds
     -- with the per-module times on the left of the screen.
     if cycleStats.loads > 0 then
-      put(string.format("  LOAD avg %.1fs%s  max %.1fs  (%d)",
-          cycleStats.loadTime / cycleStats.loads,
-          r and string.format("  last%d %.1fs", r.n, r.load) or "",
-          cycleStats.loadMax, cycleStats.loads), 0x668866)
+      putf(0x668866, "  LOAD avg %.1fs%s  max %.1fs  (%d)",
+           cycleStats.loadTime / cycleStats.loads,
+           r and string.format("  last%d %.1fs", r.n, r.load) or "",
+           cycleStats.loadMax, cycleStats.loads)
     end
-    put(string.format("  REFILLS: %d   %.1f/cycle%s",
-        cycleStats.refills or 0, (cycleStats.refills or 0) / cycleStats.cycles,
-        r and string.format("   last%d %.1f", r.n, r.refills) or ""),
-        0x668866)
+    putf(0x668866, "  REFILLS: %d   %.1f/cycle%s",
+         cycleStats.refills or 0, (cycleStats.refills or 0) / cycleStats.cycles,
+         r and string.format("   last%d %.1f", r.n, r.refills) or "")
     if (cycleStats.spins or 0) > 0 then
-      put(string.format("  SPINUP avg %.1fs  max %.1fs",
-          cycleStats.spinTime / cycleStats.spins, cycleStats.spinMax), 0x668866)
+      putf(0x668866, "  SPINUP avg %.1fs  max %.1fs",
+           cycleStats.spinTime / cycleStats.spins, cycleStats.spinMax)
     end
-    put(string.format("  WAIT idle %.1fs/cyc  return %.1fs/cyc",
-        cycleStats.idleTime / cycleStats.cycles,
-        cycleStats.doneTime / cycleStats.cycles), 0x666666)
+    putf(0x666666, "  WAIT idle %.1fs/cyc  return %.1fs/cyc",
+         cycleStats.idleTime / cycleStats.cycles,
+         cycleStats.doneTime / cycleStats.cycles)
   else
     put("  CYCLES: none completed yet", 0x555555)
   end
@@ -2183,8 +2253,8 @@ local function drawHWPanel()
   -- stalls mid-recipe; "5m" is what it sustains while mining -- idle intervals
   -- are excluded, see computationSample.
   local cNow, cAvg, cPeak = computationStats()
-  put(string.format("  COMP/s now %s   5m %s   pk %s",
-      fmtComp(cNow), cAvg and fmtComp(cAvg) or "--", fmtComp(cPeak)), 0x668866)
+  putf(0x668866, "  COMP/s now %s   5m %s   pk %s",
+       fmtComp(cNow), cAvg and fmtComp(cAvg) or "--", fmtComp(cPeak))
   skip(1)
 
   -- Plasma stock (required to mine -- a module won't run without a plasma fluid).
@@ -2194,7 +2264,7 @@ local function drawHWPanel()
     local amt = brokerState.plasma[name] or 0
     if row > H then break end
     local short = name:gsub(" Plasma", "")
-    put(string.format("  %-16s %8d mB", short, amt), amt > 0 and 0xFF00FF or 0x555555)
+    putf(amt > 0 and 0xFF00FF or 0x555555, "  %-16s %8d mB", short, amt)
     if amt > 0 then anyPlasma = true end
   end
   -- TELEMETRY STATUS, in the two rows under the plasma list.
@@ -2220,7 +2290,7 @@ local function drawHWPanel()
   local faultNode, faultWhy = nodeFault()
   local held = brokerState.nodeRecast["FLUID_UPDATE"] or brokerState.nodeRecast["DUST_UPDATE"]
   if faultNode then
-    put("  [ " .. faultNode .. ": " .. faultWhy:sub(1, PW - 14) .. " ]", 0xFF4444)
+    putf(0xFF4444, "  [ %s: %s ]", faultNode, faultWhy:sub(1, PW - 14))
     put("  [ DISPATCH HELD until telemetry is trustworthy ]", 0xFF4444)
   elseif not anyPlasma then
     if brokerState.lastFluidSyncTime == 0 then
@@ -2233,7 +2303,7 @@ local function drawHWPanel()
     -- Not a fault: a node hit a bad scan and is republishing its last good
     -- figures while it recovers. Worth saying, because the numbers above are
     -- older than the sync clock suggests -- but dispatch carries on.
-    put("  [ telemetry held over " .. held .. " scan(s) - node coping ]", 0xFFAA00)
+    putf(0xFFAA00, "  [ telemetry held over %s scan(s) - node coping ]", held)
     put("", 0x555555)
   else
     put("", 0x555555)
@@ -2263,11 +2333,14 @@ local function drawHWPanel()
       if row > H then break end
       local droneName = config.drones[key] or ("Drone-" .. key)
       local lvl = droneName:match("MK%-(.+)") or "?"
-      local line = string.format("  %-18s  x%d", "MK-" .. lvl, count)
-      if free ~= count then line = line .. string.format("  (%d free)", free) end
       -- Amber when nothing is free: the tier is owned but cannot be dispatched,
       -- which is a different state from not owning one at all.
-      put(line, (free > 0) and 0x00FFFF or 0xFFAA00)
+      local color = (free > 0) and 0x00FFFF or 0xFFAA00
+      if free ~= count then
+        putf(color, "  %-18s  x%d  (%d free)", "MK-" .. lvl, count, free)
+      else
+        putf(color, "  %-18s  x%d", "MK-" .. lvl, count)
+      end
       any = true
     end
   end
@@ -2288,9 +2361,11 @@ local function drawHWPanel()
       -- Display the material name, stripped of " Drill Tip".
       local entry = config.drills[key]
       local name = (entry and entry.tip and entry.tip:gsub(" Drill Tip", "")) or key
-      local line = string.format("  %-18s  x%d", name, kits)
-      if free ~= kits then line = line .. string.format("  (%d free)", free) end
-      put(line, 0x00AAFF)
+      if free ~= kits then
+        putf(0x00AAFF, "  %-18s  x%d  (%d free)", name, kits, free)
+      else
+        putf(0x00AAFF, "  %-18s  x%d", name, kits)
+      end
       anyDrill = true
     end
   end
@@ -2315,19 +2390,19 @@ local function drawHWPanel()
       -- distinguishes these, and it is the part that gets truncated away.
       local short = label:gsub(" Drill Tip$", " TIP"):gsub(" Rod$", " ROD")
       if state == "crafting" then
-        put(string.format("  %-24s x%d", short:sub(1, 24), want), 0xFFAA00)
+        putf(0xFFAA00, "  %-24s x%d", short:sub(1, 24), want)
       elseif state == "queued" then
         -- Not a problem: below par, waiting on a crafting CPU. Dim so it reads
         -- as backlog rather than as another thing demanding attention.
-        put(string.format("  %-24s queued x%d", short:sub(1, 24), want), 0x555555)
+        putf(0x555555, "  %-24s queued x%d", short:sub(1, 24), want)
       else
-        put(string.format("  %-24s %s", short:sub(1, 24),
-          state == "nopattern" and "NO PATTERN" or "REJECTED"), 0xFF4444)
+        putf(0xFF4444, "  %-24s %s", short:sub(1, 24),
+             state == "nopattern" and "NO PATTERN" or "REJECTED")
       end
     end
   end
 
-  for r = row, H do dashBlank("H" .. r, P3 + 1, PW, r) end
+  for r = row, H do dashBlank(SLOT_H + r, P3 + 1, PW, r) end
 end
 
 local function drawStaticFrame()
@@ -2355,8 +2430,10 @@ local function drawUI()
   if not gpu then return end
   -- Cached like every other row: the clock only changes once a second, and the
   -- dashboard repaints four times a second.
-  dashRow("SYNC", W - 17, 17, 2,
-    "SYNC: " .. os.date("%H:%M:%S", math.floor(getUnixTime())), 0x555555)
+  -- Keyed on the integer second, so os.date and the concatenation run once a
+  -- second rather than on all ten frames within it.
+  dashRowF(SLOT_SYNC, W - 17, 17, 2, 0x555555, "SYNC: %s",
+    os.date("%H:%M:%S", math.floor(getUnixTime())))
   drawModulePanel(); drawDustPanel(); drawHWPanel()
 end
 
