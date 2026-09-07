@@ -106,8 +106,25 @@ end
 local function createLogger(jobName)
   local logger = {}
 
-  local function emit(level, message)
+  -- FORMAT AFTER THE LEVEL CHECK, NOT BEFORE.
+  --
+  -- Call sites used to read logger:info(string.format("...", a, b)), which built
+  -- the string whatever the level -- and logging is OFF by default, so almost
+  -- every one of those was formatted and dropped unread. Several sit in paths
+  -- that run every three seconds per module, or once per load.
+  --
+  -- Passing the arguments through instead means shouldEmit() gets to say no
+  -- first. Backward compatible on purpose: with no varargs nothing is formatted,
+  -- so the plain logger:info("text") calls all over this codebase are untouched
+  -- and a message containing a stray % cannot start throwing.
+  local function emit(level, message, ...)
     if not shouldEmit(level) then return end
+    if select("#", ...) > 0 then
+      -- pcall so a bad format string degrades to the raw message instead of
+      -- taking down whatever was trying to report something.
+      local okFmt, formatted = pcall(string.format, message, ...)
+      message = okFmt and formatted or (tostring(message) .. " [logger: bad format]")
+    end
     local line = "[" .. isoTime() .. "] [" .. jobName .. "] [" .. level .. "] " .. tostring(message)
 
     if ENABLED and BACKEND == "loki" then
@@ -119,10 +136,10 @@ local function createLogger(jobName)
     end
   end
 
-  function logger:info(m)  emit("INFO",  m) end
-  function logger:warn(m)  emit("WARN",  m) end
-  function logger:error(m) emit("ERROR", m) end
-  function logger:debug(m) emit("DEBUG", m) end
+  function logger:info(m,  ...) emit("INFO",  m, ...) end
+  function logger:warn(m,  ...) emit("WARN",  m, ...) end
+  function logger:error(m, ...) emit("ERROR", m, ...) end
+  function logger:debug(m, ...) emit("DEBUG", m, ...) end
 
   return logger
 end

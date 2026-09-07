@@ -594,14 +594,14 @@ local function pollLoad(mod)
     mod.lastLoad = string.format("%.0fs pre%.0f fill%.0f w%d @%d/%d db%d buf%d",
       elapsed, s.preDrainSecs or 0, s.fillSecs or 0, s.fillWaits or 0,
       sw.tips or 0, sw.rods or 0, maxConfirm, s.arrivePolls or 0)
-    logger:info(string.format(
+    logger:info(
       "[LOAD] M%d %.1fs = pre %.1fs + fill %.1fs (%d passes, %d waiting) start %d/%d",
       mod.index, elapsed, s.preDrainSecs or 0, s.fillSecs or 0,
-      s.fillPasses or 0, s.fillWaits or 0, sw.tips or 0, sw.rods or 0))
-    logger:info(string.format(
+      s.fillPasses or 0, s.fillWaits or 0, sw.tips or 0, sw.rods or 0)
+    logger:info(
       "[LOAD] M%d ready (confirm polls d=%s t=%s r=%s, arrive=%s)",
       mod.index, tostring(cp.drone), tostring(cp.tip), tostring(cp.rod),
-      tostring(s.arrivePolls)))
+      tostring(s.arrivePolls))
     mod.status = "RUNNING"
     mod.runStartedAt = computer.uptime()
     mod.lastRunPollAt = 0
@@ -610,12 +610,12 @@ local function pollLoad(mod)
     mod.nextHeartbeatAt = computer.uptime() + RUN_HEARTBEAT_INTERVAL
     mod.lastRunWarnAt = 0
     mod.job.startTime = computer.uptime()
-    logger:info(string.format(
+    logger:info(
       "[HEALTH] M%d started asteroid=%s dist=%s x%s",
       mod.index,
       tostring(mod.job and mod.job.asteroid or "?"),
       tostring(mod.job and mod.job.distance or "?"),
-      tostring(mod.job and mod.job.parallels or "?")))
+      tostring(mod.job and mod.job.parallels or "?"))
     -- Set every parameter the run needs, in whichever dialect this module
     -- speaks. module_api.lua holds the 2.8/2.9 difference and does the pcall'ing
     -- -- the reasoning for that guard is written out there, and it is the same
@@ -667,6 +667,11 @@ end
 --   never re-dispatched -- so topping up forever silently pins every module to
 --   whatever asteroid it first picked up and the broker stops responding to
 --   what is actually low. Returns true once the buffer is full.
+-- WHEN and WHAT to top up. The HOW -- reading the inventories and moving the
+-- items -- is loader.topUp, next to drain(), which is the same job and had the
+-- same lesson learned in it years earlier. This function used to do both, and
+-- its half of the work asked the hardware the same question four times per
+-- consumable per pass.
 local function restockRunning(mod)
   if mod.status ~= "RUNNING" or not mod.job then return end
   local drill = config.drills[mod.job.drillKey]
@@ -675,154 +680,37 @@ local function restockRunning(mod)
   local TIPS_PER = config.tipsPerLoad or 64
   local RODS_PER = config.rodsPerLoad or 64
   local _, slotTip, slotRod = loader.dbSlotsFor(mod.index)
-  local ibufSize = mod.transposer.getInventorySize(mod.conf.interfaceSide) or 9
-  local busSize = mod.transposer.getInventorySize(mod.conf.inputBusSide) or 16
 
-  -- Count ALL of `label` across the whole bus, not one fixed slot. If we only
-  -- checked a fixed slot and the item had shifted, we'd read 0 and re-pull a full
-  -- stack every cycle — silently draining the ME and starving other modules.
-  -- One call per inventory, not one per slot. These three loops ran every few
-  -- seconds for every running module, and the findBuf one ran inside a five
-  -- second await polled five times a second -- so a single refill could spend
-  -- a couple of hundred component calls doing nothing but waiting, while the
-  -- loaders were queueing for the same budget.
-  -- Falls back to per-slot reads if loader.lua predates snapshotSide, so a
-  -- half-updated /home (new broker, old loader) is slow rather than broken.
-  local snap = loader.snapshotSide or function(m, side, from, to)
-    local out = {}
-    for sl = from, to do out[sl] = m.transposer.getStackInSlot(side, sl) end
-    return out
+  local wanted = {
+    { label = drill.tip, target = TIPS_PER, cfgSlot = 2, dbSlot = slotTip },
+    { label = drill.rod, target = RODS_PER, cfgSlot = 3, dbSlot = slotRod },
+  }
+
+  local results, totals, moved = loader.topUp(mod, wanted, dbAddr)
+
+  if moved then
+    mod.refills        = (mod.refills or 0) + 1
+    cycleStats.refills = (cycleStats.refills or 0) + 1
   end
-
-  local function busTotal(label)
-    local total, firstSlot = 0, nil
-    local inv = snap(mod, mod.conf.inputBusSide, 1, busSize)
-    for s = 1, busSize do
-      local st = inv[s]
-      if st and st.label == label then
-        total = total + (st.size or 0)
-        firstSlot = firstSlot or s
-      end
-    end
-    return total, firstSlot
-  end
-
-  local function findBuf(label)
-    local inv = snap(mod, mod.conf.interfaceSide, 1, ibufSize)
-    for s = 1, ibufSize do
-      local stack = inv[s]
-      if stack and stack.label == label then return s, stack.size or 0 end
-    end
-    return nil, 0
-  end
-
-  -- Where should a refill land? Prefer a partly filled stack of the same item,
-  -- otherwise the first empty slot. busTotal already counts the whole bus, but
-  -- the transfer used to target the FIRST slot holding the item -- which, once a
-  -- load spans more than one stack, is usually the full one, so the move landed
-  -- nothing and the module ran dry anyway. Slot 1 is the drone; start at 2.
-  local function destFor(label)
-    local firstEmpty
-    local inv = snap(mod, mod.conf.inputBusSide, 1, busSize)
-    for s = 2, busSize do
-      local st = inv[s]
-      if not st or (st.size or 0) == 0 then
-        firstEmpty = firstEmpty or s
-      elseif st.label == label then
-        local room = (st.maxSize or 64) - (st.size or 0)
-        if room > 0 then return s, room end
-      end
-    end
-    if firstEmpty then return firstEmpty, 64 end
-    return nil, 0
-  end
-
-  -- Did this pass actually move anything? A top-up that moves nothing is the ME
-  -- not delivering, not a refill, and counting it would make the stat lie.
-  local movedAny = false
-
-  -- Refill one consumable in the bus back up to `target` from the ME interface.
-  --
-  -- Returns "done" when at target, "nofit" when the bus has no room for more,
-  -- and "partial" otherwise. The caller needs the difference: "nofit" is not a
-  -- failure to retry, it is the bus being physically full, and retrying it every
-  -- three seconds for the whole top-up window achieves nothing.
-  local function refill(label, target, cfgSlot, dbSlot)
-    if mod.status ~= "RUNNING" then return "partial" end
-    local have = busTotal(label)
-    local deficit = target - have
-    if deficit <= 0 then return "done" end
-    local dst = destFor(label)
-    if not dst then
-      -- Nowhere to put it. 128 of each needs two slots per consumable plus one
-      -- for the drone, so a bus with fewer than five usable slots simply cannot
-      -- hold a full buffer of both.
-      return "nofit"
-    end
-    -- One stack at a time: that is all an interface buffer slot holds.
-    mod.iface.setInterfaceConfiguration(cfgSlot, dbAddr, dbSlot, math.min(deficit, 64))
-    -- Half a second between checks, not a fifth. Each check is one call now
-    -- rather than nine, but the ME is not going to answer faster for being
-    -- asked more often, and this runs concurrently with every other module.
-    sched.await(function() return (select(1, findBuf(label))) ~= nil end, 5, 0.5)
-    if mod.status ~= "RUNNING" then
-      mod.iface.setInterfaceConfiguration(cfgSlot)
-      return "partial"
-    end
-    local src = select(1, findBuf(label))
-    if src then
-      -- Re-pick the destination: the module has been consuming while we waited.
-      local d, r = destFor(label)
-      if d then
-        local got = mod.transposer.transferItem(mod.conf.interfaceSide,
-                      mod.conf.inputBusSide, math.min(deficit, r), src, d)
-        if (got or 0) > 0 then movedAny = true end
-      end
-    end
-    if busTotal(label) >= target then
-      -- Done with this consumable: release the slot so the interface stops
-      -- holding stock we no longer need.
-      mod.iface.setInterfaceConfiguration(cfgSlot)
-      return "done"
-    end
-
-    -- LEAVE THE ORDER STANDING.
-    --
-    -- Clearing here cancelled it, and the next pass three seconds later placed
-    -- the same order again -- so a network that hands over a few items at a time
-    -- had its progress thrown away on every pass and started over. Measured in
-    -- world at 3.6 refills per cycle to move a single stack.
-    --
-    -- Standing, the interface keeps accumulating between passes and the next one
-    -- collects whatever arrived. stepDone clears every configuration slot when
-    -- the run ends, so nothing is left hoarding.
-    return "partial"
-  end
-
-  local tipState = refill(drill.tip, TIPS_PER, 2, slotTip)
-  local rodState = refill(drill.rod, RODS_PER, 3, slotRod)
 
   -- Stop asking once each consumable is either at target or cannot fit. Waiting
   -- for both to reach target meant a bus too small for two full stacks retried
   -- for the entire window and never finished -- which looked like "sometimes it
   -- does not top up at all".
-  if movedAny then
-    mod.refills      = (mod.refills or 0) + 1
-    cycleStats.refills = (cycleStats.refills or 0) + 1
-  end
-
+  local tipState, rodState = results[1], results[2]
   local settled = (tipState ~= "partial") and (rodState ~= "partial")
   if settled then
-    local tips, rods = busTotal(drill.tip), busTotal(drill.rod)
-    logger:info(string.format(
-      "[RESTOCK] M%d settled at tips %d/%d (%s), rods %d/%d (%s)",
-      mod.index, tips, TIPS_PER, tipState, rods, RODS_PER, rodState))
+    -- `totals` came back from the pass that just ran. The old code re-read the
+    -- whole bus twice here purely to build this line -- every three seconds,
+    -- forever, on a pinned module that had nothing left to do.
+    logger:info("[RESTOCK] M%d settled at tips %d/%d (%s), rods %d/%d (%s)",
+      mod.index, totals[drill.tip] or 0, TIPS_PER, tipState,
+      totals[drill.rod] or 0, RODS_PER, rodState)
     if tipState == "nofit" or rodState == "nofit" then
-      logger:warn(string.format(
-        "[RESTOCK] M%d input bus has no room for a full buffer -- it needs %d free slots " ..
+      logger:warn("[RESTOCK] M%d input bus has no room for a full buffer -- it needs %d free slots " ..
         "(drone + %d stacks of tips + %d stacks of rods)",
         mod.index, 1 + math.ceil(TIPS_PER / 64) + math.ceil(RODS_PER / 64),
-        math.ceil(TIPS_PER / 64), math.ceil(RODS_PER / 64)))
+        math.ceil(TIPS_PER / 64), math.ceil(RODS_PER / 64))
     end
   end
   return settled
@@ -871,7 +759,7 @@ local function stepRunning(mod)
         cycleStats.spinTime = (cycleStats.spinTime or 0) + spin
         cycleStats.spins    = (cycleStats.spins or 0) + 1
         if spin > (cycleStats.spinMax or 0) then cycleStats.spinMax = spin end
-        logger:info(string.format("[SPINUP] M%d running %.2fs after enable", mod.index, spin))
+        logger:info("[SPINUP] M%d running %.2fs after enable", mod.index, spin)
       end
     end
   end
@@ -917,18 +805,18 @@ local function stepRunning(mod)
   if isActive then
     if mod.inactiveStreak and mod.inactiveStreak > 0 and mod.inactiveSinceAt then
       local downFor = now - mod.inactiveSinceAt
-      logger:warn(string.format(
+      logger:warn(
         "[HEALTH] M%d recovered after %.1fs inactive blip (streak=%d)",
-        mod.index, downFor, mod.inactiveStreak))
+        mod.index, downFor, mod.inactiveStreak)
     end
     mod.inactiveStreak = 0
     mod.inactiveSinceAt = nil
     if now >= (mod.nextHeartbeatAt or 0) then
-      logger:info(string.format(
+      logger:info(
         "[HEALTH] M%d running asteroid=%s for %.0fs",
         mod.index,
         tostring(mod.job and mod.job.asteroid or "?"),
-        now - (mod.runStartedAt or now)))
+        now - (mod.runStartedAt or now))
       mod.nextHeartbeatAt = now + RUN_HEARTBEAT_INTERVAL
     end
     return
@@ -939,22 +827,22 @@ local function stepRunning(mod)
   end
   mod.inactiveStreak = (mod.inactiveStreak or 0) + 1
   if mod.inactiveStreak == 1 or (now - (mod.lastRunWarnAt or 0) >= RUN_WARN_COOLDOWN) then
-    logger:warn(string.format(
+    logger:warn(
       "[HEALTH] M%d inactive while RUNNING (streak=%d/%d, asteroid=%s)",
       mod.index,
       mod.inactiveStreak,
       RUN_INACTIVE_CONFIRM,
-      tostring(mod.job and mod.job.asteroid or "?")))
+      tostring(mod.job and mod.job.asteroid or "?"))
     mod.lastRunWarnAt = now
   end
   if mod.inactiveStreak < RUN_INACTIVE_CONFIRM then
     return
   end
 
-  logger:warn(string.format(
+  logger:warn(
     "[HEALTH] M%d marking DONE after %.1fs inactive confirmation",
     mod.index,
-    now - (mod.inactiveSinceAt or now)))
+    now - (mod.inactiveSinceAt or now))
   local observed = now - (mod.runStartedAt or now)
   cycleStats.runTime = cycleStats.runTime + observed
   mod.cycRun = observed
@@ -1036,8 +924,8 @@ local function stepDone(mod)
       refills = mod.refills or 0,
     })
     mod.idleSince = computer.uptime()
-    logger:info(string.format("[CYCLE] M%d done (%d total, duty %.0f%%)",
-      mod.index, cycleStats.cycles, statsDuty()))
+    logger:info("[CYCLE] M%d done (%d total, duty %.0f%%)",
+      mod.index, cycleStats.cycles, statsDuty())
     mod.job = nil
     mod.status = "IDLE"
     mod.doneTime = nil
@@ -1060,8 +948,8 @@ end
 local function releaseStaleHold(mod)
   if not mod.holding or mod.status ~= "IDLE" then return end
   if computer.uptime() - (mod.heldSince or 0) < (config.holdTimeout or 10) then return end
-  logger:info(string.format("[HOLD] M%d released after %.0fs unclaimed",
-    mod.index, computer.uptime() - (mod.heldSince or 0)))
+  logger:info("[HOLD] M%d released after %.0fs unclaimed",
+    mod.index, computer.uptime() - (mod.heldSince or 0))
   pcall(returnItemsToME, mod)
   mod.holding, mod.heldSince = nil, nil
 end
@@ -1139,7 +1027,7 @@ local function getIdleModules()
     if not mod.dialect then
       mod.dialect, mod.dialectHow = moduleApi.resolve(mod.adapter, config.gtVersion)
       if mod.dialect then
-        logger:info(string.format("[RECOVERY] M%d now speaks %s", i, moduleApi.describe(mod)))
+        logger:info("[RECOVERY] M%d now speaks %s", i, moduleApi.describe(mod))
       end
     end
 
@@ -1285,8 +1173,8 @@ local function tryDispatch(mod, asteroid, droneKey, avail, availKit)
     pcall(returnItemsToME, mod)
   end
   if holds then
-    logger:info(string.format("[FASTLOAD] M%d keeping %s for %s (consumables fetched fresh)",
-      mod.index, tostring(config.drones[droneKey]), asteroid))
+    logger:info("[FASTLOAD] M%d keeping %s for %s (consumables fetched fresh)",
+      mod.index, tostring(config.drones[droneKey]), asteroid)
   end
   mod.holding, mod.heldSince = nil, nil
 
@@ -2530,7 +2418,7 @@ local function initModules()
     mod.dialect, mod.dialectHow = moduleApi.resolve(mod.adapter, config.gtVersion)
     if mod.dialect then
       if mod.dialect == moduleApi.V28 then anyLegacy = true end
-      logger:info(string.format("[STARTUP] M%d speaks %s", mod.index, moduleApi.describe(mod)))
+      logger:info("[STARTUP] M%d speaks %s", mod.index, moduleApi.describe(mod))
     else
       -- Neither setParameter nor setParameters. That is not a mining module, or
       -- moduleAddr points at the wrong block. Fail the module, not the boot: the
@@ -2853,9 +2741,13 @@ while true do
   --    the scheduler keeps ticking fast.
   -- Pull ANY event, not just modem_message: the dust panel is scrollable and
   -- nothing else in this program consumes input.
-  local ev = { event.pull(0.01) }
-  if ev[1] == "modem_message" then
-    processMessage(table.unpack(ev))
+  -- Destructured, not collected into a table. This loop spins about a hundred
+  -- times a second and `{ event.pull(...) }` allocated a fresh table on every one
+  -- of those, almost always to look at element 1 and throw the rest away.
+  -- event.pull returns at most six values for the signals this program sees.
+  local e1, e2, e3, e4, e5, e6 = event.pull(0.01)
+  if e1 == "modem_message" then
+    processMessage(e1, e2, e3, e4, e5, e6)
     -- Only DUST_UPDATE can move anything the editor shows (the HAVE column).
     -- HW_UPDATE and FLUID_UPDATE used to force a full repaint too, several times
     -- a minute, for a screen whose contents they cannot affect. Even for dust,
@@ -2867,25 +2759,29 @@ while true do
     -- falls through to sched.tick() and stepModules() below, so loads in flight
     -- keep progressing while someone edits. That is the whole reason this is a
     -- UI mode rather than a separate blocking program.
-    editor.handle(ev)
+    --
+    -- The one place that still wants a table -- edHandle indexes it. Built only
+    -- on this branch, which is not the hot path: dispatch is suspended for as
+    -- long as the editor is up.
+    editor.handle({ e1, e2, e3, e4, e5, e6 })
 
-  elseif ev[1] == "scroll" then
-    -- ev = { "scroll", screenAddr, x, y, direction, player }
-    local sx, dir = ev[3], ev[5]
+  elseif e1 == "scroll" then
+    -- signal = "scroll", screenAddr, x, y, direction, player
+    local sx, dir = e3, e5
     if sx and dir and sx >= P2 and sx < P3 then
       dustScroll = dustScroll - dir * 2   -- clamped in drawDustPanel
       lastUIDraw = 0                      -- repaint now, do not wait for the tick
     end
 
-  elseif ev[1] == "key_down" and ev[3] == 101 and not edPending then  -- "e"
+  elseif e1 == "key_down" and e3 == 101 and not edPending then  -- "e"
     -- Do not open yet: start quiescing. See QUIESCING above.
     local up = computer.uptime()
     edPending = { openAt = up + config.quiesceSeconds,
                   hardAt = up + config.quiesceSeconds + config.quiesceGrace }
     edPendingShown = nil
 
-  elseif ev[1] == "key_down" and edPending
-     and editor.isCancelKey(ev[3], ev[4]) then
+  elseif e1 == "key_down" and edPending
+     and editor.isCancelKey(e3, e4) then
     -- Aborting the countdown. Asked of the editor rather than tested here, so
     -- this cannot drift from EDKEYS -- which is how "esc" outlived the key
     -- working. Without tab and q this box could not be cancelled at all.

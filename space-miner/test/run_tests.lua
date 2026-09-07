@@ -361,5 +361,258 @@ world({}, { holding("uhv", "naquadah") }, 990, { naquadah = { kits = 0 } })
 ck("held kits count as free",          availableKits(true).naquadah, 64)
 
 -- =============================================================================
+section("loader.topUp -- component calls per restock pass")
+-- =============================================================================
+-- This is a PERFORMANCE test with teeth. The broker tops up every running module
+-- every 3 seconds, forever on a pinned one, and the old restock path re-read the
+-- same inventory four times per consumable to do it -- ~30 metered component
+-- calls per module per pass, against the same per-tick budget six loaders are
+-- queueing for. The counts asserted below are the whole point of the change, so
+-- they are asserted exactly rather than as "fewer than before".
+-- loader.lua is the one module here that reaches for OpenComputers at load:
+-- `require("computer")` for its clock and `dofile("/home/scheduler.lua")` for
+-- await/sleep. Rather than weaken the real file for the test's benefit, load it
+-- in an environment where those two are answered by fakes. Everything below is
+-- then the genuine function.
+local clock = 0
+local fakeSched = {
+  sleep = function(t) clock = clock + (t or 0) end,
+  -- Enough of await for topUp: poll until true or the timeout, advancing our
+  -- own clock so nothing spins forever.
+  await = function(pred, timeout, interval)
+    local deadline = clock + (timeout or 5)
+    repeat
+      if pred() then return true end
+      clock = clock + (interval or 0.1)
+    until clock >= deadline
+    return false
+  end,
+}
+local loader
+do
+  local env = setmetatable({
+    require = function(name)
+      if name == "computer" then return { uptime = function() return clock end } end
+      error("unexpected require: " .. tostring(name))
+    end,
+    dofile = function(path)
+      if path:find("scheduler") then return fakeSched end
+      error("unexpected dofile: " .. tostring(path))
+    end,
+  }, { __index = _G })
+  loader = assert(load(slurp("loader.lua"), "loader.lua", "t", env))()
+end
+ck("loader loads in a sandbox", type(loader.topUp), "function")
+
+-- A transposer that counts what it is asked. getAllStacks is the fast path
+-- snapshotSide prefers; it returns the OpenComputers shape (0-based, empty slots
+-- present as tables without a label).
+local function fakeMod(bus, buf, opts)
+  opts = opts or {}
+  local calls = { getAllStacks = 0, getStackInSlot = 0, getInventorySize = 0,
+                  transferItem = 0, setInterfaceConfiguration = 0 }
+  local inv   = { [0] = bus, [1] = buf }     -- side 0 = bus, side 1 = interface
+  -- Sizes are declared, not derived: `#t` on a table with nil holes is undefined
+  -- in Lua, and a bus with an empty slot in the middle is the normal case here.
+  local size  = { [0] = opts.busSize or 4, [1] = opts.bufSize or 4 }
+
+  -- getAllStacks returns COPIES in OpenComputers -- the stacks come back across
+  -- the Java boundary, so writing to a snapshot cannot write to the world. The
+  -- first version of this fake handed out references, which made topUp's
+  -- in-place snapshot update and the transfer below both land on the same table
+  -- and every move count twice. Copying is what makes this fake honest.
+  local function arr(side)
+    calls.getAllStacks = calls.getAllStacks + 1
+    local src, out = inv[side], {}
+    for i = 1, size[side] do
+      local st = src[i]
+      out[i - 1] = st and { label = st.label, size = st.size, maxSize = st.maxSize } or {}
+    end
+    return { getAll = function() return out end }
+  end
+  local mod = {
+    index = 1, status = "RUNNING",
+    conf = { interfaceSide = 1, inputBusSide = 0 },
+    calls = calls, inv = inv,
+    transposer = {
+      getAllStacks = arr,
+      getInventorySize = function(side)
+        calls.getInventorySize = calls.getInventorySize + 1
+        return size[side]
+      end,
+      getStackInSlot = function(side, sl)
+        calls.getStackInSlot = calls.getStackInSlot + 1
+        return inv[side][sl]
+      end,
+      transferItem = function(from, to, howMany, src, dst)
+        calls.transferItem = calls.transferItem + 1
+        local sst = inv[from][src]
+        if not sst then return 0 end
+        local moved = math.min(howMany, sst.size, opts.throttle or math.huge)
+        sst.size = sst.size - moved
+        if sst.size <= 0 then inv[from][src] = nil end
+        local into = inv[to][dst]
+        if into then into.size = into.size + moved
+        else inv[to][dst] = { label = sst.label, size = moved, maxSize = 64 } end
+        return moved
+      end,
+    },
+    iface = { setInterfaceConfiguration = function()
+      calls.setInterfaceConfiguration = calls.setInterfaceConfiguration + 1
+    end },
+  }
+  return mod
+end
+local function stack(label, qty) return { label = label, size = qty, maxSize = 64 } end
+local TIP, ROD = "Steel Drill Tip", "Steel Drill Rod"
+
+-- SETTLED: both consumables already at target. One read of the bus, and nothing
+-- else -- no interface read, no transfer. The old path cost six.
+local m = fakeMod({ stack("Drone", 1), stack(TIP, 64), stack(ROD, 64) }, {})
+local res, totals = loader.topUp(m, {
+  { label = TIP, target = 64, cfgSlot = 2, dbSlot = 2 },
+  { label = ROD, target = 64, cfgSlot = 3, dbSlot = 3 },
+}, "dbaddr")
+ck("settled: tips done",        res[1], "done")
+ck("settled: rods done",        res[2], "done")
+ck("settled: totals reported",  totals[TIP], 64)
+ck("settled: ONE inventory read", m.calls.getAllStacks, 1)
+ck("settled: no transfers",     m.calls.transferItem, 0)
+ck("settled: sizes read once",  m.calls.getInventorySize, 2)
+
+-- Sizes are cached on the module: a second pass asks the hardware nothing new.
+loader.topUp(m, { { label = TIP, target = 64, cfgSlot = 2, dbSlot = 2 } }, "dbaddr")
+ck("sizes cached across passes", m.calls.getInventorySize, 2)
+
+-- NEEDS BOTH: one bus read, one interface read, two transfers. The old path
+-- took four bus reads and two interface reads PER CONSUMABLE.
+m = fakeMod({ stack("Drone", 1), stack(TIP, 32), stack(ROD, 32) },
+            { stack(TIP, 64), stack(ROD, 64) })
+res = loader.topUp(m, {
+  { label = TIP, target = 64, cfgSlot = 2, dbSlot = 2 },
+  { label = ROD, target = 64, cfgSlot = 3, dbSlot = 3 },
+}, "dbaddr")
+ck("refill: TWO inventory reads", m.calls.getAllStacks, 2)
+ck("refill: one move each",       m.calls.transferItem, 2)
+ck("refill: tips landed",         m.inv[0][2].size, 64)
+ck("refill: rods landed",         m.inv[0][3].size, 64)
+
+-- A PASS THAT MOVED SOMETHING IS NEVER "done", even though the arithmetic says
+-- it reached target. The module is RUNNING and has been consuming throughout the
+-- pass, so have+got overstates the bus -- and "done" latches (restockRunning ->
+-- settled -> mod.bufferFilled), which would freeze an unpinned module's buffer
+-- below target for the rest of the run. Only a fresh read may settle it.
+ck("a pass that moved is partial",  res[1], "partial")
+ck("both consumables partial",      res[2], "partial")
+
+-- The next pass reads fresh and settles it, for one inventory read.
+m.calls.getAllStacks = 0
+res = loader.topUp(m, {
+  { label = TIP, target = 64, cfgSlot = 2, dbSlot = 2 },
+  { label = ROD, target = 64, cfgSlot = 3, dbSlot = 3 },
+}, "dbaddr")
+ck("next pass settles it",          res[1], "done")
+ck("next pass costs one read",      m.calls.getAllStacks, 1)
+
+-- And if the module ate some while we were filling, the next pass tops up the
+-- difference instead of declaring victory. This is the case the old code got
+-- wrong too: it re-read the bus, but only before the items it had just ordered
+-- could be consumed.
+m.inv[0][2].size = 59            -- five tips burned since the pass above
+res = loader.topUp(m, {
+  { label = TIP, target = 64, cfgSlot = 2, dbSlot = 2 },
+}, "dbaddr")
+ck("consumption is noticed",        res[1], "partial")
+
+-- IN-PLACE SNAPSHOT UPDATE. Both consumables are short, both have stock waiting,
+-- and the bus is empty -- so without updating the snapshot after the first
+-- transfer, destIn would hand the SAME empty slot to the second and one would
+-- land on top of the other. This is the bug drain() guards at loader.lua:520,
+-- and the assertion has to make both consumables actually compete for the slot:
+-- an earlier version of this test gave the first one no source, so they never
+-- did, and dropping the update passed it.
+m = fakeMod({ stack("Drone", 1) }, { stack(TIP, 64), stack(ROD, 64) }, { busSize = 3 })
+loader.topUp(m, {
+  { label = TIP, target = 64, cfgSlot = 2, dbSlot = 2 },
+  { label = ROD, target = 64, cfgSlot = 3, dbSlot = 3 },
+}, "dbaddr")
+ck("tips took the first empty slot", m.inv[0][2] and m.inv[0][2].label, TIP)
+ck("rods took the NEXT empty slot",  m.inv[0][3] and m.inv[0][3].label, ROD)
+ck("neither landed on the other",    m.inv[0][2] and m.inv[0][2].size, 64)
+
+-- PREFERS A PARTLY FILLED STACK over an empty slot, so a buffer does not
+-- fragment across the bus.
+m = fakeMod({ stack("Drone", 1), nil, stack(TIP, 32) }, { stack(TIP, 64) })
+loader.topUp(m, { { label = TIP, target = 64, cfgSlot = 2, dbSlot = 2 } }, "dbaddr")
+ck("filled the partial stack", m.inv[0][3].size, 64)
+ck("left the empty slot empty", m.inv[0][2], nil)
+
+-- NOFIT: the bus is physically full, so this is not a failure to retry.
+m = fakeMod({ stack("Drone", 1), stack("Junk", 64), stack("Junk", 64) },
+            { stack(TIP, 64) }, { busSize = 3 })
+res = loader.topUp(m, { { label = TIP, target = 64, cfgSlot = 2, dbSlot = 2 } }, "dbaddr")
+ck("nofit when the bus is full", res[1], "nofit")
+ck("nofit reads nothing further", m.calls.getAllStacks, 1)
+
+-- PARTIAL leaves the standing order in place; done releases it. Clearing on a
+-- partial threw away the network's progress every pass -- measured in world at
+-- 3.6 refills to move a single stack.
+m = fakeMod({ stack("Drone", 1), stack(TIP, 0) }, { stack(TIP, 8) }, { throttle = 8 })
+res = loader.topUp(m, { { label = TIP, target = 64, cfgSlot = 2, dbSlot = 2 } }, "dbaddr")
+ck("short delivery stays partial", res[1], "partial")
+ck("order placed, not cleared",    m.calls.setInterfaceConfiguration, 1)
+
+-- A module that stops mid-pass is not loaded into.
+m = fakeMod({ stack("Drone", 1) }, { stack(TIP, 64) })
+m.status = "DONE"
+loader.topUp(m, { { label = TIP, target = 64, cfgSlot = 2, dbSlot = 2 } }, "dbaddr")
+ck("stopped module gets no items", m.calls.transferItem, 0)
+
+-- =============================================================================
+section("logger.lua -- formatting happens after the level check")
+-- =============================================================================
+-- Call sites used to read logger:info(string.format(...)), so the string was
+-- built whatever the level -- and logging is OFF by default. Several of those
+-- sit in paths that run every three seconds per module.
+local written = {}
+do
+  local env = setmetatable({
+    require = function() return { uptime = function() return 0 end,
+                                  isAvailable = function() return false end } end,
+    io = { open = function()
+      return { write = function(_, line) written[#written + 1] = line end,
+               close = function() end, seek = function() return 0 end }
+    end },
+  }, { __index = _G })
+  local logging = assert(load(slurp("logger.lua"), "logger.lua", "t", env))()
+  local log = logging.createLogger("test")
+
+  -- A value that records the moment anything tries to render it.
+  local rendered = false
+  local spy = setmetatable({}, { __tostring = function() rendered = true; return "spy" end })
+
+  -- INFO is suppressed by default, so nothing should be formatted at all.
+  log:info("%s", spy)
+  ck("suppressed level formats nothing", rendered, false)
+
+  -- WARN is always written, so it must format.
+  written, rendered = {}, false
+  log:warn("%s", spy)
+  ck("emitted level does format", rendered, true)
+  ck("the formatted text is written", (written[1] or ""):find("spy") ~= nil, true)
+
+  -- Backward compatibility: a plain single-argument call must not be treated as
+  -- a format string, or every message containing a stray % would start throwing.
+  written = {}
+  log:warn("100% done")
+  ck("no varargs means no formatting", (written[1] or ""):find("100%% done") ~= nil, true)
+
+  -- A genuinely bad format degrades rather than taking down the caller.
+  written = {}
+  local okCall = pcall(function() log:warn("%d", "not a number") end)
+  ck("a bad format does not throw", okCall, true)
+end
+
+-- =============================================================================
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)

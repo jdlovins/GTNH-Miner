@@ -165,6 +165,54 @@ local function clearInterfaceSlots(mod)
 end
 
 -- ---------------------------------------------------------------------------
+-- READING A SNAPSHOT
+--
+-- These were closures inside loader.run, capturing its busSlots/ibufSize. They
+-- are at file scope now with the bound passed in, because loader.topUp needs the
+-- same three -- and the broker's restock path had grown its own line-for-line
+-- copies of the first two, which is the duplication this removes.
+-- ---------------------------------------------------------------------------
+
+-- How many of `label` are in slots `from`..`to` of a snapshot.
+local function totalIn(snap, from, to, label)
+  local total = 0
+  for s = from, to do
+    local st = snap[s]
+    if st and st.label == label then total = total + (st.size or 0) end
+  end
+  return total
+end
+
+-- Where should the next transfer land? Prefer a partly filled stack of this
+-- item, otherwise the first empty slot. Returns the slot and the room in it.
+-- Slot 1 is the drone, which is not consumed, so scanning starts at 2.
+function loader.destIn(snap, label, busSlots)
+  local firstEmpty
+  for s = 2, busSlots do
+    local st = snap[s]
+    if not st or (st.size or 0) == 0 then
+      firstEmpty = firstEmpty or s
+    elseif st.label == label then
+      local cap  = st.maxSize or STACK_DEFAULT
+      local room = cap - (st.size or 0)
+      if room > 0 then return s, room end
+    end
+  end
+  if firstEmpty then return firstEmpty, STACK_DEFAULT end
+  return nil, 0
+end
+
+function loader.srcIn(snap, label, ibufSize)
+  for s = 1, ibufSize do
+    local st = snap[s]
+    if st and st.label == label and (st.size or 0) >= 1 then return s end
+  end
+  return nil
+end
+
+loader.totalIn = totalIn
+
+-- ---------------------------------------------------------------------------
 -- THE LOAD SEQUENCE  (runs inside a task; yields freely)
 --
 -- Arguments:
@@ -439,40 +487,8 @@ function loader.run(mod, job, deps)
     return snapshotSide(mod, side, from, count)
   end
 
-  local function totalIn(snap, from, to, label)
-    local total = 0
-    for s = from, to do
-      local st = snap[s]
-      if st and st.label == label then total = total + (st.size or 0) end
-    end
-    return total
-  end
-
-  -- Where should the next transfer land? Prefer a partly filled stack of this
-  -- item, otherwise the first empty slot. Returns the slot and the room in it.
-  local function destIn(snap, label)
-    local firstEmpty
-    for s = 2, busSlots do
-      local st = snap[s]
-      if not st or (st.size or 0) == 0 then
-        firstEmpty = firstEmpty or s
-      elseif st.label == label then
-        local cap  = st.maxSize or STACK_DEFAULT
-        local room = cap - (st.size or 0)
-        if room > 0 then return s, room end
-      end
-    end
-    if firstEmpty then return firstEmpty, STACK_DEFAULT end
-    return nil, 0
-  end
-
-  local function srcIn(snap, label)
-    for s = 1, ibufSize do
-      local st = snap[s]
-      if st and st.label == label and (st.size or 0) >= 1 then return s end
-    end
-    return nil
-  end
+  local function destIn(snap, label) return loader.destIn(snap, label, busSlots) end
+  local function srcIn(snap, label)  return loader.srcIn(snap, label, ibufSize) end
 
   -- Kept for the failure messages, which run once and are not hot.
   local function busTotal(label)
@@ -580,6 +596,151 @@ function loader.run(mod, job, deps)
   stats.startedWith = { tips = TIPS_START, rods = RODS_START }
   stats.bufferTarget = { tips = TIPS_PER, rods = RODS_PER }
   return true, stats
+end
+
+-- ---------------------------------------------------------------------------
+-- TOP UP A RUNNING MODULE  (one pass, one pair of reads)
+--
+-- The broker calls this every PIN_RESTOCK_INTERVAL for a module that is mining:
+-- forever for a pinned one, and until the buffer is full for everyone else.
+--
+-- IT LIVES HERE BECAUSE IT IS THE SAME JOB AS drain(), AND IT USED TO BE WRITTEN
+-- TWICE. The broker's version asked the hardware the same question over and over
+-- inside a single pass -- count the bus, find a destination, wait, find the
+-- source, find the destination AGAIN, count the bus AGAIN -- four reads of one
+-- inventory per consumable, and it ran that for tips and rods separately. Up to
+-- ~30 metered calls per module every three seconds, against the same per-tick
+-- budget six loaders are queueing for. That is the exact cost drain() was
+-- rewritten to avoid, and the comment at the top of this file explains why it
+-- mattered the first time.
+--
+-- The shape is drain()'s: read each inventory ONCE, decide everything from the
+-- snapshots, and update them in place after a transfer so a second consumable in
+-- the same pass cannot pick the slot the first just filled. What a transfer
+-- moved is known from its return value, so the final "did we reach target?" is
+-- arithmetic rather than another read.
+--
+--   mod     the module table (conf, transposer, iface, status)
+--   wanted  array of { label, target, cfgSlot, dbSlot }
+--   dbAddr  database component address, for setInterfaceConfiguration
+--
+-- Returns (results, totals, moved):
+--   results[i]  "done" | "nofit" | "partial" for wanted[i]
+--   totals[label]  how many are in the bus now
+--   moved       true if anything actually transferred this pass
+--
+-- STANDING ORDERS ARE LEFT IN PLACE on "partial", and that is deliberate --
+-- see the broker's note on why clearing them threw away the network's progress
+-- every pass. They are cleared on "done"; stepDone clears everything at run end.
+-- ---------------------------------------------------------------------------
+local TOPUP_TIMEOUT = 5     -- seconds to wait for the ME to deliver something
+local TOPUP_POLL    = 0.5   -- each check is one call now, not nine
+
+function loader.topUp(mod, wanted, dbAddr)
+  -- Inventory sizes are a property of how the module is built, not a question to
+  -- ask every three seconds. Cached on the module the first time we look.
+  if not mod.ibufSize then
+    mod.ibufSize = mod.transposer.getInventorySize(mod.conf.interfaceSide) or 9
+  end
+  if not mod.busSize then
+    mod.busSize = mod.transposer.getInventorySize(mod.conf.inputBusSide) or 16
+  end
+  local ibufSize, busSize = mod.ibufSize, mod.busSize
+
+  local results, totals, moved = {}, {}, false
+
+  -- READ ONE: the bus. Every total and every destination below comes off this.
+  local busSnap = snapshotSide(mod, mod.conf.inputBusSide, 1, busSize)
+
+  local short = {}
+  for i, w in ipairs(wanted) do
+    local have = totalIn(busSnap, 2, busSize, w.label)
+    totals[w.label] = have
+    if have >= w.target then
+      results[i] = "done"
+      mod.iface.setInterfaceConfiguration(w.cfgSlot)   -- release; nothing owed
+    elseif not loader.destIn(busSnap, w.label, busSize) then
+      -- Nowhere to put it. A bus with fewer than five usable slots simply cannot
+      -- hold a drone plus two stacks each of tips and rods; retrying every three
+      -- seconds for the whole window achieves nothing.
+      results[i] = "nofit"
+    else
+      results[i] = "partial"
+      short[#short + 1] = { idx = i, w = w, have = have }
+      -- Place the order. One stack at a time: that is all a buffer slot holds.
+      mod.iface.setInterfaceConfiguration(w.cfgSlot, dbAddr, w.dbSlot,
+        math.min(w.target - have, STACK_DEFAULT))
+    end
+  end
+
+  if #short == 0 then return results, totals, moved end
+
+  -- WAIT, then READ TWO: the interface buffer. The predicate keeps the snapshot
+  -- it took, so arriving costs nothing extra -- the old code waited on one scan
+  -- and then immediately scanned again to find what it had just been told about.
+  local bufSnap
+  sched.await(function()
+    bufSnap = snapshotSide(mod, mod.conf.interfaceSide, 1, ibufSize)
+    for _, e in ipairs(short) do
+      if loader.srcIn(bufSnap, e.w.label, ibufSize) then return true end
+    end
+    return false
+  end, TOPUP_TIMEOUT, TOPUP_POLL)
+
+  -- A module that stopped while we waited must not be loaded into.
+  if mod.status ~= "RUNNING" then return results, totals, moved end
+  if not bufSnap then return results, totals, moved end
+
+  for _, e in ipairs(short) do
+    local w = e.w
+    local src = loader.srcIn(bufSnap, w.label, ibufSize)
+    if src then
+      local dst, room = loader.destIn(busSnap, w.label, busSize)
+      if dst then
+        local want = math.min(w.target - e.have, room)
+        local got  = mod.transposer.transferItem(
+          mod.conf.interfaceSide, mod.conf.inputBusSide, want, src, dst)
+        if (got or 0) > 0 then
+          moved = true
+          -- Keep both snapshots honest, exactly as drain() does: the next
+          -- consumable in this same pass reads them.
+          local d = busSnap[dst]
+          if d then d.size = (d.size or 0) + got
+          else busSnap[dst] = { label = w.label, size = got, maxSize = STACK_DEFAULT } end
+          local sst = bufSnap[src]
+          if sst then
+            sst.size = (sst.size or 0) - got
+            if sst.size <= 0 then bufSnap[src] = nil end
+          end
+
+          -- THE INVARIANT: "done" IS ONLY EVER DECIDED FROM A READ.
+          --
+          -- It is tempting to say `have + got >= target, so we are finished` and
+          -- skip a read. That is wrong, and subtly: the module is RUNNING. It
+          -- has been consuming tips and rods this whole pass, including through
+          -- the await above, so the count we started from is already old and
+          -- have + got overstates what is really in the bus.
+          --
+          -- Overstating it matters because "done" latches. restockRunning
+          -- returns settled, stepRunning sets mod.bufferFilled, and an unpinned
+          -- module then stops topping up for the rest of the run -- so a buffer
+          -- reported full at 64 but actually holding 59 stays at 59.
+          --
+          -- So a pass that moved anything reports "partial", whatever the
+          -- arithmetic says, and the NEXT pass decides from a fresh read three
+          -- seconds later. That costs no component calls at all -- the read it
+          -- defers to is the one the next pass was going to make anyway -- and
+          -- it is strictly more accurate than the code this replaced, which
+          -- re-read the bus but still could not see what was consumed after it.
+          --
+          -- `totals` is reported as the best estimate for the log line only.
+          totals[w.label] = e.have + got
+        end
+      end
+    end
+  end
+
+  return results, totals, moved
 end
 
 loader.dbSlotsFor = dbSlotsFor  -- exported for the broker's UI/return logic
