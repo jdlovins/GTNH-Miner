@@ -509,6 +509,73 @@ world({}, { holding("uhv", "naquadah") }, 990, { naquadah = { kits = 0 } })
 ck("held kits count as free",          availableKits(true).naquadah, 64)
 
 -- =============================================================================
+section("applyHwStock -- a tier that hits zero has to come back")
+-- =============================================================================
+-- Lifted out of the broker source the same way availableDrones is above.
+--
+-- The bug: hw_telem sent only non-zero counts and the broker MERGED them, so a
+-- tier that ran to zero simply stopped being mentioned and kept its last value
+-- forever. tryDispatch's only guard against handing out a drone the network
+-- does not hold is brokerState.drones[key] <= 0, so a frozen count meant a
+-- surplus module was dispatched, timed out fetching a drone that was not there,
+-- errored, recovered, and repeated -- which is exactly what was seen in world
+-- with 10 LuV drones, 11 modules, and the panel insisting on 7.
+local stockSrc = broker:match("(local function applyHwStock.-\n)end\n\n")
+ck("applyHwStock extracted", stockSrc ~= nil, true)
+
+local senv = {
+  pairs = pairs, ipairs = ipairs, type = type, tonumber = tonumber,
+  config = { droneKeyOrder = { "luv", "uhv", "zpm" } },
+  drillKeyOrder = { "steel", "naquadah" },
+}
+local applyHwStock = assert(load(
+  stockSrc .. "end\nreturn applyHwStock", "stock", "t", senv))()
+
+local st = { drones = { luv = 7, uhv = 2, zpm = 0 },
+             drills = { steel = { kits = 9, tips = 9, rods = 9 } } }
+
+-- A payload naming luv sets it. Ordinary case, and the one that always worked.
+applyHwStock(st, { drones = { luv = 3, uhv = 2 }, drills = {} })
+ck("present tier takes value", st.drones.luv, 3)
+
+-- THE BUG. luv is absent because the network holds none; it must read 0, not 3.
+applyHwStock(st, { drones = { uhv = 2 }, drills = {} })
+ck("absent tier reads zero",  st.drones.luv, 0)
+ck("other tiers unharmed",    st.drones.uhv, 2)
+
+-- Same for drills: a material that runs out must stop being counted.
+applyHwStock(st, { drones = {}, drills = { naquadah = { kits = 4, tips = 5, rods = 4 } } })
+ck("absent drill zeroes",     st.drills.steel.kits, 0)
+ck("absent drill is a table", type(st.drills.steel), "table")
+ck("present drill kits",      st.drills.naquadah.kits, 4)
+ck("present drill tips",      st.drills.naquadah.tips, 5)
+
+-- A node naming something we do not know must not get it into a table dispatch
+-- reads, and must not stop the known keys being applied.
+applyHwStock(st, { drones = { luv = 1, nosuchtier = 99 }, drills = {} })
+ck("unknown key ignored",     st.drones.nosuchtier, nil)
+ck("known key still applied", st.drones.luv, 1)
+
+-- A malformed or absent section leaves that half alone rather than blanking it.
+applyHwStock(st, { drills = {} })
+ck("missing drones section",  st.drones.luv, 1)
+applyHwStock(st, nil)
+ck("nil payload survives",    st.drones.luv, 1)
+
+-- And the other half of the fix: the node has to actually send its zeroes, or
+-- an un-upgraded broker keeps freezing. Source-checked, since hw_telem cannot
+-- be loaded here.
+do
+  local hw = slurp("hw_telem.lua")
+  local body = hw:match("local function buildPayload%(assets%)(.-)\n  local crafting")
+  ck("payload body found",   body ~= nil, true)
+  ck("drones sent uncounted", body:find("if count > 0", 1, true), nil)
+  ck("kits sent uncounted",   body:find("if kits > 0", 1, true), nil)
+  ck("drones default to 0",
+     body:find("payload.drones[key] = assets.drones[key] or 0", 1, true) ~= nil, true)
+end
+
+-- =============================================================================
 section("loader.topUp -- component calls per restock pass")
 -- =============================================================================
 -- This is a PERFORMANCE test with teeth. The broker tops up every running module

@@ -760,17 +760,27 @@ drawStaticFrame()
 local lastAssets = { drones={}, drillTips={}, drillRods={} }
 
 -- Helper to build payload from assets
+-- EVERY KEY, INCLUDING THE ZEROES.
+--
+-- These used to be sent only when non-zero, which sounds like a harmless
+-- economy and is not: the broker MERGES this table into its own, so a tier that
+-- stops being sent keeps its last value forever. The moment the last LuV drone
+-- left the network the broker went on believing there were seven, handed the
+-- surplus module a job it could never load, and repeated that until it was
+-- restarted.
+--
+-- A zero is a fact about the network and has to travel like one. dust_telem
+-- (stocks[name] or 0 over the whole watchlist) and fluid_telem (PLASMA_ORDER
+-- seeded to 0) have always sent theirs; this node was the odd one out.
 local function buildPayload(assets)
   local payload = { drones={}, drills={} }
   for _, key in ipairs(droneKeys) do
-    local count = assets.drones[key] or 0
-    if count > 0 then payload.drones[key] = count end
+    payload.drones[key] = assets.drones[key] or 0
   end
   for _, key in ipairs(drillKeyOrder) do
     local tips = assets.drillTips[key] or 0
     local rods = assets.drillRods[key] or 0
-    local kits = math.min(tips, rods)
-    if kits > 0 then payload.drills[key] = { kits=kits, tips=tips, rods=rods } end
+    payload.drills[key] = { kits = math.min(tips, rods), tips = tips, rods = rods }
   end
   -- Ride the existing HW_UPDATE rather than opening a second channel: the broker
   -- already parses this message, so restock state costs no new listener. Only

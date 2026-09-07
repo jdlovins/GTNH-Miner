@@ -1695,6 +1695,54 @@ end
 -- TELEMETRY
 -- =============================================================================
 
+-- ---------------------------------------------------------------------------
+-- HARDWARE STOCK: REPLACE, DO NOT MERGE.
+--
+-- This was `for k, v in pairs(data.drones) do state.drones[k] = v end`, and the
+-- combination of that with a node that only sent non-zero counts meant A TIER
+-- THAT REACHED ZERO NEVER CAME BACK. Once the last LuV drone was committed, the
+-- node stopped mentioning luv, the merge had nothing to overwrite the old 7
+-- with, and the broker believed in seven drones that did not exist until it was
+-- restarted.
+--
+-- What that cost: tryDispatch's only guard against handing out a drone the
+-- network does not physically hold is `brokerState.drones[droneKey] <= 0`. With
+-- the count frozen high that guard never fires, so a surplus module was
+-- dispatched, waited out ARRIVE_TIMEOUT for a drone that was not there, failed
+-- to ERROR, recovered, and went round again forever.
+--
+-- hw_telem now sends its zeroes, which fixes this from the other end. Both
+-- halves are here on purpose: this one also covers an un-upgraded node, and
+-- that one covers an un-upgraded broker. Neither should have to trust the
+-- other to be current.
+--
+-- Keyed off the config lists rather than off the payload, so a node sending a
+-- key we do not know cannot inject it into a table dispatch reads.
+-- ---------------------------------------------------------------------------
+local function applyHwStock(state, data)
+  if type(data) ~= "table" then return end
+
+  if type(data.drones) == "table" then
+    for _, key in ipairs(config.droneKeyOrder) do
+      state.drones[key] = tonumber(data.drones[key]) or 0
+    end
+  end
+
+  if type(data.drills) == "table" then
+    for _, key in ipairs(drillKeyOrder) do
+      local d = data.drills[key]
+      -- An absent material is zero of it, not "no opinion". Written out rather
+      -- than left nil because every reader does (d and d.kits) or 0 and a nil
+      -- would work by accident -- until one of them stopped guarding.
+      state.drills[key] = (type(d) == "table")
+        and { kits = tonumber(d.kits) or 0,
+              tips = tonumber(d.tips) or 0,
+              rods = tonumber(d.rods) or 0 }
+        or  { kits = 0, tips = 0, rods = 0 }
+    end
+  end
+end
+
 -- Bumped whenever anything the editor DISPLAYS changes: the row list itself,
 -- what is tracked, a target, or the dust stock behind the HAVE column.
 --
@@ -1782,9 +1830,8 @@ local function processMessage(evType, _, _, _, _, rawMsg)
     brokerState.lastFluidSyncTime = computer.uptime()
     brokerState.lastFluidSync = os.date("%X")
   elseif msg.payloadType == "HW_UPDATE" then
-    if msg.data.drones then for k, v in pairs(msg.data.drones) do brokerState.drones[k] = v end end
-    if msg.data.drills then for k, v in pairs(msg.data.drills) do brokerState.drills[k] = v end end
-    -- Replaced wholesale, not merged like the two above. The node sends its
+    applyHwStock(brokerState, msg.data)
+    -- Replaced wholesale, like the stock tables above. The node sends its
     -- complete set of outstanding orders every cycle, so assignment is what
     -- lets a resolved entry clear itself -- merging would pin a "nopattern"
     -- warning on screen forever after you added the pattern.
