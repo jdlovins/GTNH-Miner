@@ -709,6 +709,63 @@ for _, why in ipairs({ "takes tier", "none free", "kits %d < %d" }) do
 end
 
 -- =============================================================================
+section("header buttons -- SETTINGS and PAUSE, clickable and keyable")
+-- =============================================================================
+-- Source assertions: the dashboard needs a GPU, a screen and six modules, none
+-- of which exist here. What is worth pinning down is the wiring, because every
+-- one of these is silent when wrong -- a button that draws and does nothing
+-- looks exactly like a button that works.
+local uiSrc = slurp("broker-mk3.lua")
+
+-- A click arrives as "touch", and both buttons have to be reachable from it.
+ck("touch is handled",       uiSrc:find('e1 == "touch"', 1, true) ~= nil, true)
+ck("settings is clickable",  uiSrc:find("btnHit(BTN_SETTINGS", 1, true) ~= nil, true)
+ck("pause is clickable",     uiSrc:find("btnHit(BTN_PAUSE", 1, true) ~= nil, true)
+
+-- Keys stay, and are not optional: a tier 1 screen cannot report a touch, so a
+-- button-only control would be unreachable on it.
+ck("E still opens settings", uiSrc:find("e3 == 101", 1, true) ~= nil, true)
+ck("P toggles pause",        uiSrc:find("e3 == 112 or e3 == 80", 1, true) ~= nil, true)
+
+-- Both entry points must start the SAME countdown. Two copies of the quiesce
+-- deadlines is two things to get wrong, and getting it wrong opens the editor
+-- on top of a load that is still moving items.
+ck("one quiesce starter",    select(2, uiSrc:gsub("openAt = up %+ config%.quiesceSeconds", "")), 1)
+ck("key calls it",           uiSrc:find("-- \"e\"\n    -- Do not open yet: start quiescing. See QUIESCING above.\n    requestEditor()", 1, true) ~= nil, true)
+
+-- The pause has to actually gate dispatch, beside the other reasons not to
+-- start work rather than inside dispatchBatch -- it is the same kind of
+-- condition as the editor gates next to it.
+ck("pause gates dispatch",   uiSrc:find("and not dispatchPaused", 1, true) ~= nil, true)
+ck("gate is in the loop",    uiSrc:find("and not dispatchPaused", 1, true)
+                             > uiSrc:find("local function mainLoop", 1, true), true)
+
+-- Paused stops NEW work only. Nothing may reach setWorkAllowed(false) or the
+-- module lifecycle from the toggle: a running module holds a drone and a kit,
+-- and cancelling its run wastes both.
+ck("pause interrupts nothing",
+   uiSrc:match("local function togglePause.-\nend"):find("setWorkAllowed", 1, true) == nil, true)
+
+-- It is session state, not a setting. A stored pause comes back after a restart
+-- as a broker that silently refuses to dispatch, which is indistinguishable
+-- from a broken one.
+ck("pause is not a setting", slurp("settings.lua"):find("dispatchPaused", 1, true) == nil, true)
+ck("pause starts off",       uiSrc:find("local dispatchPaused = false", 1, true) ~= nil, true)
+
+-- The button says what it DOES, so the label has to follow the state.
+ck("label follows state",
+   uiSrc:find('dispatchPaused and "RESUME" or "PAUSE"', 1, true) ~= nil, true)
+-- Fixed width, or switching back from the longer label leaves its tail on
+-- screen: dashRow only clears the width it is handed.
+ck("buttons are equal width",
+   uiSrc:match("BTN_SETTINGS = { x = %d+,%s+w = (%d+) }"),
+   uiSrc:match("BTN_PAUSE%s+= { x = %d+,%s+w = (%d+) }"))
+-- Their cache slots must sit outside the three panel bands, which
+-- dashInvalidateRows drops wholesale for the rows the quiesce box covers.
+ck("button slots are their own",
+   uiSrc:find("SLOT_BTN_E, SLOT_BTN_P, SLOT_BTN_S = 9003, 9004, 9005", 1, true) ~= nil, true)
+
+-- =============================================================================
 section("applyHwStock -- a tier that hits zero has to come back")
 -- =============================================================================
 -- Lifted out of the broker source the same way availableDrones is above.

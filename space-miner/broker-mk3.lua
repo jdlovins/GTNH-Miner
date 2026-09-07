@@ -405,6 +405,40 @@ local PW = P2 - 2
 -- it is fully shown; without this the overflow was simply invisible.
 local dustScroll = 0
 
+-- Dispatch pause. Stops the broker STARTING work; it never interrupts a module
+-- already mining, which is the same bargain the editor's quiesce makes and for
+-- the same reason -- a drone and a kit are already committed, and dropping the
+-- run wastes both.
+--
+-- Session state, not a setting. "I am standing here doing maintenance" is not
+-- something a restart should remember, and a broker that came back up silently
+-- refusing to dispatch would look exactly like a broken one.
+local dispatchPaused = false
+
+-- Header buttons, on the row between the title and the panel headings.
+--
+-- OpenComputers delivers a screen click as a "touch" signal carrying the cell
+-- it landed in, so a button here is a rectangle of text plus its bounds --
+-- there is no widget layer to hang one off and nothing to register.
+--
+-- Fixed widths, because the pause button's label changes length: sized to its
+-- text it would leave the tail of "RESUME" on screen after switching back to
+-- "PAUSE", since dashRow only clears the width it is given.
+--
+-- Both buttons keep their key equivalents (E and P). A tier 1 screen cannot
+-- report a touch at all, so a button is the second way in, never the only one.
+local BTN_Y        = 3
+local BTN_SETTINGS = { x = 2,  w = 12 }
+local BTN_PAUSE    = { x = 16, w = 12 }
+local BTN_STATUS_X = 30
+-- Clamped to the screen: a tier 1 display is 50 columns, and a status strip
+-- sized for a tier 3 one would be asking gpu.fill to write past the edge.
+local BTN_STATUS_W = math.max(0, math.min(40, W - BTN_STATUS_X))
+
+local function btnHit(b, x, y)
+  return y == BTN_Y and x and x >= b.x and x < b.x + b.w
+end
+
 -- Every interval from here down is REAL SECONDS against computer.uptime().
 -- They used to be compared against os.time(), which in OpenOS is world time, not
 -- real time -- so "0.2" and "10" were in a unit nobody had established and the
@@ -1955,6 +1989,10 @@ local dashCache, dashFG = {}, nil
 -- and allocates nothing.
 local SLOT_M, SLOT_D, SLOT_H = 0, 1000, 2000
 local SLOT_SYNC, SLOT_DTAG   = 9001, 9002
+-- The header buttons. Outside the three panel bands on purpose: they sit above
+-- the panels, so dashInvalidateRows -- which only drops the panel slots for the
+-- rows the quiesce box covers -- must not touch them.
+local SLOT_BTN_E, SLOT_BTN_P, SLOT_BTN_S = 9003, 9004, 9005
 
 -- Counts rows actually repainted. The quiesce box needs to know whether the
 -- panels have drawn over it, and "did anything paint" is cheaper to answer than
@@ -2536,8 +2574,38 @@ local function drawStaticFrame()
   end
 end
 
+-- Centre a label inside a button's fixed width. The brackets are the only thing
+-- on this screen that says "pressable", so they are not decoration.
+local function btnLabel(b, text)
+  local pad  = math.max(0, (b.w - 2) - #text)
+  local left = math.floor(pad / 2)
+  return "[" .. string.rep(" ", left) .. text .. string.rep(" ", pad - left) .. "]"
+end
+
+-- Cached like every other row, so a settled dashboard repaints neither button.
+local function drawButtons()
+  dashRow(SLOT_BTN_E, BTN_SETTINGS.x, BTN_SETTINGS.w, BTN_Y,
+          btnLabel(BTN_SETTINGS, "SETTINGS"), 0x00AAFF)
+  -- The button says what pressing it DOES; the text beside it says what the
+  -- broker is doing. A button labelled with the current state reads exactly
+  -- backwards half the time, and there is no room here for a legend.
+  dashRow(SLOT_BTN_P, BTN_PAUSE.x, BTN_PAUSE.w, BTN_Y,
+          btnLabel(BTN_PAUSE, dispatchPaused and "RESUME" or "PAUSE"),
+          dispatchPaused and 0x00FF00 or 0xFFAA00)
+  if dispatchPaused then
+    dashRow(SLOT_BTN_S, BTN_STATUS_X, BTN_STATUS_W, BTN_Y,
+            "DISPATCH PAUSED -- running jobs finish", 0xFFAA00)
+  else
+    -- Not blank: the keys are the fallback for a screen that cannot report a
+    -- touch, and nothing else on the dashboard mentions them.
+    dashRow(SLOT_BTN_S, BTN_STATUS_X, BTN_STATUS_W, BTN_Y,
+            "or press E / P", 0x555555)
+  end
+end
+
 local function drawUI()
   if not gpu then return end
+  drawButtons()
   -- Cached like every other row: the clock only changes once a second, and the
   -- dashboard repaints four times a second.
   -- Keyed on the integer second, so os.date and the concatenation run once a
@@ -2788,6 +2856,28 @@ local edPending = nil        -- { openAt, hardAt } while counting down
 local edPendingShown = nil   -- last text painted, so we only repaint on change
 local edPendingPaints = -1   -- dashPaints when we last drew it, to detect damage
 
+-- Asking for the editor, from the key or the button. One function because the
+-- two entry points must start the SAME countdown -- a second copy of these two
+-- deadlines is a second thing to get wrong, and getting it wrong opens the
+-- editor while a load is still moving items.
+local function requestEditor()
+  local up = computer.uptime()
+  edPending = { openAt = up + config.quiesceSeconds,
+                hardAt = up + config.quiesceSeconds + config.quiesceGrace }
+  edPendingShown = nil
+end
+
+-- Toggle dispatch, from the key or the button. Logged either way, and with
+-- which one, because a broker that has stopped taking work looks identical to a
+-- broker with nothing to do -- and the log is where you go to tell them apart
+-- an hour later.
+local function togglePause(how)
+  dispatchPaused = not dispatchPaused
+  logger:info("[UI] dispatch " .. (dispatchPaused and "PAUSED" or "resumed") ..
+              " (" .. how .. ")")
+  lastUIDraw = 0   -- repaint the button now, do not wait for the tick
+end
+
 -- How many modules are still doing component-heavy work.
 --
 -- DONE counts as well as LOADING: that state returns leftover tips and rods to
@@ -2824,7 +2914,7 @@ local function drawQuiesce(line1, line2)
   gpu.setForeground(0x888888)
   gpu.set(x + math.max(0, math.floor((w - #line2) / 2)), y + 2, line2)
   gpu.setForeground(0x555555)
-  local hint = "tab or q to cancel"
+  local hint = "tab or q to cancel, or click SETTINGS again"
   gpu.set(x + math.max(0, math.floor((w - #hint) / 2)), y + 3, hint)
   -- Only the rows this box covers are now misdescribed by the cache. Dropping
   -- the whole thing here is what created the repaint loop above.
@@ -3045,12 +3135,31 @@ while true do
       lastUIDraw = 0                      -- repaint now, do not wait for the tick
     end
 
+  elseif e1 == "touch" then
+    -- signal = "touch", screenAddr, x, y, button, player
+    if btnHit(BTN_SETTINGS, e3, e4) then
+      if edPending then
+        -- The countdown's own cancel. A screen driven by clicks has no tab or
+        -- q to press, so the button that started it has to be able to call it
+        -- off -- otherwise a mis-click commits you to the editor.
+        edPending, edPendingShown = nil, nil
+        lastUIDraw = 0
+      else
+        requestEditor()
+      end
+    elseif btnHit(BTN_PAUSE, e3, e4) then
+      togglePause("click")
+    end
+
   elseif e1 == "key_down" and e3 == 101 and not edPending then  -- "e"
     -- Do not open yet: start quiescing. See QUIESCING above.
-    local up = computer.uptime()
-    edPending = { openAt = up + config.quiesceSeconds,
-                  hardAt = up + config.quiesceSeconds + config.quiesceGrace }
-    edPendingShown = nil
+    requestEditor()
+
+  elseif e1 == "key_down" and (e3 == 112 or e3 == 80) then  -- "p" / "P"
+    -- Works during the editor countdown too: pausing dispatch and opening the
+    -- editor are not alternatives, and a countdown is exactly when you have
+    -- decided to stop the array.
+    togglePause("key")
 
   elseif e1 == "key_down" and edPending
      and editor.isCancelKey(e3, e4) then
@@ -3183,14 +3292,16 @@ while true do
         and (brokerState.lastFluidSyncTime > 0)
   end
 
-  -- 6. Dispatch on its own cadence -- unless we are quiescing for the editor or
-  --    it is already open. Existing work is never interrupted; we simply stop
-  --    starting more, so the broker drains to idle and stays there.
+  -- 6. Dispatch on its own cadence -- unless we are quiescing for the editor, it
+  --    is already open, or someone has paused. Existing work is never
+  --    interrupted; we simply stop starting more, so the broker drains to idle
+  --    and stays there.
   local now = computer.uptime()
   -- `not nodeFault()` sits here beside the other gates rather than inside
   -- dispatchBatch, because it is the same kind of condition as the two next to
   -- it: a reason not to start new work, not a rule about how work is chosen.
   if brokerState.telemetryReady and not editor.isOpen() and not edPending
+     and not dispatchPaused
      and not nodeFault()
      and (now - lastDispatchCheck >= config.dispatchInterval) then
     dispatchBatch()
