@@ -429,6 +429,33 @@ read-back and waits on ME delivery (the arrive timeout alone is 15s per item), s
 a healthy load on a laggy server can easily outlast a short grace — and opening
 early lands you in exactly the contention this exists to avoid.
 
+### `hotkeyEditor` / `hotkeyPause`
+
+The dashboard has two controls, each reachable two ways: the header buttons
+`[ SETTINGS ]` and `[ PAUSE ]` / `[ RESUME ]`, or the keys `E` and `P`. These two
+settings switch the **keys** off, one at a time. The buttons are never gated on
+them — that combination would leave no way in at all.
+
+They exist because the broker's screen is a block in a world with other people in
+it. Anyone standing at the keyboard can open the editor or stop the array by
+leaning on one key; a button needs a deliberate click on the right few cells.
+
+**`hotkeyEditor` can lock you out, and nothing in the code can stop it.** A tier 1
+screen cannot report a click at all, so with the key off there is no way back into
+the page that would turn it on. The fix is to edit `hotkeyEditor = true` into
+`/home/user_config.lua` by hand. The broker prints this at boot, every boot, while
+it is off.
+
+Cancelling the editor countdown (`tab` / `q`, or clicking `SETTINGS` again) is
+**not** gated by `hotkeyEditor`: the box is already up, and a countdown you cannot
+stop is a worse outcome than the keyboard-leaning the setting exists to prevent.
+
+Pausing stops the broker *starting* jobs. It never interrupts a module already
+mining — that module holds a drone and a kit, and cancelling the run wastes both —
+so the array drains to idle and stays there. It is session state and resets on
+restart, because a broker that comes back up silently refusing to dispatch looks
+exactly like a broken one.
+
 ---
 
 ## Logging

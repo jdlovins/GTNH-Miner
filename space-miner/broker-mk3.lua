@@ -439,6 +439,14 @@ local function btnHit(b, x, y)
   return y == BTN_Y and x and x >= b.x and x < b.x + b.w
 end
 
+-- How to open the editor right now, in words. Any message that tells someone to
+-- go and change a setting has to name a way in that actually works -- "press E"
+-- is a dead end once the key is switched off.
+local function editorWayIn()
+  if config.hotkeyEditor then return "press E, or click SETTINGS" end
+  return "click SETTINGS on the header"
+end
+
 -- Every interval from here down is REAL SECONDS against computer.uptime().
 -- They used to be compared against os.time(), which in OpenOS is world time, not
 -- real time -- so "0.2" and "10" were in a unit nobody had established and the
@@ -2490,7 +2498,8 @@ local function drawHWPanel()
     -- it: a fresh install otherwise dispatches nothing and says nothing about
     -- why.
     if seenTotal > 0 then
-      putf(0xFFAA00, "  network sees %d -- set them on the HARDWARE page (E)", seenTotal)
+      putf(0xFFAA00, "  network sees %d -- set them on the HARDWARE page (%s)",
+           seenTotal, config.hotkeyEditor and "E" or "SETTINGS")
     end
   end
 
@@ -2597,9 +2606,16 @@ local function drawButtons()
             "DISPATCH PAUSED -- running jobs finish", 0xFFAA00)
   else
     -- Not blank: the keys are the fallback for a screen that cannot report a
-    -- touch, and nothing else on the dashboard mentions them.
-    dashRow(SLOT_BTN_S, BTN_STATUS_X, BTN_STATUS_W, BTN_Y,
-            "or press E / P", 0x555555)
+    -- touch, and nothing else on the dashboard mentions them. Names only the
+    -- ones that are switched on -- a hint for a key that does nothing is worse
+    -- than no hint, because it sends you looking for a broken keyboard.
+    local keys
+    if config.hotkeyEditor and config.hotkeyPause then keys = "or press E / P"
+    elseif config.hotkeyEditor                     then keys = "or press E"
+    elseif config.hotkeyPause                      then keys = "or press P"
+    else                                                keys = "buttons only"
+    end
+    dashRow(SLOT_BTN_S, BTN_STATUS_X, BTN_STATUS_W, BTN_Y, keys, 0x555555)
   end
 end
 
@@ -2763,8 +2779,22 @@ local function initModules()
   for _, n in pairs(config.droneStock or {}) do declared = declared + (tonumber(n) or 0) end
   if declared == 0 then
     local line = "No drones declared -- nothing will dispatch. Set how many you own on " ..
-                 "the editor's HARDWARE page (press E). Drone counts are configured now " ..
-                 "rather than read from the hw node, which can only see the ME network."
+                 "the editor's HARDWARE page (" .. editorWayIn() .. "). Drone counts are " ..
+                 "configured now rather than read from the hw node, which can only see " ..
+                 "the ME network."
+    logger:warn("[STARTUP] " .. line)
+    print(line)
+  end
+
+  -- The editor key is switchable, and switching it off on a screen that cannot
+  -- report a click leaves no way back into the page that would switch it on.
+  -- Nothing here can detect that -- a screen's tier is not something the GPU
+  -- will answer for -- so say it at boot, every boot, while the console is still
+  -- the thing being looked at.
+  if not config.hotkeyEditor then
+    local line = "Editor key (E) is OFF -- the SETTINGS button on the header is the only " ..
+                 "way in. If this screen does not respond to clicks, set hotkeyEditor " ..
+                 "back to true in /home/user_config.lua."
     logger:warn("[STARTUP] " .. line)
     print(line)
   end
@@ -2915,6 +2945,9 @@ local function drawQuiesce(line1, line2)
   gpu.set(x + math.max(0, math.floor((w - #line2) / 2)), y + 2, line2)
   gpu.setForeground(0x555555)
   local hint = "tab or q to cancel, or click SETTINGS again"
+  -- The cancel keys are not the editor hotkey and stay live either way: this box
+  -- is already up, and stranding someone inside a countdown they cannot stop is
+  -- a worse outcome than the keyboard-fiddling the setting exists to prevent.
   gpu.set(x + math.max(0, math.floor((w - #hint) / 2)), y + 3, hint)
   -- Only the rows this box covers are now misdescribed by the cache. Dropping
   -- the whole thing here is what created the repaint loop above.
@@ -3151,11 +3184,13 @@ while true do
       togglePause("click")
     end
 
-  elseif e1 == "key_down" and e3 == 101 and not edPending then  -- "e"
+  elseif e1 == "key_down" and e3 == 101 and config.hotkeyEditor
+     and not edPending then  -- "e"
     -- Do not open yet: start quiescing. See QUIESCING above.
     requestEditor()
 
-  elseif e1 == "key_down" and (e3 == 112 or e3 == 80) then  -- "p" / "P"
+  elseif e1 == "key_down" and (e3 == 112 or e3 == 80)
+     and config.hotkeyPause then  -- "p" / "P"
     -- Works during the editor countdown too: pausing dispatch and opening the
     -- editor are not alternatives, and a countdown is exactly when you have
     -- decided to stop the array.

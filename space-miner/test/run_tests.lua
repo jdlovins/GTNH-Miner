@@ -722,10 +722,58 @@ ck("touch is handled",       uiSrc:find('e1 == "touch"', 1, true) ~= nil, true)
 ck("settings is clickable",  uiSrc:find("btnHit(BTN_SETTINGS", 1, true) ~= nil, true)
 ck("pause is clickable",     uiSrc:find("btnHit(BTN_PAUSE", 1, true) ~= nil, true)
 
--- Keys stay, and are not optional: a tier 1 screen cannot report a touch, so a
--- button-only control would be unreachable on it.
+-- Keys stay, and each is switchable on its own -- the broker's screen is a block
+-- in a world with other people in it, and leaning on one key should not have to
+-- stop the array.
 ck("E still opens settings", uiSrc:find("e3 == 101", 1, true) ~= nil, true)
 ck("P toggles pause",        uiSrc:find("e3 == 112 or e3 == 80", 1, true) ~= nil, true)
+ck("E obeys its setting",    uiSrc:find("e3 == 101 and config.hotkeyEditor", 1, true) ~= nil, true)
+ck("P obeys its setting",    uiSrc:find("and config.hotkeyPause then", 1, true) ~= nil, true)
+
+-- Both are declared knobs, so they reach the editor page and user_config.lua
+-- through the same path as everything else, and both ship ON.
+for _, key in ipairs({ "hotkeyEditor", "hotkeyPause" }) do
+  local spec = S.byKey[key]
+  ck(key .. " is declared",  spec ~= nil, true)
+  ck(key .. " is a bool",    spec and spec.type, "bool")
+  ck(key .. " defaults on",  spec and spec.default, true)
+  ck(key .. " is on the UI page", spec and spec.group, "ui")
+end
+
+-- The buttons are what is LEFT when a key is off, so a click must never be
+-- gated on a hotkey setting: that combination would leave no way in at all.
+ck("settings click is ungated",
+   uiSrc:find("btnHit(BTN_SETTINGS, e3, e4) and config.hotkey", 1, true) == nil, true)
+ck("pause click is ungated",
+   uiSrc:find("btnHit(BTN_PAUSE, e3, e4) and config.hotkey", 1, true) == nil, true)
+
+-- The hint beside them names only the keys that are live. A hint for a key that
+-- does nothing is worse than no hint: it sends you looking for a broken
+-- keyboard. All four combinations have to be covered, the last one included.
+local hintSrc = uiSrc:match("local function drawButtons.-\nend\n")
+for _, want in ipairs({ '"or press E / P"', '"or press E"', '"or press P"', '"buttons only"' }) do
+  ck("hint covers " .. want, hintSrc:find(want, 1, true) ~= nil, true)
+end
+
+-- Turning the editor key off on a screen that cannot be clicked strands you
+-- outside the page that would turn it back on. Nothing can detect that, so it
+-- has to be said -- at boot, and in a message that names the file to edit.
+ck("lockout is warned",      uiSrc:find("Editor key (E) is OFF", 1, true) ~= nil, true)
+ck("warning names the fix",  uiSrc:find("user_config.lua", 1, true) ~= nil, true)
+
+-- And no message may tell someone to press a key that is switched off. Both
+-- "go and change a setting" lines go through one helper.
+ck("way in is derived",      uiSrc:find("local function editorWayIn", 1, true) ~= nil, true)
+ck("boot uses it",           uiSrc:find("editorWayIn()", 1, true) ~= nil, true)
+ck("no bare press-E left",   uiSrc:find("(press E)", 1, true) == nil, true)
+
+-- The cancel keys are NOT the editor hotkey and stay live regardless: the box is
+-- already up, and a countdown you cannot stop is worse than the keyboard
+-- fiddling the setting exists to prevent.
+ck("cancel is ungated",
+   uiSrc:find("editor.isCancelKey(e3, e4) then", 1, true) ~= nil, true)
+ck("cancel has no hotkey gate",
+   uiSrc:find("config.hotkeyEditor\n     and editor.isCancelKey") == nil, true)
 
 -- Both entry points must start the SAME countdown. Two copies of the quiesce
 -- deadlines is two things to get wrong, and getting it wrong opens the editor

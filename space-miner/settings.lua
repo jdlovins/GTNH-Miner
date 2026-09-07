@@ -168,6 +168,29 @@ S.list = {
   { key = "quiesceGrace", group = "ui", type = "int", default = 60, min = 0, max = 300,
     label = "Editor quiesce grace", help = "extra wait for in-flight loads, then the editor opens regardless" },
 
+  -- The dashboard's two keys, each switchable on its own.
+  --
+  -- They exist because the broker's screen is a block in a world with other
+  -- people in it: anyone standing at the keyboard can open the editor or stop
+  -- the array by leaning on one key. Turning a key off leaves its header button,
+  -- which needs a deliberate click on the right four cells.
+  --
+  -- THE EDITOR KEY CAN LOCK YOU OUT, and nothing here can stop it: a tier 1
+  -- screen cannot report a click, so with hotkeyEditor off there is no way back
+  -- into the editor to turn it on again -- the fix is to edit user_config.lua by
+  -- hand. The broker says so at boot rather than only here, because this line is
+  -- read at the moment you are least likely to believe it.
+  { group = "ui", type = "note",
+    text = "turning the editor key off on a screen that cannot be clicked locks you out of this page" },
+
+  { key = "hotkeyEditor", group = "ui", type = "bool", default = true,
+    label = "Editor key (E)",
+    help  = "off = the SETTINGS button is the only way in; a T1 screen cannot click" },
+
+  { key = "hotkeyPause", group = "ui", type = "bool", default = true,
+    label = "Pause key (P)",
+    help  = "off = only the PAUSE button stops new jobs; running jobs never stop either way" },
+
   -- --- LOGGING -------------------------------------------------------------
   { key = "logging.enabled", group = "logging", type = "bool", default = false,
     label = "Logging enabled", help = "off still writes ERROR/WARN to the file; on adds INFO/DEBUG" },
