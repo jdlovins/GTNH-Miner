@@ -42,14 +42,32 @@ local nodeName = "MEDINA-HWRelay"
 
 -- Hardcoded drone and drill lists (don't load config to save memory)
 local droneKeys = {"max","uxv","umv","uiv","uev","uhv","uv","zpm","luv","iv","ev","hv","mv","lv"}
--- Full ME network labels, including the voltage suffix (mirrors config.drones).
-local droneNames = {
-  max="Mining Drone MK-XIV (MAX)", uxv="Mining Drone MK-XIII (UXV)", umv="Mining Drone MK-XII (UMV)",
-  uiv="Mining Drone MK-XI (UIV)", uev="Mining Drone MK-X (UEV)", uhv="Mining Drone MK-IX (UHV)",
-  uv="Mining Drone MK-VIII (UV)", zpm="Mining Drone MK-VII (ZPM)", luv="Mining Drone MK-VI (LuV)",
-  iv="Mining Drone MK-V (IV)", ev="Mining Drone MK-IV (EV)", hv="Mining Drone MK-III (HV)",
-  mv="Mining Drone MK-II (MV)", lv="Mining Drone MK-I (LV)"
+
+-- The tier and voltage part of each drone label, without the marker.
+--
+-- GTNH renamed that marker -- "MK-IX" on 2.8, "Mk-IX" on 2.9 -- and the label is
+-- how this node counts drones, so getting it wrong reports 0 of every tier and
+-- the broker never dispatches. This node cannot work out which spelling to use:
+-- it holds an ME controller and nothing else, loads no config.lua by design, and
+-- an item name has nothing to probe. So the broker sends it with DRILL_PAR, the
+-- same way it sends drillCraftSlots, and droneNames is rebuilt when it arrives.
+local droneModels = {
+  max="XIV (MAX)", uxv="XIII (UXV)", umv="XII (UMV)",
+  uiv="XI (UIV)",  uev="X (UEV)",    uhv="IX (UHV)",
+  uv="VIII (UV)",  zpm="VII (ZPM)",  luv="VI (LuV)",
+  iv="V (IV)",     ev="IV (EV)",     hv="III (HV)",
+  mv="II (MV)",    lv="I (LV)"
 }
+
+-- Reverse of droneModels, for the full-scan fallback: "IX (UHV)" -> "uhv".
+local droneKeyByModel = {}
+for key, model in pairs(droneModels) do droneKeyByModel[model] = key end
+
+-- Defaults to the 2.9 spelling rather than the older one, so a fresh install on
+-- the current pack is right from the first scan even if the broker never comes
+-- up. A 2.8 fleet reads zero for one cycle and corrects on the first DRILL_PAR.
+local droneMark  = "Mk"
+local droneNames = {}
 
 -- Map drone keys to their voltage tiers
 local droneVoltages = {
@@ -464,16 +482,30 @@ local gc = type(collectgarbage) == "function" and collectgarbage or function() e
 
 -- Every label worth asking about, and where its count belongs in `assets`.
 -- Built from the tables above so there is still exactly one list of names.
+--
+-- assets.drones is keyed by drone KEY ("uhv"), not by label. It used to be keyed
+-- by the full label, which meant the marker rename reached the dashboard and the
+-- payload as well as the query -- three places to get right instead of one. The
+-- label is now purely the thing we ask the network, and rebuilding it on a
+-- droneMark change touches nothing else.
 local scanTargets = {}
-for _, key in ipairs(droneKeys) do
-  local label = droneNames[key]
-  -- assets.drones is keyed by full label (updateDashboard looks it up that way).
-  scanTargets[#scanTargets + 1] = { label = label, bucket = "drones", key = label }
+
+local function rebuildDroneLabels()
+  for _, key in ipairs(droneKeys) do
+    droneNames[key] = "Mining Drone " .. droneMark .. "-" .. droneModels[key]
+  end
+  scanTargets = {}
+  for _, key in ipairs(droneKeys) do
+    scanTargets[#scanTargets + 1] =
+      { label = droneNames[key], bucket = "drones", key = key }
+  end
+  for _, label in ipairs(drillLabels) do
+    local bucket = string.find(label, "Drill Tip", 1, true) and "drillTips" or "drillRods"
+    scanTargets[#scanTargets + 1] = { label = label, bucket = bucket, key = drillLookup[label] }
+  end
 end
-for _, label in ipairs(drillLabels) do
-  local bucket = string.find(label, "Drill Tip", 1, true) and "drillTips" or "drillRods"
-  scanTargets[#scanTargets + 1] = { label = label, bucket = bucket, key = drillLookup[label] }
-end
+
+rebuildDroneLabels()
 
 -- More entries than any single label could plausibly occupy. A filtered query
 -- that comes back bigger than this was not filtered at all.
@@ -554,7 +586,13 @@ local function scanFull()
   for _, item in ipairs(itemList) do
     if item.label then
       if string.find(item.label, "Mining Drone", 1, true) then
-        assets.drones[item.label] = (assets.drones[item.label] or 0) + item.size
+        -- Marker-insensitive on purpose, and only here. The filtered path has to
+        -- name an exact label because the match happens on the Java side, but
+        -- this path is already holding the network's own string -- so it can
+        -- accept either spelling and cost nothing, which keeps the full-scan
+        -- fallback working on a node the broker has not reached yet.
+        local key = droneKeyByModel[item.label:gsub("^Mining Drone [Mm][Kk]%-", "")]
+        if key then assets.drones[key] = (assets.drones[key] or 0) + item.size end
       elseif drillLookup[item.label] then
         local key = drillLookup[item.label]
         if string.find(item.label, "Drill Tip", 1, true) then
@@ -585,17 +623,17 @@ local function updateDashboard(assets)
   -- Drone column (left, rows 7-20)
   local totalDrones = 0
   for i, key in ipairs(droneKeys) do
-    local label = droneNames[key]
-    local count = assets.drones[label] or 0
+    local count = assets.drones[key] or 0
     totalDrones = totalDrones + count
     local row = 6 + i
     term.setCursor(2, row)
     gpu.fill(2, row, 36, 1, " ")
     gpu.setForeground(count > 0 and 0x00FFFF or 0x555555)
-    -- Display drone model with voltage tier
-    -- Labels carry a voltage suffix; show just the MK-N model, tier is its own column.
+    -- Display drone model with voltage tier. Built from droneModels rather than
+    -- picked back out of the label: the tier is its own column, and the label is
+    -- for asking the network with, not for reading identity out of.
     local voltage = droneVoltages[key]
-    local model   = string.match(label, "MK%-[XVI]+") or label
+    local model   = droneMark .. "-" .. (droneModels[key]:match("^[XVI]+") or "?")
     io.write(string.format("  %-14s [%s]: %d", model, voltage, count))
   end
 
@@ -725,7 +763,7 @@ local lastAssets = { drones={}, drillTips={}, drillRods={} }
 local function buildPayload(assets)
   local payload = { drones={}, drills={} }
   for _, key in ipairs(droneKeys) do
-    local count = assets.drones[droneNames[key]] or 0
+    local count = assets.drones[key] or 0
     if count > 0 then payload.drones[key] = count end
   end
   for _, key in ipairs(drillKeyOrder) do
@@ -834,6 +872,15 @@ while true do
           -- answer: too few slots is slow, too many is rejected requests.
           slots = tonumber(msg.data.slots) or 1
           if slots < 1 then slots = 1 end
+          -- Which spelling of the drone tier marker this pack uses. Absent from
+          -- an older broker, which leaves the default standing rather than
+          -- blanking the labels. Rebuild only on a change: it reallocates
+          -- scanTargets, and this message arrives every 30 seconds.
+          local mark = msg.data.droneMark
+          if (mark == "MK" or mark == "Mk") and mark ~= droneMark then
+            droneMark = mark
+            rebuildDroneLabels()
+          end
         end
       end
     end

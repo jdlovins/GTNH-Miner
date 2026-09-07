@@ -456,13 +456,39 @@ fetch one; otherwise timestamps are uptime-relative.
 
 ### `gtVersion`
 
-Which Space Elevator Mining Module API the modules speak. `auto` (default),
-`2.9`, or `2.8`.
+Which GTNH this world is running: `2.9` (default) or `2.8`. It selects two
+things, and both must match the world.
 
-GTNH 2.9 replaced the module's positional parameter call with a named one, and
-the two forms are disjoint — a 2.9 module has no `setParameters` at all, which
-is how the broker originally found out about the break ("attempt to call a nil
-value (field 'setParameters')").
+**The module parameter API.** GTNH 2.9 replaced the module's positional
+parameter call with a named one, and the two forms are disjoint — a 2.9 module
+has no `setParameters` at all, which is how the broker originally found out
+about the break ("attempt to call a nil value (field 'setParameters')").
+
+**The drone item names.** 2.9 also renamed the mining drone's tier marker:
+`Mining Drone MK-IX (UHV)` became `Mining Drone Mk-IX (UHV)`. Labels are how
+every drone is resolved — `iface.store{label}` on the loader,
+`getItemsInNetwork{label}` on the hw node — so the wrong spelling reports **0 of
+every tier** and the fleet never dispatches. That symptom looks exactly like an
+empty ME network, which is why the boot check below exists.
+
+**There used to be an `auto` that probed each module, and the drone label is
+what removed it.** An item name has nothing to probe: no method's presence tells
+you what the pack calls a drone. So the label has to be configured, and a system
+that probes the API while configuring the label holds two answers to one
+question. There is one now, asked at the broker's boot prompt.
+
+`module_api.lua`'s `detect()` still runs at startup, but only to *object*: if a
+module speaks a dialect other than the one you chose, the broker warns at boot
+and on the console. That warning is the only chance to catch a wrong setting
+before a job runs — without it a module loads a drone and two full stacks of
+consumables and only then throws on a parameter call that does not exist.
+
+The hw telemetry node needs the drone spelling too, and cannot work it out: it
+holds an ME controller, loads no `config.lua` by design, and never touches a
+module. The broker sends it with `DRILL_PAR` on `ports.hardware`, the same way
+`drillCraftSlots` rides along. The node defaults to the 2.9 spelling until it
+hears otherwise, so a 2.8 fleet reads zero for one scan cycle and corrects on
+the first broadcast.
 
 | | GTNH 2.8 | GTNH 2.9 |
 |---|---|---|
@@ -471,30 +497,39 @@ value (field 'setParameters')").
 | set cycle mode | *module GUI only* | `setParameter("cycle", false)` |
 | introspection | `getParametersInfo()` | `getParameters()` |
 
-Nothing else on the miner path moved. `setWorkAllowed()` and `isMachineActive()`
-are the same call on both, and the whole consumable path — `iface.store{label}`,
-`setInterfaceConfiguration`, the transposer — never changed. All four
-version-dependent calls live in [`module_api.lua`](module_api.lua) and nowhere
-else.
+Plus the drone tier marker, above. `setWorkAllowed()` and `isMachineActive()`
+are the same call on both, as are `setInterfaceConfiguration` and the
+transposer. All four version-dependent calls and the one version-dependent
+string live in [`module_api.lua`](module_api.lua) and nowhere else.
 
-**`auto` probes each module's adapter once at boot** and logs what it found
-(`[STARTUP] M1 speaks GTNH 2.9 (probed)`). Because the methods are disjoint,
-presence of the method *is* the answer — there is nothing to guess. A module that
-answers neither is reported as an error on the dashboard and kept out of dispatch
-rather than being handed a job it cannot be told where to send.
+**The broker asks at boot** and logs the answer (`[STARTUP] M1 speaks GTNH 2.9
+(configured)`). The stored `gtVersion` is the default, so once it is saved this
+is a keypress. A module whose adapter answers neither dialect is reported as an
+error on the dashboard and kept out of dispatch rather than being handed a job
+it cannot be told where to send.
 
-Force `2.9` or `2.8` only when the probe reads wrong — a pack where both methods
-exist, or one that exists but throws. A forced value is honoured over the probe,
-which is the entire point of having it; a wrong force fails every module start
-loudly (`parameters failed: setParameters: ...`) rather than silently mining at
-the wrong distance.
+**A wrong answer is caught at boot, not at dispatch.** `detect()` reads what the
+adapter actually speaks and the broker warns when that disagrees:
+
+```
+[STARTUP] M1 configured for GTNH 2.8 but this module speaks 2.9
+          -- check the gtVersion setting
+WARNING: ... Drone item names are picked from the same setting, so stock
+         will read 0 for every tier until it matches the world.
+```
+
+The warning does not override you — a forced value beating a misreading probe is
+the reason the setting is authoritative. But an uncorrected mismatch fails every
+module start loudly (`parameters failed: setParameters: ...`) *and* silently
+zeroes every drone count, and the second half is the one that looks like a
+hardware problem rather than a setting.
 
 **On GTNH 2.8, `parallel` and `cycle` cannot be set from code.** They live in
 each module's own GUI, and there is no 2.8 call to write instead. Set every
 module to its tier maximum by hand, because dispatch charges jobs at
 `config.moduleTiers[tier].maxParallels` — a GUI holding less still mines, but
 the computation draw and the ETA readouts will be wrong. The broker prints one
-warning at boot when it detects 2.8, once for the whole array rather than once
+warning at boot when it is set to 2.8, once for the whole array rather than once
 per module.
 
 `distanceParam` in `job_node_config.lua` is used on 2.8 and ignored on 2.9. It is

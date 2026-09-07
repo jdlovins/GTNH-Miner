@@ -10,11 +10,23 @@
 --   cycle mode    -- module GUI only --             setParameter("cycle", false)
 --   introspect    getParametersInfo()               getParameters()
 --
--- Nothing else on the miner path moved. setWorkAllowed() and isMachineActive()
--- are the same call in both, and the whole consumable path -- iface.store{label},
--- setInterfaceConfiguration, the transposer -- never changed at all. So this file
--- owns four calls and no more; if you find yourself version-gating anything else,
--- check first, because it is probably not actually version-dependent.
+-- 2.9 also renamed the mining drone's tier marker -- "Mining Drone MK-IX (UHV)"
+-- became "Mining Drone Mk-IX (UHV)". That is not a call, it is an item LABEL,
+-- and it matters because labels are how the whole consumable path resolves a
+-- drone: iface.store{label} on the loader, getItemsInNetwork{label} on the hw
+-- node. An earlier version of this header claimed that path "never changed at
+-- all". It had, and the fleet sat idle with every drone counted as zero.
+--
+-- The marker cannot be probed. There is no method whose presence answers "what
+-- does this pack call the item", so unlike the four calls above it has to be
+-- CONFIGURED -- which is why gtVersion is a stored setting rather than a probe,
+-- and why detect() below no longer decides anything. See api.mark().
+--
+-- Everything else on the miner path really is unchanged: setWorkAllowed() and
+-- isMachineActive() are the same call in both, as is setInterfaceConfiguration
+-- and the transposer. So this file owns four calls and one string, and no more;
+-- if you find yourself version-gating anything else, check first, because it is
+-- probably not actually version-dependent.
 --
 -- No `component` require. Every hardware handle arrives on the `mod` table the
 -- way loader.lua takes them, which is what makes this file drivable from plain
@@ -30,17 +42,49 @@ api.V29 = "2.9"
 api.V28 = "2.8"
 
 -- ---------------------------------------------------------------------------
+-- THE DRONE TIER MARKER
+--
+-- "Mining Drone MK-IX (UHV)" on 2.8, "Mining Drone Mk-IX (UHV)" on 2.9. One
+-- string, and the reason gtVersion is a setting instead of a probe: config.lua
+-- rewrites config.drones through this, and the broker ships it to the hw node
+-- with DRILL_PAR, because that node holds no config and cannot work it out.
+--
+-- Falls back to the 2.9 spelling for an unknown version rather than returning
+-- nil. A nil here would concatenate into "Mining Drone nil-IX (UHV)" three
+-- layers away from the mistake; a wrong-but-plausible label fails as a clean
+-- "no drones in stock", which is the symptom this whole change exists to fix
+-- and is therefore the one an operator has a chance of recognising.
+-- ---------------------------------------------------------------------------
+api.MARK = { [api.V28] = "MK", [api.V29] = "Mk" }
+
+function api.mark(version)
+  return api.MARK[version] or api.MARK[api.V29]
+end
+
+-- Rewrite one drone label for `version`. Case-insensitive on the way in so it
+-- is idempotent -- relabelling an already-relabelled table is a no-op, not a
+-- miss -- and anchored on "Mining Drone " so it cannot chew on anything else.
+function api.relabel(label, version)
+  if type(label) ~= "string" then return label end
+  return (label:gsub("^(Mining Drone )[Mm][Kk]%-", "%1" .. api.mark(version) .. "-"))
+end
+
+-- ---------------------------------------------------------------------------
 -- WHICH DIALECT DOES THIS ADAPTER SPEAK?
 --
--- Probed, not configured, because the two method names cannot both be present:
--- 2.9 removed setParameters outright, which is precisely how the broker found
--- out about the break -- "attempt to call a nil value (field 'setParameters')".
--- Presence of the method IS the answer.
+-- The two method names cannot both be present: 2.9 removed setParameters
+-- outright, which is precisely how the broker found out about the break --
+-- "attempt to call a nil value (field 'setParameters')". Presence of the method
+-- IS the answer, for the API.
+--
+-- This no longer DECIDES anything (see check() below for why). It is kept
+-- because it is still the truth about the hardware, and comparing it against
+-- the configured version is what turns a wrong gtVersion into a boot warning
+-- instead of a module that loads a full set of consumables and only then
+-- discovers it cannot be told where to mine.
 --
 -- Returns nil for an adapter with neither, which is not a mining module (or is
--- an address pointing at the wrong block). Callers must treat that as a hardware
--- error rather than picking a default: guessing here means every start silently
--- does nothing.
+-- an address pointing at the wrong block).
 -- ---------------------------------------------------------------------------
 function api.detect(adapter)
   if type(adapter) ~= "table" and type(adapter) ~= "userdata" then return nil end
@@ -53,21 +97,42 @@ function api.detect(adapter)
   return nil
 end
 
--- Resolve the dialect for one adapter given the `gtVersion` setting.
--- Returns (dialect, how) where `how` is "probed" | "forced" | nil.
+-- ---------------------------------------------------------------------------
+-- THE CONFIGURED VERSION IS THE ANSWER. THE PROBE ONLY GETS TO OBJECT.
 --
--- A forced setting is honoured even when it contradicts the probe. That is the
--- point of having it: if GTNH ships a version where both methods exist, or one
--- exists but throws, the probe is the thing that is wrong and the operator needs
--- a way to say so without editing code.
-function api.resolve(adapter, setting)
-  if setting == api.V29 or setting == api.V28 then return setting, "forced" end
-  local probed = api.detect(adapter)
-  if probed then return probed, "probed" end
+-- This used to probe per adapter and fall back to the setting. It does not any
+-- more, and the drone label is why: an item name has no method to probe for, so
+-- it has to be configured -- and a system that probes the API while configuring
+-- the label holds two sources of truth for one fact, free to disagree. There is
+-- now one, chosen at the boot prompt and pushed to the nodes that need it.
+--
+-- Returns (dialect, how). `how` is "configured" for a version we recognise, and
+-- the pair is (nil, nil) for one we do not, which callers must treat as a
+-- hardware error rather than defaulting -- guessing means every start silently
+-- does nothing.
+-- ---------------------------------------------------------------------------
+function api.resolve(_adapter, setting)
+  if setting == api.V29 or setting == api.V28 then return setting, "configured" end
   return nil, nil
 end
 
--- "GTNH 2.9 (probed)" — for the boot log and the module panel.
+-- Does the hardware agree with what it was told? Returns nil when it does (or
+-- when there is nothing to compare against), and a one-line description of the
+-- disagreement when it does not.
+--
+-- An adapter that answers neither dialect is NOT a mismatch: it is not a mining
+-- module at all, which is a different failure with its own error at the call
+-- site. Saying both would bury the real one.
+function api.check(adapter, setting)
+  local probed = api.detect(adapter)
+  if not probed or not setting then return nil end
+  if probed == setting then return nil end
+  return "configured for GTNH " .. tostring(setting) ..
+         " but this module speaks " .. probed ..
+         " -- check the gtVersion setting"
+end
+
+-- "GTNH 2.9 (configured)" — for the boot log and the module panel.
 function api.describe(mod)
   if not mod.dialect then return "GTNH ?" end
   return "GTNH " .. mod.dialect .. (mod.dialectHow and (" (" .. mod.dialectHow .. ")") or "")

@@ -111,9 +111,10 @@ for i, mc in ipairs(nodeConf.modules) do
     nextHeartbeatAt = 0,
     lastRunWarnAt   = 0,
     -- Which GTNH parameter API this module's controller speaks. Filled in by
-    -- initModules(), because resolving it needs config.gtVersion and a live
-    -- adapter, and a module that answers neither dialect must be reported on
-    -- the dashboard rather than erroring the whole boot.
+    -- initModules() from config.gtVersion -- not probed; see module_api.lua for
+    -- why the drone label forced that. Still nil for a module whose adapter
+    -- answers neither dialect, which must be reported on the dashboard rather
+    -- than erroring the whole boot.
     dialect         = nil,
     dialectHow      = nil,
   }
@@ -1019,21 +1020,16 @@ local function getIdleModules()
   local idle = {}
   local now = computer.uptime()
   for i, mod in ipairs(modules) do
-    -- A module whose parameter API we could not identify is never dispatchable:
-    -- the load would run in full and only then discover there is no way to tell
-    -- the module where to mine. Re-probe first, because the usual reason for a
-    -- nil dialect is an adapter that was mid chunk-reload at boot, and that
-    -- fixes itself.
-    if not mod.dialect then
-      mod.dialect, mod.dialectHow = moduleApi.resolve(mod.adapter, config.gtVersion)
-      if mod.dialect then
-        logger:info("[RECOVERY] M%d now speaks %s", i, moduleApi.describe(mod))
-      end
-    end
-
-    -- Still unidentified after the re-probe: leave it out of dispatch entirely,
-    -- including out of the ERROR recovery below, which would otherwise hand it a
-    -- job every ERROR_TIMEOUT seconds forever.
+    -- A module with no dialect is never dispatchable: the load would run in
+    -- full and only then discover there is no way to tell the module where to
+    -- mine. Leave it out of dispatch entirely, including out of the ERROR
+    -- recovery below, which would otherwise hand it a job every ERROR_TIMEOUT
+    -- seconds forever.
+    --
+    -- There used to be a re-probe here, for an adapter caught mid chunk-reload
+    -- at boot. The dialect comes from the gtVersion setting now, not from the
+    -- hardware, so it is set for every module or for none and there is nothing
+    -- a retry could discover.
     if mod.dialect then
       if mod.status == "IDLE" then
         idle[#idle + 1] = mod
@@ -1986,11 +1982,9 @@ local function drawModulePanel()
     row = row + 1
 
     if (mod.status == "RUNNING") and mod.job and row <= H then
-      local droneName = config.drones[mod.job.droneKey] or "?"
-      local lvl = droneName:match("MK%-(.+)") or "?"
       dashRowF(SLOT_M + row, P1 + 1, PW, row, 0xCCCCCC,
-        "  dist=%d  drone=MK-%s  refills=%d",
-        mod.job.distance or 0, lvl, mod.refills or 0)
+        "  dist=%d  drone=%s  refills=%d",
+        mod.job.distance or 0, config.droneModel(mod.job.droneKey), mod.refills or 0)
       row = row + 1
 
       -- Load diagnostic from the most recent load of this module:
@@ -2331,15 +2325,14 @@ local function drawHWPanel()
     local free  = freeDrones[key] or 0
     if count > 0 or free > 0 then
       if row > H then break end
-      local droneName = config.drones[key] or ("Drone-" .. key)
-      local lvl = droneName:match("MK%-(.+)") or "?"
       -- Amber when nothing is free: the tier is owned but cannot be dispatched,
       -- which is a different state from not owning one at all.
       local color = (free > 0) and 0x00FFFF or 0xFFAA00
+      local model = config.droneModel(key)
       if free ~= count then
-        putf(color, "  %-18s  x%d  (%d free)", "MK-" .. lvl, count, free)
+        putf(color, "  %-18s  x%d  (%d free)", model, count, free)
       else
-        putf(color, "  %-18s  x%d", "MK-" .. lvl, count)
+        putf(color, "  %-18s  x%d", model, count)
       end
       any = true
     end
@@ -2464,9 +2457,31 @@ local function runBootPrompt()
   }, 1)
   brokerState.priorityMode = (pr == 2) and "rarity" or "threshold"
 
+  -- ASKED HERE, NOT PERSISTED HERE.
+  --
+  -- gtVersion decides two things that must agree with the world: which parameter
+  -- API the modules speak, and what the ME network calls a mining drone. Neither
+  -- can be worked out from an item name, so it is asked -- and asked at every
+  -- boot for the same reason priority mode is, because this file has no business
+  -- writing user_config.lua. The editor owns that file and nothing else writes
+  -- it, so a value saved there simply arrives as the default below and this is
+  -- one keypress.
+  --
+  -- Answering re-runs the relabel over config.drones, which is why setGtVersion
+  -- is idempotent -- config.lua has already run it once with the stored value.
+  local versions = { moduleApi.V29, moduleApi.V28 }
+  local def = (config.gtVersion == moduleApi.V28) and 2 or 1
+  local gv = promptChoice("\nWhich GTNH is this world running?", {
+    "GTNH 2.9  - setParameter(), drones named \"Mk-\"",
+    "GTNH 2.8  - setParameters(), drones named \"MK-\"",
+  }, def)
+  local mark = config.setGtVersion(versions[gv])
+
   logger:info("[STARTUP] priority mode = " .. brokerState.priorityMode)
+  logger:info("[STARTUP] GTNH " .. config.gtVersion .. " -- drones named \"" .. mark .. "-\"")
   if gpu then gpu.setForeground(0x00FF00) end
-  print("\n  Priority: " .. brokerState.priorityMode:upper() .. ".  Starting broker...")
+  print("\n  Priority: " .. brokerState.priorityMode:upper() ..
+        ".  GTNH " .. config.gtVersion .. ".  Starting broker...")
   if gpu then gpu.setForeground(0xFFFFFF) end
   os.sleep(1)
 end
@@ -2476,13 +2491,15 @@ end
 -- responsive instead of staring at a blank console while ~24 component calls
 -- run. Cheap work; this is purely about feedback.
 --
--- The dialect is resolved HERE, once, rather than at every start: it is a
--- property of the pack the world is running, it cannot change while the broker
--- is up, and probing it per job would put two speculative component calls in
--- front of every dispatch.
+-- The dialect is settled HERE, once, rather than at every start: it is a
+-- property of the pack the world is running and it cannot change while the
+-- broker is up. It comes from the gtVersion setting now rather than from a
+-- probe -- see module_api.lua for why an item label forced that -- so this pass
+-- is really about checking the hardware agrees, and about the interface clear.
 local function initModules()
   logger:info("[STARTUP] Initializing " .. #modules .. " modules...")
   local anyLegacy = false
+  local anyMismatch = nil
   for i, mod in ipairs(modules) do
     if gpu then
       local row = 5 + i
@@ -2496,6 +2513,23 @@ local function initModules()
     if mod.dialect then
       if mod.dialect == moduleApi.V28 then anyLegacy = true end
       logger:info("[STARTUP] M%d speaks %s", mod.index, moduleApi.describe(mod))
+      -- The probe does not decide any more, but it still knows. Comparing it
+      -- against the answer given at the prompt is the ONLY chance to catch a
+      -- wrong gtVersion before a job runs: without it the module loads a drone,
+      -- a stack of tips and a stack of rods, and only then throws on a
+      -- parameter call that does not exist. Warn, do not fail -- a forced
+      -- setting beating a misreading probe is exactly why the setting exists.
+      local mismatch = moduleApi.check(mod.adapter, config.gtVersion)
+      if mismatch then
+        anyMismatch = anyMismatch or mismatch
+        logger:warn("[STARTUP] M" .. mod.index .. " " .. mismatch)
+      end
+    elseif moduleApi.detect(mod.adapter) then
+      -- The adapter is a mining module, but gtVersion names a version this
+      -- build does not know. Nothing downstream can run against that.
+      mod.status = "ERROR"
+      mod.lastError = "unknown gtVersion: " .. tostring(config.gtVersion)
+      logger:error("[STARTUP] M" .. mod.index .. " " .. mod.lastError)
     else
       -- Neither setParameter nor setParameters. That is not a mining module, or
       -- moduleAddr points at the wrong block. Fail the module, not the boot: the
@@ -2523,6 +2557,15 @@ local function initModules()
                  "computation and ETA figures are wrong if the GUI holds less."
     logger:warn("[STARTUP] " .. line)
     print(line)
+  end
+
+  -- Loud, because the drone labels are wrong too when this fires and the only
+  -- other symptom is every tier reading zero in stock -- which looks like an
+  -- empty network, not a misconfiguration.
+  if anyMismatch then
+    print("WARNING: " .. anyMismatch)
+    print("         Drone item names are picked from the same setting, so stock")
+    print("         will read 0 for every tier until it matches the world.")
   end
 end
 
@@ -2763,8 +2806,12 @@ local function broadcastDrillPar()
     -- restockable" -- no drone in stock for any material, say. Empty with
     -- enabled=false means "you have turned this off". An older broker sends
     -- neither, which the node reads as enabled.
+    -- droneMark rides along for the same reason drillCraftSlots does: the node
+    -- holds no config.lua, so it cannot turn a version into an item name. It
+    -- keeps its own default until this arrives, so an older broker that sends
+    -- none costs nothing.
     data        = { par = list, slots = config.drillCraftSlots or 1,
-                    enabled = enabled },
+                    enabled = enabled, droneMark = config.droneMark },
   }))
   local n = 0
   for _ in pairs(list) do n = n + 1 end

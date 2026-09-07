@@ -43,7 +43,7 @@ S.groups = {
   { id = "nodes",    label = "TELEMETRY NODES (pushed to dust/fluid/hw over the air)" },
   { id = "ui",       label = "INTERFACE       (this screen)" },
   { id = "logging",  label = "LOGGING         (see logger.lua)" },
-  { id = "compat",   label = "COMPATIBILITY   (which GTNH the modules speak)" },
+  { id = "compat",   label = "COMPATIBILITY   (which GTNH this fleet runs)" },
   { id = "other",    label = "OTHER" },
 }
 
@@ -196,15 +196,27 @@ S.list = {
     label = "Boot epoch", help = "real unix seconds at boot, to anchor timestamps; 0 = uptime-relative" },
 
   -- --- COMPATIBILITY -------------------------------------------------------
-  -- GTNH 2.9 renamed the mining module's parameter API and the two forms are
-  -- disjoint, so "auto" asks each adapter which one it has rather than making
-  -- the operator know. module_api.lua holds the difference; this only decides
-  -- whether it probes. Not scope = "node": no telemetry node touches a module
-  -- controller, so shipping this to them would be noise on the wire.
-  { key = "gtVersion", group = "compat", type = "choice", default = "auto",
-    choices = { "auto", "2.9", "2.8" },
-    label = "GTNH module API",
-    help  = "auto probes each module; force it only if the probe reads wrong" },
+  -- Which GTNH this fleet is running. Two things hang off it, and module_api.lua
+  -- holds both: the mining module's parameter API (2.9 renamed it, and the two
+  -- forms are disjoint) and the mining drone's item label ("MK-IX" on 2.8,
+  -- "Mk-IX" on 2.9).
+  --
+  -- There used to be an "auto" that probed each adapter, and the label is what
+  -- killed it. An item name has nothing to probe -- no method's presence tells
+  -- you what the pack calls a drone -- so the label has to be configured, and a
+  -- system that probes the API while configuring the label carries two answers
+  -- to one question. Now there is one, asked at the boot prompt. module_api's
+  -- detect() still runs at startup, but only to warn when the hardware
+  -- disagrees with what it was told.
+  --
+  -- Not scope = "node": the dust and fluid nodes have no use for it, and the hw
+  -- node -- which does, for the drone labels -- stays off the command port and
+  -- receives it with DRILL_PAR instead, the same way drillCraftSlots does. See
+  -- broadcastDrillPar() in broker-mk3.lua.
+  { key = "gtVersion", group = "compat", type = "choice", default = "2.9",
+    choices = { "2.9", "2.8" },
+    label = "GTNH version",
+    help  = "selects the module parameter API and the drone item names" },
 }
 
 -- ---------------------------------------------------------------------------

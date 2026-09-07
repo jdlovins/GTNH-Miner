@@ -22,6 +22,20 @@ do
   end
 end
 
+-- Same two paths, and for the same reason. Needed for the drone relabel in §14b
+-- -- module_api owns the 2.8/2.9 tier marker along with the parameter API, so
+-- that one string is not written down in two files.
+local moduleApi
+do
+  for _, path in ipairs({ "/home/module_api.lua", "module_api.lua" }) do
+    local ok, mod = pcall(dofile, path)
+    if ok and type(mod) == "table" and mod.mark then moduleApi = mod break end
+  end
+  if not moduleApi then
+    error("config.lua: cannot load module_api.lua -- re-run install-medina to fetch it")
+  end
+end
+
 -- Helper: convert k/m/b suffixes to numbers (e.g. 100k=100000, 1m=1000000, 1b=1000000000)
 local function qty(s)
   if type(s) == "number" then return s end
@@ -44,6 +58,13 @@ end
 -- Maps short tier keys (lv, mv, ... uxv) to the exact item name as reported
 -- by the ME network. Used by hw_telem for inventory scanning and by job_node
 -- when requesting items via transposer.
+--
+-- WRITTEN IN THE 2.8 SPELLING, AND NOT NECESSARILY WHAT YOU WILL READ HERE AT
+-- RUNTIME. GTNH 2.9 renamed the tier marker to "Mk-", and §14b below rewrites
+-- every entry in place once gtVersion is known -- which cannot happen here,
+-- three thousand lines before the user overlay is merged. Read config.drones,
+-- never this literal, and see module_api.lua for why the version is configured
+-- rather than probed.
 --------------------------------------------------------------------------------
 config.drones = {
   lv  = "Mining Drone MK-I (LV)",
@@ -3022,6 +3043,52 @@ do
       end
     end
   end
+end
+
+--------------------------------------------------------------------------------
+-- 14b. DRONE LABELS FOR THIS PACK VERSION
+--
+-- Has to run HERE, after the overlay: gtVersion is a setting, so it is not
+-- known until user_config.lua has been merged, and §1 is far too early.
+--
+-- Rewritten IN PLACE rather than exposed as a lookup function, so that every
+-- existing reader -- loader.lua, job_node.lua, the broker's dashboard -- keeps
+-- saying config.drones[key] and none of them has to know this happened. The
+-- label they get is simply correct, which is why nothing downstream needs a
+-- case-insensitive comparison.
+--
+-- config.droneMark is published for the two places that build a label rather
+-- than read one: the broker's DRILL_PAR broadcast (the hw node holds no config
+-- and cannot derive it) and the editor's drill page.
+--------------------------------------------------------------------------------
+-- Idempotent, and deliberately so: relabel() matches the marker case-insensitively,
+-- so running this over an already-relabelled table is a no-op rather than a miss.
+-- That is what lets the boot prompt call it again with a different answer without
+-- config.lua having to keep a pristine copy of the shipped spelling around.
+function config.setGtVersion(version)
+  config.gtVersion = version
+  config.settings.gtVersion = version
+  config.droneMark = moduleApi.mark(version)
+  for key, name in pairs(config.drones) do
+    config.drones[key] = moduleApi.relabel(name, version)
+  end
+  return config.droneMark
+end
+
+config.setGtVersion(config.gtVersion)
+
+-- "Mk-IX (UHV)" -- the drone's tier and voltage, for panels that are naming a
+-- tier rather than resolving an item.
+--
+-- Derived by trimming the label instead of parsing the marker out of it. Three
+-- display sites used to do droneName:match("MK%-(.+)") and then print "MK-" ..
+-- that, which broke on the rename for no reason -- they were reconstructing a
+-- string they already had. Trimming also keeps the voltage suffix spelled the
+-- way the pack spells it (LuV, not LUV) without a second table to maintain.
+function config.droneModel(key)
+  local label = config.drones[key]
+  if not label then return "Drone-" .. tostring(key) end
+  return (label:gsub("^Mining Drone ", ""))
 end
 
 return config

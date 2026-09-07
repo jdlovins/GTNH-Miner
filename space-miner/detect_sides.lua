@@ -120,6 +120,9 @@ if not nodeConf.dbAddr or nodeConf.dbAddr == "" then
 end
 
 -- config.lua only supplies a sensible default probe item; it isn't required.
+-- It is also the only thing that knows the drone spelling for this pack, so the
+-- hardcoded fallback below is the 2.8 one and will be wrong on 2.9 -- which
+-- costs a retype at the prompt, not a wrong answer.
 --
 -- The probe has to be an item you ACTUALLY HOLD -- it gets borrowed from the ME
 -- network and put back. This used to take the first drone out of pairs(), whose

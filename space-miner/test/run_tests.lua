@@ -56,12 +56,15 @@ ck("detect 2.8",           api.detect(fake28()), "2.8")
 ck("detect neither",       api.detect({}), nil)
 ck("detect nil adapter",   api.detect(nil), nil)
 
-local d, how = api.resolve(fake29(), "auto")
-ck("resolve auto -> 2.9",  d .. "/" .. how, "2.9/probed")
-d, how = api.resolve(fake28(), "auto")
-ck("resolve auto -> 2.8",  d .. "/" .. how, "2.8/probed")
+-- resolve() no longer probes: there is no "auto" to resolve, because the drone
+-- label half of this split has nothing to probe for. The setting IS the answer,
+-- and it beats the hardware -- which detect() is now only allowed to warn about.
+local d, how = api.resolve(fake29(), "2.9")
+ck("resolve 2.9",          d .. "/" .. how, "2.9/configured")
+d, how = api.resolve(fake28(), "2.8")
+ck("resolve 2.8",          d .. "/" .. how, "2.8/configured")
 d, how = api.resolve(fake29(), "2.8")
-ck("override beats probe", d .. "/" .. how, "2.8/forced")
+ck("setting beats probe",  d .. "/" .. how, "2.8/configured")
 ck("resolve unknown",      (api.resolve({}, "auto")), nil)
 
 -- 2.9 writes three named parameters, in this order. This is the regression
@@ -110,6 +113,101 @@ ck("2.9 reset args",        r29.calls[1][1] .. "=" .. tostring(r29.calls[1][2]),
 
 ck("describe",              api.describe({ dialect = "2.8", dialectHow = "probed" }), "GTNH 2.8 (probed)")
 
+-- --- the drone tier marker -------------------------------------------------
+-- The half of the 2.8/2.9 split that cannot be probed, which is why the version
+-- is configured. See the module_api header.
+ck("mark 2.8",              api.mark("2.8"), "MK")
+ck("mark 2.9",              api.mark("2.9"), "Mk")
+ck("mark unknown -> 2.9",   api.mark("2.7"), "Mk")
+ck("relabel to 2.9",        api.relabel("Mining Drone MK-IX (UHV)", "2.9"),
+                            "Mining Drone Mk-IX (UHV)")
+ck("relabel to 2.8",        api.relabel("Mining Drone Mk-IX (UHV)", "2.8"),
+                            "Mining Drone MK-IX (UHV)")
+-- Idempotence is load-bearing: config.lua relabels at load and the boot prompt
+-- relabels again with the operator's answer, over the same table.
+ck("relabel idempotent",    api.relabel(api.relabel("Mining Drone MK-I (LV)", "2.9"), "2.9"),
+                            "Mining Drone Mk-I (LV)")
+-- Anchored, so it cannot chew on a drill or an asteroid's module tier -- the
+-- editor's asteroid rows print "MK-2" for a module and must not follow drones.
+ck("relabel leaves others", api.relabel("MK-II", "2.9"), "MK-II")
+
+-- resolve() takes the setting and nothing else now.
+local resolved, how = api.resolve(fake29(), "2.8")
+ck("resolve honours setting", resolved, "2.8")
+ck("resolve says configured", how, "configured")
+ck("resolve refuses unknown", (api.resolve(fake29(), "auto")), nil)
+
+-- detect() no longer decides, but it still objects.
+ck("check agrees",          api.check(fake29(), "2.9"), nil)
+ck("check disagrees",       (api.check(fake29(), "2.8")):match("speaks 2%.9") ~= nil, true)
+ck("check ignores non-module", api.check({}, "2.9"), nil)
+
+-- =============================================================================
+section("config.lua / hw_telem.lua -- drone labels follow the pack version")
+-- =============================================================================
+-- config.lua cannot be dofile'd from here: it resolves settings.lua and
+-- module_api.lua relative to the working directory, which is the repo root when
+-- these tests run. So this reads its SOURCE, the same bargain the editor checks
+-- below make, and drives the shipped table through the real relabel.
+--
+-- What this is actually guarding is the thing that let the bug ship: the drone
+-- names are written down TWICE, in config.lua and again in hw_telem.lua, and
+-- nothing made them agree.
+local cfgSrc = slurp("config.lua")
+
+local shipped = {}
+for key, name in cfgSrc:match("config%.drones = {(.-)}"):gmatch('(%w+)%s*=%s*"([^"]+)"') do
+  shipped[key] = name
+end
+local nShipped = 0
+for _ in pairs(shipped) do nShipped = nShipped + 1 end
+ck("config ships 14 drones", nShipped, 14)
+
+-- Every tier converts, in both directions. A gsub anchored slightly wrong would
+-- leave exactly one behind, and one missing tier is a silent 0-in-stock.
+local bad29, bad28 = 0, 0
+for _, name in pairs(shipped) do
+  if not api.relabel(name, "2.9"):match("^Mining Drone Mk%-") then bad29 = bad29 + 1 end
+  if not api.relabel(name, "2.8"):match("^Mining Drone MK%-") then bad28 = bad28 + 1 end
+end
+ck("all 14 relabel to 2.9", bad29, 0)
+ck("all 14 relabel to 2.8", bad28, 0)
+
+-- config.lua must actually run the relabel, and must do it after the overlay --
+-- gtVersion is a setting, so relabelling beside the table in section 1 would
+-- read a default that user_config.lua is about to change.
+ck("config relabels",        cfgSrc:find("moduleApi.relabel(name", 1, true) ~= nil, true)
+ck("relabel after overlay",  cfgSrc:find("config.setGtVersion(config.gtVersion)", 1, true)
+                             > cfgSrc:find("user.drillPar", 1, true), true)
+
+-- The module tier is a different "MK" entirely -- MK-I/II/III are Mining Module
+-- tiers, and the editor prints them for asteroid rows. Only drones were renamed.
+ck("module tiers untouched",  cfgSrc:find('["MK-II"]', 1, true) ~= nil, true)
+ck("relabel spares modules",  api.relabel("MK-II", "2.9"), "MK-II")
+
+-- hw_telem holds the second copy. It cannot be loaded (it asserts a modem on
+-- line 24), so check it builds its labels from the marker rather than hardcoding
+-- a spelling, and that its 14 tiers still spell out what config.lua ships.
+local hwSrc = slurp("hw_telem.lua")
+ck("node builds from mark",
+   hwSrc:find('droneMark .. "-" .. droneModels[key]', 1, true) ~= nil, true)
+ck("node hardcodes no marker",
+   hwSrc:find('"Mining Drone MK%-') == nil and hwSrc:find('"Mining Drone Mk%-') == nil, true)
+
+local models = {}
+for key, model in hwSrc:match("local droneModels = {(.-)}"):gmatch('(%w+)="([^"]+)"') do
+  models[key] = model
+end
+local mismatched, nModels = 0, 0
+for key, model in pairs(models) do
+  nModels = nModels + 1
+  if ("Mining Drone Mk-" .. model) ~= api.relabel(shipped[key] or "", "2.9") then
+    mismatched = mismatched + 1
+  end
+end
+ck("node lists 14 tiers",     nModels, 14)
+ck("node agrees with config", mismatched, 0)
+
 -- =============================================================================
 section("settings.lua -- the tunable registry")
 -- =============================================================================
@@ -117,7 +215,7 @@ local S = dofile(ROOT .. "/settings.lua")
 local cfg = {}
 local raw = S.defaults(cfg)
 
-ck("gtVersion default",     cfg.gtVersion, "auto")
+ck("gtVersion default",     cfg.gtVersion, "2.9")
 ck("nested default",        cfg.logging.file, "/tmp/spacemining.log")
 ck("apply maps auto->nil",  cfg.asteroidCap, nil)
 
@@ -133,8 +231,12 @@ ck("dustScanInterval is",             S.nodePayload(raw).dustScanInterval, 10)
 ck("int bounds refuse low",  (S.coerce(S.byKey.tipsPerLoad, 0)), nil)
 ck("int bounds refuse high", (S.coerce(S.byKey.tipsPerLoad, 99999)), nil)
 ck("bool from string",       S.coerce(S.byKey.fastReload, "true"), true)
-ck("choice cycles",          S.cycle(S.byKey.gtVersion, "auto"), "2.9")
-ck("choice wraps",           S.cycle(S.byKey.gtVersion, "2.8"), "auto")
+ck("choice cycles",          S.cycle(S.byKey.gtVersion, "2.9"), "2.8")
+ck("choice wraps",           S.cycle(S.byKey.gtVersion, "2.8"), "2.9")
+-- "auto" is gone: an item label has nothing to probe, so the version is always
+-- an explicit answer now. A saved user_config.lua from before this change still
+-- carries it, and has to be refused rather than silently accepted.
+ck("auto no longer legal",   (S.coerce(S.byKey.gtVersion, "auto")), nil)
 
 -- Every declared setting must survive a defaults -> coerce round trip. A knob
 -- whose own default is out of its own bounds ships broken and nothing else here
