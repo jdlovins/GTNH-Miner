@@ -489,30 +489,40 @@ is not there. Without it that reads as a hardware fault.
 Which GTNH this world is running: `2.9` (default), `2.9-pre-b3`, or `2.8`. It
 selects two things, and both must match the world.
 
-**Three choices for two parameter APIs**, because the two things did not change
-at the same time — the drone rename landed partway through 2.9, at beta 3:
+**Three choices for two parameter APIs**, because the things did not change at
+the same time — the voltage suffix arrived at 2.8 → 2.9, the marker rename
+landed partway through 2.9, at beta 3:
 
 | `gtVersion` | parameter API | drone names |
 |---|---|---|
 | `2.9` | `setParameter` | `Mining Drone Mk-IX (UHV)` |
 | `2.9-pre-b3` | `setParameter` | `Mining Drone MK-IX (UHV)` |
-| `2.8` | `setParameters` | `Mining Drone MK-IX (UHV)` |
+| `2.8` | `setParameters` | `Mining Drone MK-IX` |
 
 `2.9-pre-b3` means 2.9 **before** beta 3; beta 3 itself is the first `Mk`
-release. If you are on 2.9 and drone stock reads 0 for every tier, this is the
-setting to move.
+release. Its label is *inferred*: the suffix and the marker are treated as
+independent changes, and only the outer two rows have been seen in a world. If
+drone stock reads 0 for every tier, this is the setting to move.
+
+The label is the whole line, not just the marker — on 2.8 the drone is plainly
+`Mining Drone MK-IX`, with no voltage anywhere in the name. The broker prints
+the label it is going to ask for at boot (`[STARTUP] GTNH 2.8 -- drones named
+"Mining Drone MK-IX"`), which is the fastest way to see a wrong setting.
 
 **The module parameter API.** GTNH 2.9 replaced the module's positional
 parameter call with a named one, and the two forms are disjoint — a 2.9 module
 has no `setParameters` at all, which is how the broker originally found out
 about the break ("attempt to call a nil value (field 'setParameters')").
 
-**The drone item names.** GTNH 2.9 beta 3 renamed the mining drone's tier
-marker: `Mining Drone MK-IX (UHV)` became `Mining Drone Mk-IX (UHV)`. Labels are
-how every drone is resolved — `iface.store{label}` on the loader,
-`getItemsInNetwork{label}` on the hw node — so the wrong spelling reports **0 of
-every tier** and the fleet never dispatches. That symptom looks exactly like an
-empty ME network, which is why the boot check below exists.
+**The drone item names.** GTNH 2.9 put the voltage in the mining drone's name
+(`Mining Drone MK-IX` → `Mining Drone MK-IX (UHV)`), and beta 3 then lowercased
+the tier marker (→ `Mining Drone Mk-IX (UHV)`). Labels are how every drone is
+resolved — `iface.store{label}` on the loader, `getItemsInNetwork{label}` on the
+hw node — so either half wrong reports **0 of every tier** and the fleet never
+dispatches. On the loader that also surfaces as `fingerprint never confirmed for
+drone (...)`, because `store()` cannot resolve a name the network does not have.
+The counting symptom looks exactly like an empty ME network, which is why the
+boot check below exists.
 
 **There used to be an `auto` that probed each module, and the drone label is
 what removed it.** An item name has nothing to probe: no method's presence tells

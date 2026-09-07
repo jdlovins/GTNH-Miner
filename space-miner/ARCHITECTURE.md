@@ -190,9 +190,12 @@ needs to be rate-limited uses `computer.uptime()`, never a loop counter.
 
 **Inventory Scanning:**
 - Calls `me_controller.getItemsInNetwork()` for all items
-- Counts items with exact label match (e.g. "Mining Drone Mk-VII", "Steel Drill Tip").
-  The drone marker is `MK-` on GTNH 2.8 and `Mk-` on 2.9; the broker sends which
-  one to use with `DRILL_PAR`, since this node holds no config. See `gtVersion`.
+- Counts items with exact label match (e.g. "Mining Drone Mk-VII (ZPM)", "Steel
+  Drill Tip"). The drone label differs by pack in two ways — `MK-` on GTNH 2.8
+  and 2.9-pre-b3, `Mk-` from 2.9 beta 3, and no ` (VOLT)` suffix at all on 2.8 —
+  and the broker sends both facts with `DRILL_PAR`, since this node holds no
+  config. The full-scan fallback keys on the roman tier alone, which no version
+  has moved, so it works before the broker is heard from. See `gtVersion`.
 - Groups tips and rods by material to compute kits
 - Drill kit = min(tips, rods) for that material
 - Only reports non-zero counts to minimize payload

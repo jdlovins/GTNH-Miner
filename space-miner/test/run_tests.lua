@@ -37,6 +37,15 @@ local function slurp(rel)
   local s = f:read("*a"); f:close(); return s
 end
 
+-- Source with line comments stripped, for the "this string appears nowhere"
+-- checks. Those exist to assert that a label is BUILT rather than written down,
+-- and a comment explaining the three spellings is documentation, not a literal.
+-- Naive on purpose: it does not understand a "--" inside a string, which none
+-- of the files it is pointed at contain.
+local function code(rel)
+  return (slurp(rel):gsub("%-%-[^\n]*", ""))
+end
+
 -- =============================================================================
 section("module_api.lua -- the GTNH 2.8 / 2.9 dialect shim")
 -- =============================================================================
@@ -129,17 +138,36 @@ ck("2.8 dialect",             api.dialect("2.8"), "2.8")
 ck("2.9 dialect",             api.dialect("2.9"), "2.9")
 ck("unknown has no dialect",  api.dialect("2.7"), nil)
 ck("three versions offered",  #api.VERSIONS, 3)
-ck("relabel to 2.9",        api.relabel("Mining Drone MK-IX (UHV)", "2.9"),
+-- The label is BUILT from its parts, not rewritten, and the three forms differ
+-- in two independent ways. api.relabel used to do this as a string -> string
+-- gsub, which could not express the 2.8 row at all: dropping " (UHV)" throws
+-- the voltage away, so nothing can put it back.
+ck("2.9 label",             api.droneLabel("IX", "UHV", "2.9"),
                             "Mining Drone Mk-IX (UHV)")
-ck("relabel to 2.8",        api.relabel("Mining Drone Mk-IX (UHV)", "2.8"),
+ck("pre-b3 label",          api.droneLabel("IX", "UHV", "2.9-pre-b3"),
                             "Mining Drone MK-IX (UHV)")
--- Idempotence is load-bearing: config.lua relabels at load and the boot prompt
--- relabels again with the operator's answer, over the same table.
-ck("relabel idempotent",    api.relabel(api.relabel("Mining Drone MK-I (LV)", "2.9"), "2.9"),
+-- The row a tester found the hard way: 2.8 has no voltage in the item name, so
+-- asking that network for the suffixed label matches nothing and the whole
+-- fleet reads as zero.
+ck("2.8 label has no volt", api.droneLabel("IX", "UHV", "2.8"),
+                            "Mining Drone MK-IX")
+ck("2.8 drops the suffix",  api.suffix("2.8"), false)
+ck("pre-b3 keeps it",       api.suffix("2.9-pre-b3"), true)
+-- An unknown version falls back to the CURRENT pack, in both halves. `false` is
+-- a real value in api.SUFFIX, so a plain `or` lookup would report the 2.8
+-- answer for every version it did not recognise.
+ck("unknown suffixes",      api.suffix("2.7"), true)
+ck("unknown label is 2.9's", api.droneLabel("I", "LV", "2.7"),
                             "Mining Drone Mk-I (LV)")
--- Anchored, so it cannot chew on a drill or an asteroid's module tier -- the
--- editor's asteroid rows print "MK-2" for a module and must not follow drones.
-ck("relabel leaves others", api.relabel("MK-II", "2.9"), "MK-II")
+-- Building is idempotent by construction: config.lua builds at load and the
+-- editor builds again with the operator's answer, over the same parts.
+ck("rebuild is stable",     api.droneLabel("I", "LV", "2.9"),
+                            api.droneLabel("I", "LV", "2.9"))
+-- Building rather than rewriting is what makes "MK-II" safe: the editor's
+-- asteroid rows print a MINING MODULE tier, a different MK entirely, and a
+-- string rewrite over the config had to be anchored not to chew on it. Nothing
+-- here reads an existing string at all, so there is nothing to anchor.
+ck("relabel is gone",       api.relabel, nil)
 
 -- resolve() takes the setting and nothing else now.
 local resolved, how = api.resolve(fake29(), "2.8")
@@ -178,67 +206,110 @@ section("config.lua / hw_telem.lua -- drone labels follow the pack version")
 -- config.lua cannot be dofile'd from here: it resolves settings.lua and
 -- module_api.lua relative to the working directory, which is the repo root when
 -- these tests run. So this reads its SOURCE, the same bargain the editor checks
--- below make, and drives the shipped table through the real relabel.
+-- below make, and drives the shipped parts through the real builder.
 --
 -- What this is actually guarding is the thing that let the bug ship: the drone
 -- names are written down TWICE, in config.lua and again in hw_telem.lua, and
--- nothing made them agree.
+-- nothing made them agree ON EVERY VERSION. The old check compared the two only
+-- under the 2.9 form, which is precisely why a 2.8-only difference got through.
 local cfgSrc = slurp("config.lua")
 
+-- key -> { roman, volt }, out of config.droneTiers.
 local shipped = {}
-for key, name in cfgSrc:match("config%.drones = {(.-)}"):gmatch('(%w+)%s*=%s*"([^"]+)"') do
-  shipped[key] = name
+for key, roman, volt in cfgSrc:match("config%.droneTiers = {(.-)\n}")
+                              :gmatch('(%w+)%s*=%s*{%s*roman%s*=%s*"([^"]+)",%s*volt%s*=%s*"([^"]+)"') do
+  shipped[key] = { roman = roman, volt = volt }
 end
 local nShipped = 0
 for _ in pairs(shipped) do nShipped = nShipped + 1 end
 ck("config ships 14 drones", nShipped, 14)
 
--- Every tier converts, in both directions. A gsub anchored slightly wrong would
--- leave exactly one behind, and one missing tier is a silent 0-in-stock.
+-- Every tier builds, on every version. A table row typo'd or missed leaves
+-- exactly one behind, and one missing tier is a silent 0-in-stock.
 local bad29, bad28, badPre = 0, 0, 0
-for _, name in pairs(shipped) do
-  if not api.relabel(name, "2.9"):match("^Mining Drone Mk%-") then bad29 = bad29 + 1 end
-  if not api.relabel(name, "2.8"):match("^Mining Drone MK%-") then bad28 = bad28 + 1 end
-  if not api.relabel(name, "2.9-pre-b3"):match("^Mining Drone MK%-") then badPre = badPre + 1 end
+for _, t in pairs(shipped) do
+  if api.droneLabel(t.roman, t.volt, "2.9")
+     ~= ("Mining Drone Mk-" .. t.roman .. " (" .. t.volt .. ")") then bad29 = bad29 + 1 end
+  if api.droneLabel(t.roman, t.volt, "2.8")
+     ~= ("Mining Drone MK-" .. t.roman) then bad28 = bad28 + 1 end
+  if api.droneLabel(t.roman, t.volt, "2.9-pre-b3")
+     ~= ("Mining Drone MK-" .. t.roman .. " (" .. t.volt .. ")") then badPre = badPre + 1 end
 end
-ck("all 14 relabel to 2.9", bad29, 0)
-ck("all 14 relabel to 2.8", bad28, 0)
-ck("all 14 relabel pre-b3", badPre, 0)
+ck("all 14 build for 2.9",   bad29, 0)
+ck("all 14 build for 2.8",   bad28, 0)
+ck("all 14 build pre-b3",    badPre, 0)
 
--- config.lua must actually run the relabel, and must do it after the overlay --
--- gtVersion is a setting, so relabelling beside the table in section 1 would
--- read a default that user_config.lua is about to change.
-ck("config relabels",        cfgSrc:find("moduleApi.relabel(name", 1, true) ~= nil, true)
-ck("relabel after overlay",  cfgSrc:find("config.setGtVersion(config.gtVersion)", 1, true)
+-- config.lua must actually build the labels, and must do it after the overlay --
+-- gtVersion is a setting, so building beside the table in section 1 would read a
+-- default that user_config.lua is about to change.
+ck("config builds labels",   cfgSrc:find("moduleApi.droneLabel(tier.roman", 1, true) ~= nil, true)
+ck("config holds no labels", code("config.lua"):find('"Mining Drone ', 1, true) == nil, true)
+ck("build after overlay",    cfgSrc:find("config.setGtVersion(config.gtVersion)", 1, true)
                              > cfgSrc:find("user.drillPar", 1, true), true)
+-- The suffix has to reach the wire as well as the local table: the hw node holds
+-- no config and cannot derive it, and a marker-only packet is what left a 2.8
+-- node counting zero even with the broker up.
+ck("config exports suffix",  cfgSrc:find("config.droneSuffix = moduleApi.suffix", 1, true) ~= nil, true)
+local brkSrc = slurp("broker-mk3.lua")
+ck("broker ships suffix",    brkSrc:find("droneSuffix = config.droneSuffix", 1, true) ~= nil, true)
 
 -- The module tier is a different "MK" entirely -- MK-I/II/III are Mining Module
 -- tiers, and the editor prints them for asteroid rows. Only drones were renamed.
 ck("module tiers untouched",  cfgSrc:find('["MK-II"]', 1, true) ~= nil, true)
-ck("relabel spares modules",  api.relabel("MK-II", "2.9"), "MK-II")
 
 -- hw_telem holds the second copy. It cannot be loaded (it asserts a modem on
--- line 24), so check it builds its labels from the marker rather than hardcoding
--- a spelling, and that its 14 tiers still spell out what config.lua ships.
+-- line 24), so check it builds its labels from the two facts rather than
+-- hardcoding a spelling, and that its 14 tiers still spell out what config.lua
+-- ships -- UNDER BOTH FORMS, which is the check that would have caught this.
 local hwSrc = slurp("hw_telem.lua")
-ck("node builds from mark",
-   hwSrc:find('droneMark .. "-" .. droneModels[key]', 1, true) ~= nil, true)
-ck("node hardcodes no marker",
-   hwSrc:find('"Mining Drone MK%-') == nil and hwSrc:find('"Mining Drone Mk%-') == nil, true)
+ck("node builds from parts",
+   hwSrc:find('droneMark .. "-" .. droneRoman[key]', 1, true) ~= nil, true)
+ck("node honours the suffix",
+   hwSrc:find("droneSuffix and (base", 1, true) ~= nil, true)
+local hwCode = code("hw_telem.lua")
+ck("node hardcodes no label",
+   hwCode:find('"Mining Drone MK%-') == nil and hwCode:find('"Mining Drone Mk%-') == nil, true)
+-- The fallback keys on the roman alone. Keyed on "IX (UHV)" it matched 2.9 and
+-- nothing else, so the marker-insensitive path did not in fact rescue anyone.
+ck("fallback keys on roman",
+   hwSrc:find("droneKeyByRoman", 1, true) ~= nil, true)
+ck("old model key is gone",
+   hwSrc:find("droneKeyByModel", 1, true) == nil, true)
 
-local models = {}
-for key, model in hwSrc:match("local droneModels = {(.-)}"):gmatch('(%w+)="([^"]+)"') do
-  models[key] = model
+local romans, volts = {}, {}
+for key, roman in hwSrc:match("local droneRoman = {(.-)\n}"):gmatch('(%w+)="([^"]+)"') do
+  romans[key] = roman
+end
+for key, volt in hwSrc:match("local droneVoltages = {(.-)\n}"):gmatch('(%w+)="([^"]+)"') do
+  volts[key] = volt
 end
 local mismatched, nModels = 0, 0
-for key, model in pairs(models) do
+for key, roman in pairs(romans) do
   nModels = nModels + 1
-  if ("Mining Drone Mk-" .. model) ~= api.relabel(shipped[key] or "", "2.9") then
-    mismatched = mismatched + 1
+  local t = shipped[key] or {}
+  for _, v in ipairs({ "2.9", "2.9-pre-b3", "2.8" }) do
+    if api.droneLabel(roman, volts[key] or "", v)
+       ~= api.droneLabel(t.roman or "", t.volt or "", v) then
+      mismatched = mismatched + 1
+    end
   end
 end
 ck("node lists 14 tiers",     nModels, 14)
-ck("node agrees with config", mismatched, 0)
+ck("node agrees on all forms", mismatched, 0)
+
+-- The full-scan fallback's pattern, run for real rather than grepped. Both
+-- forms have to yield the same roman, or a node the broker has not reached
+-- counts drones on 2.9 and nothing on 2.8.
+local function fallbackRoman(label)
+  return label:match("^Mining Drone [Mm][Kk]%-([XVI]+)")
+end
+ck("fallback reads 2.8",      fallbackRoman("Mining Drone MK-XIII"), "XIII")
+ck("fallback reads 2.9",      fallbackRoman("Mining Drone Mk-XIII (UXV)"), "XIII")
+ck("fallback reads pre-b3",   fallbackRoman("Mining Drone MK-IX (UHV)"), "IX")
+-- Greedy, so the four-character roman does not truncate to the one-character
+-- one and file every MAX drone under UEV.
+ck("fallback is greedy",      fallbackRoman("Mining Drone Mk-XIV (MAX)"), "XIV")
+ck("fallback spares others",  fallbackRoman("Mining Module MK-II"), nil)
 
 -- config.droneKeyByLabel is how the broker reads a drone back OUT of an input
 -- bus at boot -- a module mining when the broker went down still holds one, and

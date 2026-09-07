@@ -10,20 +10,27 @@
 --   cycle mode    -- module GUI only --             setParameter("cycle", false)
 --   introspect    getParametersInfo()               getParameters()
 --
--- GTNH also renamed the mining drone's tier marker -- "Mining Drone MK-IX (UHV)"
--- became "Mining Drone Mk-IX (UHV)". That is not a call, it is an item LABEL,
--- and it matters because labels are how the whole consumable path resolves a
--- drone: iface.store{label} on the loader, getItemsInNetwork{label} on the hw
--- node. An earlier version of this header claimed that path "never changed at
--- all". It had, and the fleet sat idle with every drone counted as zero.
+-- GTNH also renamed the mining drone, and in TWO ways, not one. That is not a
+-- call, it is an item LABEL, and it matters because labels are how the whole
+-- consumable path resolves a drone: iface.store{label} on the loader,
+-- getItemsInNetwork{label} on the hw node. An earlier version of this header
+-- claimed that path "never changed at all". It had, and the fleet sat idle with
+-- every drone counted as zero.
 --
--- AND THE TWO CHANGES DO NOT SHARE A BOUNDARY. The marker moved partway through
--- 2.9, at beta 3, while the parameter API moved at 2.8 -> 2.9:
+-- AND NONE OF THE THREE CHANGES SHARE A BOUNDARY. The parameter API moved at
+-- 2.8 -> 2.9; the voltage suffix appeared at the same time; the marker moved
+-- partway through 2.9, at beta 3:
 --
---     gtVersion      parameter API     drone marker
---     2.8            setParameters     MK
---     2.9-pre-b3     setParameter      MK
---     2.9  (b3+)     setParameter      Mk
+--     gtVersion      parameter API     drone label
+--     2.8            setParameters     Mining Drone MK-IX
+--     2.9-pre-b3     setParameter      Mining Drone MK-IX (UHV)
+--     2.9  (b3+)     setParameter      Mining Drone Mk-IX (UHV)
+--
+-- The 2.8 row cost a tester a day: the code assumed only the marker moved, asked
+-- a 2.8 network for "Mining Drone MK-IX (UHV)" -- an item that does not exist --
+-- and got the same silent zero the marker bug produced. The 2.9-pre-b3 row is
+-- INFERRED, not observed: the suffix and the marker are treated as independent
+-- changes. If a pre-b3 world says otherwise it is one edit, in api.SUFFIX.
 --
 -- So "which GTNH" and "which parameter API" are two different questions with
 -- two different answers, and this file keeps them apart: VERSION is what the
@@ -31,15 +38,15 @@
 -- two call styles that implies (api.DIALECT). configure(), resetDistance() and
 -- detect() all speak dialect and are unaffected by the middle row.
 --
--- The marker cannot be probed, and the middle row is why that is now permanent
+-- The label cannot be probed, and the middle row is why that is now permanent
 -- rather than merely awkward: a probe answers "setParameter" for both 2.9 rows
 -- and cannot tell their labels apart. So it has to be CONFIGURED -- which is
 -- why gtVersion is a stored setting, and why detect() below no longer decides
--- anything. See api.mark().
+-- anything. See api.droneLabel().
 --
 -- Everything else on the miner path really is unchanged: setWorkAllowed() and
 -- isMachineActive() are the same call in both, as is setInterfaceConfiguration
--- and the transposer. So this file owns four calls and one string, and no more;
+-- and the transposer. So this file owns four calls and one label, and no more;
 -- if you find yourself version-gating anything else, check first, because it is
 -- probably not actually version-dependent.
 --
@@ -59,8 +66,8 @@ api.V29 = "2.9"
 api.V28 = "2.8"
 
 -- VERSION: which GTNH the operator says this world is. Three values, because
--- the drone marker changed at 2.9 beta 3 and the parameter API did not.
--- "2.9-pre-b3" is 2.9 BEFORE beta 3; beta 3 itself is the first "Mk" release.
+-- the drone label changed twice and the parameter API once, at two different
+-- boundaries. "2.9-pre-b3" is 2.9 BEFORE beta 3; beta 3 is the first "Mk".
 api.GT28       = "2.8"
 api.GT29_PREB3 = "2.9-pre-b3"
 api.GT29       = "2.9"
@@ -81,23 +88,25 @@ function api.dialect(version)
 end
 
 -- ---------------------------------------------------------------------------
--- THE DRONE TIER MARKER
+-- THE DRONE LABEL
 --
--- "Mining Drone MK-IX (UHV)" before 2.9 beta 3, "Mining Drone Mk-IX (UHV)"
--- after. One string, and the reason gtVersion is a setting instead of a probe:
--- config.lua rewrites config.drones through this, and the broker ships it to
--- the hw node with DRILL_PAR, because that node holds no config and cannot work
--- it out.
+-- Two independent facts, and the reason gtVersion is a setting instead of a
+-- probe: config.lua builds config.drones through this, and the broker ships
+-- both facts to the hw node with DRILL_PAR, because that node holds no config
+-- and cannot work them out.
 --
--- Keyed by VERSION, not dialect -- 2.8 and 2.9-pre-b3 share a marker while
--- speaking different parameter APIs, so a dialect key could not express this.
+-- Both keyed by VERSION, not dialect -- 2.8 and 2.9-pre-b3 speak different
+-- parameter APIs while 2.9-pre-b3 and 2.9 share one, so neither table lines up
+-- with a dialect key.
 --
--- Falls back to the current spelling for an unknown version rather than
--- returning nil. A nil here would concatenate into "Mining Drone nil-IX (UHV)"
--- three layers away from the mistake; a wrong-but-plausible label fails as a
--- clean "no drones in stock", which is the symptom this whole change exists to
--- fix and is therefore the one an operator has a chance of recognising.
+-- Both fall back to the CURRENT pack for an unknown version rather than
+-- returning nil. A nil marker would concatenate into "Mining Drone nil-IX
+-- (UHV)" three layers away from the mistake; a wrong-but-plausible label fails
+-- as a clean "no drones in stock", which is the symptom this whole thing exists
+-- to fix and is therefore the one an operator has a chance of recognising.
 -- ---------------------------------------------------------------------------
+
+-- The tier marker: "MK-" through 2.9 beta 3, "Mk-" after.
 api.MARK = {
   [api.GT28]       = "MK",
   [api.GT29_PREB3] = "MK",
@@ -108,12 +117,37 @@ function api.mark(version)
   return api.MARK[version] or api.MARK[api.GT29]
 end
 
--- Rewrite one drone label for `version`. Case-insensitive on the way in so it
--- is idempotent -- relabelling an already-relabelled table is a no-op, not a
--- miss -- and anchored on "Mining Drone " so it cannot chew on anything else.
-function api.relabel(label, version)
-  if type(label) ~= "string" then return label end
-  return (label:gsub("^(Mining Drone )[Mm][Kk]%-", "%1" .. api.mark(version) .. "-"))
+-- Does the label carry the voltage in parentheses? 2.8 does not: the item is
+-- plain "Mining Drone MK-IX" there, and asking a 2.8 network for the suffixed
+-- name matches nothing at all.
+--
+-- Note the `== nil` test rather than `or`: `false` is a legitimate value here
+-- and `api.SUFFIX[version] or default` would read it as absent, which is the
+-- one version that needs the answer.
+api.SUFFIX = {
+  [api.GT28]       = false,
+  [api.GT29_PREB3] = true,
+  [api.GT29]       = true,
+}
+
+function api.suffix(version)
+  local s = api.SUFFIX[version]
+  if s == nil then return api.SUFFIX[api.GT29] end
+  return s
+end
+
+-- The one place a drone label is spelled, from its two parts: roman = "IX",
+-- volt = "UHV".
+--
+-- BUILT, not rewritten. This used to be relabel(), a string -> string gsub over
+-- the shipped table, which worked only while the marker was the sole
+-- difference: dropping " (UHV)" for 2.8 throws the voltage away, so the reverse
+-- direction cannot be recovered from the string. Holding the parts means every
+-- form is reachable from every other, and adding a fourth costs a table row.
+function api.droneLabel(roman, volt, version)
+  local base = "Mining Drone " .. api.mark(version) .. "-" .. tostring(roman)
+  if api.suffix(version) then return base .. " (" .. tostring(volt) .. ")" end
+  return base
 end
 
 -- ---------------------------------------------------------------------------

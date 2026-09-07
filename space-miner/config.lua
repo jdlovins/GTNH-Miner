@@ -22,9 +22,9 @@ do
   end
 end
 
--- Same two paths, and for the same reason. Needed for the drone relabel in §14b
--- -- module_api owns the 2.8/2.9 tier marker along with the parameter API, so
--- that one string is not written down in two files.
+-- Same two paths, and for the same reason. Needed to build the drone labels in
+-- §14b -- module_api owns every 2.8/2.9 difference, the label form along with
+-- the parameter API, so no version spelling is written down in two files.
 local moduleApi
 do
   for _, path in ipairs({ "/home/module_api.lua", "module_api.lua" }) do
@@ -55,33 +55,43 @@ end
 
 --------------------------------------------------------------------------------
 -- 1. DRONE REGISTRY
--- Maps short tier keys (lv, mv, ... uxv) to the exact item name as reported
--- by the ME network. Used by hw_telem for inventory scanning and by job_node
--- when requesting items via transposer.
+-- Maps short tier keys (lv, mv, ... max) to the exact item name as reported by
+-- the ME network. Used by hw_telem for inventory scanning and by the loader
+-- when fingerprinting items for the transposer.
 --
--- WRITTEN IN THE 2.8 SPELLING, AND NOT NECESSARILY WHAT YOU WILL READ HERE AT
--- RUNTIME. GTNH 2.9 renamed the tier marker to "Mk-", and §14b below rewrites
--- every entry in place once gtVersion is known -- which cannot happen here,
--- three thousand lines before the user overlay is merged. Read config.drones,
--- never this literal, and see module_api.lua for why the version is configured
--- rather than probed.
+-- THE PARTS ARE WRITTEN DOWN; THE LABEL IS NOT. A drone label is a roman tier
+-- and a voltage, and how those are spelled depends on the pack: 2.8 is
+-- "Mining Drone MK-IX", 2.9 is "Mining Drone Mk-IX (UHV)". §14b builds
+-- config.drones from these once gtVersion is known -- which cannot happen here,
+-- three thousand lines before the user overlay is merged.
+--
+-- This used to be a table of literal 2.8 strings that §14b rewrote in place,
+-- and that only worked while the marker was the sole difference. It is not:
+-- dropping " (UHV)" for 2.8 throws the voltage away, so a string rewrite cannot
+-- go back. Read config.drones, and see module_api.lua for why the version is
+-- configured rather than probed.
 --------------------------------------------------------------------------------
-config.drones = {
-  lv  = "Mining Drone MK-I (LV)",
-  mv  = "Mining Drone MK-II (MV)",
-  hv  = "Mining Drone MK-III (HV)",
-  ev  = "Mining Drone MK-IV (EV)",
-  iv  = "Mining Drone MK-V (IV)",
-  luv = "Mining Drone MK-VI (LuV)",
-  zpm = "Mining Drone MK-VII (ZPM)",
-  uv  = "Mining Drone MK-VIII (UV)",
-  uhv = "Mining Drone MK-IX (UHV)",
-  uev = "Mining Drone MK-X (UEV)",
-  uiv = "Mining Drone MK-XI (UIV)",
-  umv = "Mining Drone MK-XII (UMV)",
-  uxv = "Mining Drone MK-XIII (UXV)",
-  max = "Mining Drone MK-XIV (MAX)"
+config.droneTiers = {
+  lv  = { roman = "I",    volt = "LV"  },
+  mv  = { roman = "II",   volt = "MV"  },
+  hv  = { roman = "III",  volt = "HV"  },
+  ev  = { roman = "IV",   volt = "EV"  },
+  iv  = { roman = "V",    volt = "IV"  },
+  luv = { roman = "VI",   volt = "LuV" },
+  zpm = { roman = "VII",  volt = "ZPM" },
+  uv  = { roman = "VIII", volt = "UV"  },
+  uhv = { roman = "IX",   volt = "UHV" },
+  uev = { roman = "X",    volt = "UEV" },
+  uiv = { roman = "XI",   volt = "UIV" },
+  umv = { roman = "XII",  volt = "UMV" },
+  uxv = { roman = "XIII", volt = "UXV" },
+  max = { roman = "XIV",  volt = "MAX" }
 }
+
+-- Filled by config.setGtVersion() in §14b. Empty here on purpose: a placeholder
+-- spelling would be one more thing that could be read by accident and be wrong
+-- on exactly the pack this table exists to get right.
+config.drones = {}
 
 -- Iteration order for best-available drone selection (highest tier first).
 -- Broker walks this list and picks the first tier that is both in stock
@@ -3051,26 +3061,30 @@ end
 -- Has to run HERE, after the overlay: gtVersion is a setting, so it is not
 -- known until user_config.lua has been merged, and §1 is far too early.
 --
--- Rewritten IN PLACE rather than exposed as a lookup function, so that every
--- existing reader -- loader.lua, job_node.lua, the broker's dashboard -- keeps
--- saying config.drones[key] and none of them has to know this happened. The
--- label they get is simply correct, which is why nothing downstream needs a
+-- Written into config.drones rather than exposed as a lookup function, so that
+-- every existing reader -- loader.lua, job_node.lua, the broker's dashboard --
+-- keeps saying config.drones[key] and none of them has to know this happened.
+-- The label they get is simply correct, which is why nothing downstream needs a
 -- case-insensitive comparison.
 --
--- config.droneMark is published for the two places that build a label rather
--- than read one: the broker's DRILL_PAR broadcast (the hw node holds no config
--- and cannot derive it) and the editor's drill page.
+-- config.droneMark and config.droneSuffix are published for the place that
+-- builds a label rather than reads one: the broker's DRILL_PAR broadcast, since
+-- the hw node holds no config and cannot derive either.
 --------------------------------------------------------------------------------
--- Idempotent, and deliberately so: relabel() matches the marker case-insensitively,
--- so running this over an already-relabelled table is a no-op rather than a miss.
--- That is what lets the boot prompt call it again with a different answer without
--- config.lua having to keep a pristine copy of the shipped spelling around.
+-- Idempotent because it BUILDS from config.droneTiers rather than editing the
+-- strings it finds. The old version gsub'd the table in place, which was
+-- idempotent only by luck -- and stopped being reversible the moment 2.8 turned
+-- out to drop the voltage suffix as well as spell the marker differently. This
+-- is what lets the editor call it again with a different answer without
+-- config.lua keeping a pristine copy of anything around.
 function config.setGtVersion(version)
   config.gtVersion = version
   config.settings.gtVersion = version
-  config.droneMark = moduleApi.mark(version)
-  for key, name in pairs(config.drones) do
-    config.drones[key] = moduleApi.relabel(name, version)
+  config.droneMark   = moduleApi.mark(version)
+  config.droneSuffix = moduleApi.suffix(version)
+  config.drones = {}
+  for key, tier in pairs(config.droneTiers) do
+    config.drones[key] = moduleApi.droneLabel(tier.roman, tier.volt, version)
   end
   -- Label -> key, for reading a drone back OUT of a module's input bus. The
   -- broker needs it at boot: a module that was mining when the broker went down
@@ -3092,15 +3106,15 @@ config.setGtVersion(config.gtVersion)
 -- "Mk-IX (UHV)" -- the drone's tier and voltage, for panels that are naming a
 -- tier rather than resolving an item.
 --
--- Derived by trimming the label instead of parsing the marker out of it. Three
--- display sites used to do droneName:match("MK%-(.+)") and then print "MK-" ..
--- that, which broke on the rename for no reason -- they were reconstructing a
--- string they already had. Trimming also keeps the voltage suffix spelled the
--- way the pack spells it (LuV, not LUV) without a second table to maintain.
+-- Built from the parts, not trimmed off the label. It used to be a gsub over
+-- config.drones[key], which is fine right up until the label stops carrying the
+-- voltage: on 2.8 that trim yields a bare "MK-IX" and every dashboard silently
+-- loses its voltage column. A display string and an item name are two different
+-- things, and only one of them has to match what the ME network says.
 function config.droneModel(key)
-  local label = config.drones[key]
-  if not label then return "Drone-" .. tostring(key) end
-  return (label:gsub("^Mining Drone ", ""))
+  local tier = config.droneTiers[key]
+  if not tier then return "Drone-" .. tostring(key) end
+  return config.droneMark .. "-" .. tier.roman .. " (" .. tier.volt .. ")"
 end
 
 return config

@@ -43,38 +43,51 @@ local nodeName = "MEDINA-HWRelay"
 -- Hardcoded drone and drill lists (don't load config to save memory)
 local droneKeys = {"max","uxv","umv","uiv","uev","uhv","uv","zpm","luv","iv","ev","hv","mv","lv"}
 
--- The tier and voltage part of each drone label, without the marker.
+-- The roman tier of each drone, without the marker or the voltage.
 --
--- GTNH renamed that marker -- "MK-IX" on 2.8, "Mk-IX" on 2.9 -- and the label is
--- how this node counts drones, so getting it wrong reports 0 of every tier and
--- the broker never dispatches. This node cannot work out which spelling to use:
--- it holds an ME controller and nothing else, loads no config.lua by design, and
--- an item name has nothing to probe. So the broker sends it with DRILL_PAR, the
--- same way it sends drillCraftSlots, and droneNames is rebuilt when it arrives.
-local droneModels = {
-  max="XIV (MAX)", uxv="XIII (UXV)", umv="XII (UMV)",
-  uiv="XI (UIV)",  uev="X (UEV)",    uhv="IX (UHV)",
-  uv="VIII (UV)",  zpm="VII (ZPM)",  luv="VI (LuV)",
-  iv="V (IV)",     ev="IV (EV)",     hv="III (HV)",
-  mv="II (MV)",    lv="I (LV)"
+-- GTNH has renamed this label twice, and the label is how this node counts
+-- drones, so getting it wrong reports 0 of every tier and the broker never
+-- dispatches:
+--
+--     2.8          Mining Drone MK-IX
+--     2.9-pre-b3   Mining Drone MK-IX (UHV)
+--     2.9  (b3+)   Mining Drone Mk-IX (UHV)
+--
+-- This node cannot work out which form to use: it holds an ME controller and
+-- nothing else, loads no config.lua by design, and an item name has nothing to
+-- probe. So the broker sends both facts with DRILL_PAR, the same way it sends
+-- drillCraftSlots, and droneNames is rebuilt when they arrive.
+local droneRoman = {
+  max="XIV", uxv="XIII", umv="XII",
+  uiv="XI",  uev="X",    uhv="IX",
+  uv="VIII", zpm="VII",  luv="VI",
+  iv="V",    ev="IV",    hv="III",
+  mv="II",   lv="I"
 }
 
--- Reverse of droneModels, for the full-scan fallback: "IX (UHV)" -> "uhv".
-local droneKeyByModel = {}
-for key, model in pairs(droneModels) do droneKeyByModel[model] = key end
-
--- Defaults to the 2.9 spelling rather than the older one, so a fresh install on
--- the current pack is right from the first scan even if the broker never comes
--- up. A 2.8 fleet reads zero for one cycle and corrects on the first DRILL_PAR.
-local droneMark  = "Mk"
-local droneNames = {}
-
--- Map drone keys to their voltage tiers
+-- Map drone keys to their voltage tiers. The other half of a label, and the
+-- tier column on the dashboard.
 local droneVoltages = {
   max="MAX", uxv="UXV", umv="UMV", uiv="UIV", uev="UEV", uhv="UHV",
   uv="UV", zpm="ZPM", luv="LuV", iv="IV", ev="EV", hv="HV",
   mv="MV", lv="LV"
 }
+
+-- Reverse of droneRoman, for the full-scan fallback: "IX" -> "uhv".
+--
+-- Keyed on the ROMAN ALONE, which is the one part of the label no version has
+-- moved. It used to be keyed on "IX (UHV)", so the fallback matched 2.9 and
+-- nothing else -- meaning it did not in fact rescue a node the broker had not
+-- reached, which is the entire reason the fallback is marker-insensitive.
+local droneKeyByRoman = {}
+for key, roman in pairs(droneRoman) do droneKeyByRoman[roman] = key end
+
+-- Defaults to the 2.9 spelling rather than an older one, so a fresh install on
+-- the current pack is right from the first scan even if the broker never comes
+-- up. A 2.8 fleet reads zero for one cycle and corrects on the first DRILL_PAR.
+local droneMark   = "Mk"
+local droneSuffix = true
+local droneNames  = {}
 
 modem.setStrength(400)
 -- Only 2025 is opened. modem.open() is what makes a port RECEIVE; broadcasting
@@ -492,7 +505,8 @@ local scanTargets = {}
 
 local function rebuildDroneLabels()
   for _, key in ipairs(droneKeys) do
-    droneNames[key] = "Mining Drone " .. droneMark .. "-" .. droneModels[key]
+    local base = "Mining Drone " .. droneMark .. "-" .. droneRoman[key]
+    droneNames[key] = droneSuffix and (base .. " (" .. droneVoltages[key] .. ")") or base
   end
   scanTargets = {}
   for _, key in ipairs(droneKeys) do
@@ -586,12 +600,18 @@ local function scanFull()
   for _, item in ipairs(itemList) do
     if item.label then
       if string.find(item.label, "Mining Drone", 1, true) then
-        -- Marker-insensitive on purpose, and only here. The filtered path has to
+        -- Form-insensitive on purpose, and only here. The filtered path has to
         -- name an exact label because the match happens on the Java side, but
         -- this path is already holding the network's own string -- so it can
-        -- accept either spelling and cost nothing, which keeps the full-scan
-        -- fallback working on a node the broker has not reached yet.
-        local key = droneKeyByModel[item.label:gsub("^Mining Drone [Mm][Kk]%-", "")]
+        -- read the roman out of any spelling and cost nothing, which keeps the
+        -- full-scan fallback working on a node the broker has not reached yet.
+        --
+        -- The capture stops at the roman and ignores whatever follows, so a
+        -- bare "Mining Drone MK-IX" and a suffixed "Mining Drone Mk-IX (UHV)"
+        -- both land on "IX". [XVI]+ is greedy, so "XIII" captures whole rather
+        -- than colliding with "X".
+        local roman = item.label:match("^Mining Drone [Mm][Kk]%-([XVI]+)")
+        local key   = roman and droneKeyByRoman[roman]
         if key then assets.drones[key] = (assets.drones[key] or 0) + item.size end
       elseif drillLookup[item.label] then
         local key = drillLookup[item.label]
@@ -629,11 +649,13 @@ local function updateDashboard(assets)
     term.setCursor(2, row)
     gpu.fill(2, row, 36, 1, " ")
     gpu.setForeground(count > 0 and 0x00FFFF or 0x555555)
-    -- Display drone model with voltage tier. Built from droneModels rather than
+    -- Display drone model with voltage tier. Built from droneRoman rather than
     -- picked back out of the label: the tier is its own column, and the label is
-    -- for asking the network with, not for reading identity out of.
+    -- for asking the network with, not for reading identity out of. That split
+    -- is what keeps the voltage on screen for a 2.8 fleet, whose labels do not
+    -- carry one.
     local voltage = droneVoltages[key]
-    local model   = droneMark .. "-" .. (droneModels[key]:match("^[XVI]+") or "?")
+    local model   = droneMark .. "-" .. (droneRoman[key] or "?")
     io.write(string.format("  %-14s [%s]: %d", model, voltage, count))
   end
 
@@ -882,14 +904,22 @@ while true do
           -- answer: too few slots is slow, too many is rejected requests.
           slots = tonumber(msg.data.slots) or 1
           if slots < 1 then slots = 1 end
-          -- Which spelling of the drone tier marker this pack uses. Absent from
-          -- an older broker, which leaves the default standing rather than
+          -- Which drone label form this pack uses: the marker's case, and
+          -- whether the voltage is in the name at all. Both absent from an
+          -- older broker, which leaves the 2.9 defaults standing rather than
           -- blanking the labels. Rebuild only on a change: it reallocates
           -- scanTargets, and this message arrives every 30 seconds.
+          --
+          -- The suffix is read as `~= false` so an older broker's nil means
+          -- "2.9 form", matching the default above. It is only honoured
+          -- alongside a valid marker, so a malformed packet cannot half-apply.
           local mark = msg.data.droneMark
-          if (mark == "MK" or mark == "Mk") and mark ~= droneMark then
-            droneMark = mark
-            rebuildDroneLabels()
+          if mark == "MK" or mark == "Mk" then
+            local suffix = msg.data.droneSuffix ~= false
+            if mark ~= droneMark or suffix ~= droneSuffix then
+              droneMark, droneSuffix = mark, suffix
+              rebuildDroneLabels()
+            end
           end
         end
       end

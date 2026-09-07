@@ -214,42 +214,47 @@ S.list = {
   -- these numbers, so a fleet that has drifted says so instead of quietly
   -- mis-dispatching. Update these when you craft or lose a drone.
   { key = "droneStock.lv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "LV drones", help = "how many Mining Drone Mk-I (LV) you own" },
+    label = "LV drones", help = "how many LV mining drones you own" },
   { key = "droneStock.mv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "MV drones", help = "how many Mining Drone Mk-II (MV) you own" },
+    label = "MV drones", help = "how many MV mining drones you own" },
   { key = "droneStock.hv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "HV drones", help = "how many Mining Drone Mk-III (HV) you own" },
+    label = "HV drones", help = "how many HV mining drones you own" },
   { key = "droneStock.ev", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "EV drones", help = "how many Mining Drone Mk-IV (EV) you own" },
+    label = "EV drones", help = "how many EV mining drones you own" },
   { key = "droneStock.iv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "IV drones", help = "how many Mining Drone Mk-V (IV) you own" },
+    label = "IV drones", help = "how many IV mining drones you own" },
   { key = "droneStock.luv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "LuV drones", help = "how many Mining Drone Mk-VI (LuV) you own" },
+    label = "LuV drones", help = "how many LuV mining drones you own" },
   { key = "droneStock.zpm", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "ZPM drones", help = "how many Mining Drone Mk-VII (ZPM) you own" },
+    label = "ZPM drones", help = "how many ZPM mining drones you own" },
   { key = "droneStock.uv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "UV drones", help = "how many Mining Drone Mk-VIII (UV) you own" },
+    label = "UV drones", help = "how many UV mining drones you own" },
   { key = "droneStock.uhv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "UHV drones", help = "how many Mining Drone Mk-IX (UHV) you own" },
+    label = "UHV drones", help = "how many UHV mining drones you own" },
   { key = "droneStock.uev", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "UEV drones", help = "how many Mining Drone Mk-X (UEV) you own" },
+    label = "UEV drones", help = "how many UEV mining drones you own" },
   { key = "droneStock.uiv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "UIV drones", help = "how many Mining Drone Mk-XI (UIV) you own" },
+    label = "UIV drones", help = "how many UIV mining drones you own" },
   { key = "droneStock.umv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "UMV drones", help = "how many Mining Drone Mk-XII (UMV) you own" },
+    label = "UMV drones", help = "how many UMV mining drones you own" },
   { key = "droneStock.uxv", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "UXV drones", help = "how many Mining Drone Mk-XIII (UXV) you own" },
+    label = "UXV drones", help = "how many UXV mining drones you own" },
   { key = "droneStock.max", group = "hardware", type = "int", default = 0, min = 0, max = 999,
-    label = "MAX drones", help = "how many Mining Drone Mk-XIV (MAX) you own" },
+    label = "MAX drones", help = "how many MAX mining drones you own" },
 
   -- --- COMPATIBILITY -------------------------------------------------------
   -- Which GTNH this fleet is running. Two things hang off it, module_api.lua
   -- holds both, and THEY DO NOT SHARE A BOUNDARY -- which is why there are
   -- three choices for two parameter APIs:
   --
-  --     2.9          setParameter    drones "Mk-"   (beta 3 onward)
-  --     2.9-pre-b3   setParameter    drones "MK-"
-  --     2.8          setParameters   drones "MK-"
+  --     2.9          setParameter    Mining Drone Mk-IX (UHV)   (beta 3 onward)
+  --     2.9-pre-b3   setParameter    Mining Drone MK-IX (UHV)
+  --     2.8          setParameters   Mining Drone MK-IX
+  --
+  -- The label moved twice: 2.9 added the voltage in parentheses, and beta 3
+  -- lowercased the marker. Both matter equally -- either one wrong and every
+  -- lookup misses, which shows up as an empty fleet rather than a spelling
+  -- mistake.
   --
   -- The drone label is an item name, so it has nothing to probe for -- and the
   -- middle row makes that permanent rather than merely awkward: a probe answers
@@ -259,8 +264,8 @@ S.list = {
   --
   -- Not scope = "node": the dust and fluid nodes have no use for it, and the hw
   -- node -- which does, for the drone labels -- stays off the command port and
-  -- receives the marker with DRILL_PAR instead, the same way drillCraftSlots
-  -- does. See broadcastDrillPar() in broker-mk3.lua.
+  -- receives the label form with DRILL_PAR instead, the same way
+  -- drillCraftSlots does. See broadcastDrillPar() in broker-mk3.lua.
   { key = "gtVersion", group = "compat", type = "choice", default = "2.9",
     choices = { "2.9", "2.9-pre-b3", "2.8" },
     label = "GTNH version",

@@ -130,8 +130,11 @@ end
 -- Prefer the lowest tier, which is the one you are most likely to own, and walk
 -- droneKeyOrder backwards (it runs highest to lowest) so the fallback is
 -- deterministic too.
+-- The literal is a last resort for a machine with no config.lua at all, and is
+-- the CURRENT pack's spelling -- there is nothing here to derive the right one
+-- from. On an older pack it will be wrong, which costs a retype at the prompt.
 local okMain, mainConf = pcall(dofile, "/home/config.lua")
-local defaultProbe = "Mining Drone MK-I (LV)"
+local defaultProbe = "Mining Drone Mk-I (LV)"
 if okMain and type(mainConf) == "table" and type(mainConf.drones) == "table" then
   defaultProbe = mainConf.drones.lv or defaultProbe
   if not mainConf.drones.lv and type(mainConf.droneKeyOrder) == "table" then

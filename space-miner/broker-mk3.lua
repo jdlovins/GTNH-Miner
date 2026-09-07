@@ -2584,8 +2584,12 @@ local function runBootPrompt()
   -- better than a prompt, because it tells you the answer instead of asking you
   -- for it. Priority mode is asked because it is a genuine per-session choice.
   logger:info("[STARTUP] priority mode = " .. brokerState.priorityMode)
+  -- The whole label, not just the marker. 2.8 differs from 2.9 in two ways --
+  -- marker case AND whether the voltage is in the name -- so a line reading
+  -- only "MK-" cannot tell a right guess from a wrong one, which is exactly how
+  -- a 2.8 world sat there resolving no drones at all.
   logger:info("[STARTUP] GTNH " .. tostring(config.gtVersion) ..
-              " -- drones named \"" .. tostring(config.droneMark) .. "-\"")
+              " -- drones named \"" .. tostring(config.drones.uhv) .. "\"")
   if gpu then gpu.setForeground(0x00FF00) end
   print("\n  Priority: " .. brokerState.priorityMode:upper() ..
         ".  GTNH " .. tostring(config.gtVersion) .. ".  Starting broker...")
@@ -2944,12 +2948,18 @@ local function broadcastDrillPar()
     -- restockable" -- no drone in stock for any material, say. Empty with
     -- enabled=false means "you have turned this off". An older broker sends
     -- neither, which the node reads as enabled.
-    -- droneMark rides along for the same reason drillCraftSlots does: the node
-    -- holds no config.lua, so it cannot turn a version into an item name. It
-    -- keeps its own default until this arrives, so an older broker that sends
-    -- none costs nothing.
+    -- droneMark and droneSuffix ride along for the same reason drillCraftSlots
+    -- does: the node holds no config.lua, so it cannot turn a version into an
+    -- item name. It keeps its own default until this arrives, so an older
+    -- broker that sends neither costs nothing.
+    --
+    -- Two scalars rather than the fourteen labels themselves. The node already
+    -- holds the roman-and-voltage table -- it needs it to draw its own fleet
+    -- column -- so shipping the labels would put a second copy on the wire
+    -- every thirty seconds to say what four bytes already say.
     data        = { par = list, slots = config.drillCraftSlots or 1,
-                    enabled = enabled, droneMark = config.droneMark },
+                    enabled = enabled, droneMark = config.droneMark,
+                    droneSuffix = config.droneSuffix },
   }))
   local n = 0
   for _ in pairs(list) do n = n + 1 end
