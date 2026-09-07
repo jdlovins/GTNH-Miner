@@ -137,11 +137,21 @@ as before.
 drone is invisible to every other module until it is given back. Dispatch
 normally claims it within a fraction of a second.
 
-**Off by default:** it is the most invasive change to the load path, and the
-failure mode if the broker is wrong about what a module holds would be arming a
-module with the wrong hardware. The loader verifies the drone before committing,
-so that should fail loudly rather than silently — but prove it on your setup
-before leaving it on.
+**On by default.** It was shipped off while it was new, on the grounds that it is
+the most invasive change to the load path and that being wrong about what a
+module holds would mean arming one with the wrong hardware. That has since been
+run in world, and the guard is real: the loader reads bus slot 1 back and refuses
+the load with `drone mismatch in bus: expected X, got Y` before committing tips
+and rods, on the fast path as well as the slow one.
+
+Turn it **off** if you see that error, or any load failing on a module that had
+just finished — that is the broker and the bus disagreeing, and the slow path
+does not depend on them agreeing.
+
+One consequence worth recognising on the hardware panel: a held drone is
+physically in a module's bus, so the ME cannot see it. The tier reads
+`x0 (1 free)` — zero in the network, one owned by the fleet. That gap is fast
+reload working, not a miscount.
 
 ---
 

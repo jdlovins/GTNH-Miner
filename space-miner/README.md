@@ -550,7 +550,7 @@ settings itself. Declaring a knob there is the whole job of adding one here.
   ```lua
   settings = {
     tipsPerLoad         = 256,
-    fastReload          = true,
+    fastReload          = false,
     asteroidCap         = "all",
     ["logging.enabled"] = true,
   }

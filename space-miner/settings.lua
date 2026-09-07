@@ -89,7 +89,7 @@ S.list = {
   { group = "dispatch", type = "note",
     text = "fastReload and holdTimeout below change what a FINISHED module does with its drone" },
 
-  { key = "fastReload", group = "dispatch", type = "bool", default = false,
+  { key = "fastReload", group = "dispatch", type = "bool", default = true,
     label = "Fast reload",
     help  = "a finished module holds its drone when the next job wants the same one" },
 
