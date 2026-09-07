@@ -2457,31 +2457,21 @@ local function runBootPrompt()
   }, 1)
   brokerState.priorityMode = (pr == 2) and "rarity" or "threshold"
 
-  -- ASKED HERE, NOT PERSISTED HERE.
+  -- gtVersion is NOT asked here, deliberately. It is a stored setting, it lives
+  -- on the editor's COMPATIBILITY page, and it changes when you upgrade the pack
+  -- -- which is to say almost never. Prompting for it would ask every boot for a
+  -- value that is already saved, and hand back the saved value as the default.
   --
-  -- gtVersion decides two things that must agree with the world: which parameter
-  -- API the modules speak, and what the ME network calls a mining drone. Neither
-  -- can be worked out from an item name, so it is asked -- and asked at every
-  -- boot for the same reason priority mode is, because this file has no business
-  -- writing user_config.lua. The editor owns that file and nothing else writes
-  -- it, so a value saved there simply arrives as the default below and this is
-  -- one keypress.
-  --
-  -- Answering re-runs the relabel over config.drones, which is why setGtVersion
-  -- is idempotent -- config.lua has already run it once with the stored value.
-  local versions = { moduleApi.V29, moduleApi.V28 }
-  local def = (config.gtVersion == moduleApi.V28) and 2 or 1
-  local gv = promptChoice("\nWhich GTNH is this world running?", {
-    "GTNH 2.9  - setParameter(), drones named \"Mk-\"",
-    "GTNH 2.8  - setParameters(), drones named \"MK-\"",
-  }, def)
-  local mark = config.setGtVersion(versions[gv])
-
+  -- Getting it wrong is not silent: initModules() compares every module's actual
+  -- dialect against it and says so, by name, on the console. That is strictly
+  -- better than a prompt, because it tells you the answer instead of asking you
+  -- for it. Priority mode is asked because it is a genuine per-session choice.
   logger:info("[STARTUP] priority mode = " .. brokerState.priorityMode)
-  logger:info("[STARTUP] GTNH " .. config.gtVersion .. " -- drones named \"" .. mark .. "-\"")
+  logger:info("[STARTUP] GTNH " .. tostring(config.gtVersion) ..
+              " -- drones named \"" .. tostring(config.droneMark) .. "-\"")
   if gpu then gpu.setForeground(0x00FF00) end
   print("\n  Priority: " .. brokerState.priorityMode:upper() ..
-        ".  GTNH " .. config.gtVersion .. ".  Starting broker...")
+        ".  GTNH " .. tostring(config.gtVersion) .. ".  Starting broker...")
   if gpu then gpu.setForeground(0xFFFFFF) end
   os.sleep(1)
 end

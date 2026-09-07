@@ -502,11 +502,14 @@ are the same call on both, as are `setInterfaceConfiguration` and the
 transposer. All four version-dependent calls and the one version-dependent
 string live in [`module_api.lua`](module_api.lua) and nowhere else.
 
-**The broker asks at boot** and logs the answer (`[STARTUP] M1 speaks GTNH 2.9
-(configured)`). The stored `gtVersion` is the default, so once it is saved this
-is a keypress. A module whose adapter answers neither dialect is reported as an
-error on the dashboard and kept out of dispatch rather than being handed a job
-it cannot be told where to send.
+**Set it on the editor's COMPATIBILITY page** (press `E`), where it saves to
+`user_config.lua` like any other setting. The broker logs what it is using at
+boot (`[STARTUP] M1 speaks GTNH 2.9 (configured)`). A module whose adapter
+answers neither dialect is reported as an error on the dashboard and kept out of
+dispatch rather than being handed a job it cannot be told where to send.
+
+There is no boot prompt for this. It changes when you upgrade the pack and not
+otherwise, and a wrong value announces itself anyway — see below.
 
 **A wrong answer is caught at boot, not at dispatch.** `detect()` reads what the
 adapter actually speaks and the broker warns when that disagrees:
