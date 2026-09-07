@@ -2504,8 +2504,10 @@ local function initModules()
       if mod.dialect == moduleApi.V28 then anyLegacy = true end
       logger:info("[STARTUP] M%d speaks %s", mod.index, moduleApi.describe(mod))
       -- The probe does not decide any more, but it still knows. Comparing it
-      -- against the answer given at the prompt is the ONLY chance to catch a
-      -- wrong gtVersion before a job runs: without it the module loads a drone,
+      -- against the parameter API the setting implies -- not against the setting
+      -- itself, which is a different string on 2.9-pre-b3 -- is the ONLY chance
+      -- to catch a wrong gtVersion before a job runs: without it a module loads a
+      -- drone,
       -- a stack of tips and a stack of rods, and only then throws on a
       -- parameter call that does not exist. Warn, do not fail -- a forced
       -- setting beating a misreading probe is exactly why the setting exists.

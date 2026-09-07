@@ -456,26 +456,41 @@ fetch one; otherwise timestamps are uptime-relative.
 
 ### `gtVersion`
 
-Which GTNH this world is running: `2.9` (default) or `2.8`. It selects two
-things, and both must match the world.
+Which GTNH this world is running: `2.9` (default), `2.9-pre-b3`, or `2.8`. It
+selects two things, and both must match the world.
+
+**Three choices for two parameter APIs**, because the two things did not change
+at the same time — the drone rename landed partway through 2.9, at beta 3:
+
+| `gtVersion` | parameter API | drone names |
+|---|---|---|
+| `2.9` | `setParameter` | `Mining Drone Mk-IX (UHV)` |
+| `2.9-pre-b3` | `setParameter` | `Mining Drone MK-IX (UHV)` |
+| `2.8` | `setParameters` | `Mining Drone MK-IX (UHV)` |
+
+`2.9-pre-b3` means 2.9 **before** beta 3; beta 3 itself is the first `Mk`
+release. If you are on 2.9 and drone stock reads 0 for every tier, this is the
+setting to move.
 
 **The module parameter API.** GTNH 2.9 replaced the module's positional
 parameter call with a named one, and the two forms are disjoint — a 2.9 module
 has no `setParameters` at all, which is how the broker originally found out
 about the break ("attempt to call a nil value (field 'setParameters')").
 
-**The drone item names.** 2.9 also renamed the mining drone's tier marker:
-`Mining Drone MK-IX (UHV)` became `Mining Drone Mk-IX (UHV)`. Labels are how
-every drone is resolved — `iface.store{label}` on the loader,
+**The drone item names.** GTNH 2.9 beta 3 renamed the mining drone's tier
+marker: `Mining Drone MK-IX (UHV)` became `Mining Drone Mk-IX (UHV)`. Labels are
+how every drone is resolved — `iface.store{label}` on the loader,
 `getItemsInNetwork{label}` on the hw node — so the wrong spelling reports **0 of
 every tier** and the fleet never dispatches. That symptom looks exactly like an
 empty ME network, which is why the boot check below exists.
 
 **There used to be an `auto` that probed each module, and the drone label is
 what removed it.** An item name has nothing to probe: no method's presence tells
-you what the pack calls a drone. So the label has to be configured, and a system
-that probes the API while configuring the label holds two answers to one
-question. There is one now, asked at the broker's boot prompt.
+you what the pack calls a drone. The `2.9-pre-b3` row makes that permanent
+rather than merely awkward — a probe answers `setParameter` for both 2.9 rows
+and cannot tell their drone names apart. So the version is configured, and
+`module_api.lua` keeps "which GTNH" and "which parameter API" as two separate
+facts with a mapping between them.
 
 `module_api.lua`'s `detect()` still runs at startup, but only to *object*: if a
 module speaks a dialect other than the one you chose, the broker warns at boot
@@ -512,7 +527,9 @@ There is no boot prompt for this. It changes when you upgrade the pack and not
 otherwise, and a wrong value announces itself anyway — see below.
 
 **A wrong answer is caught at boot, not at dispatch.** `detect()` reads what the
-adapter actually speaks and the broker warns when that disagrees:
+adapter actually speaks, and the broker warns when that disagrees with the
+parameter API your version implies — note *implies*: on `2.9-pre-b3` a module
+correctly speaks `2.9`, and that is not a mismatch:
 
 ```
 [STARTUP] M1 configured for GTNH 2.8 but this module speaks 2.9

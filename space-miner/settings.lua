@@ -196,27 +196,28 @@ S.list = {
     label = "Boot epoch", help = "real unix seconds at boot, to anchor timestamps; 0 = uptime-relative" },
 
   -- --- COMPATIBILITY -------------------------------------------------------
-  -- Which GTNH this fleet is running. Two things hang off it, and module_api.lua
-  -- holds both: the mining module's parameter API (2.9 renamed it, and the two
-  -- forms are disjoint) and the mining drone's item label ("MK-IX" on 2.8,
-  -- "Mk-IX" on 2.9).
+  -- Which GTNH this fleet is running. Two things hang off it, module_api.lua
+  -- holds both, and THEY DO NOT SHARE A BOUNDARY -- which is why there are
+  -- three choices for two parameter APIs:
   --
-  -- There used to be an "auto" that probed each adapter, and the label is what
-  -- killed it. An item name has nothing to probe -- no method's presence tells
-  -- you what the pack calls a drone -- so the label has to be configured, and a
-  -- system that probes the API while configuring the label carries two answers
-  -- to one question. Now there is one, asked at the boot prompt. module_api's
-  -- detect() still runs at startup, but only to warn when the hardware
-  -- disagrees with what it was told.
+  --     2.9          setParameter    drones "Mk-"   (beta 3 onward)
+  --     2.9-pre-b3   setParameter    drones "MK-"
+  --     2.8          setParameters   drones "MK-"
+  --
+  -- The drone label is an item name, so it has nothing to probe for -- and the
+  -- middle row makes that permanent rather than merely awkward: a probe answers
+  -- "setParameter" for both 2.9 rows and cannot tell their labels apart. So it
+  -- is configured. module_api's detect() still runs at startup, but only to
+  -- warn when a module's actual API disagrees with what it was told.
   --
   -- Not scope = "node": the dust and fluid nodes have no use for it, and the hw
   -- node -- which does, for the drone labels -- stays off the command port and
-  -- receives it with DRILL_PAR instead, the same way drillCraftSlots does. See
-  -- broadcastDrillPar() in broker-mk3.lua.
+  -- receives the marker with DRILL_PAR instead, the same way drillCraftSlots
+  -- does. See broadcastDrillPar() in broker-mk3.lua.
   { key = "gtVersion", group = "compat", type = "choice", default = "2.9",
-    choices = { "2.9", "2.8" },
+    choices = { "2.9", "2.9-pre-b3", "2.8" },
     label = "GTNH version",
-    help  = "selects the module parameter API and the drone item names" },
+    help  = "parameter API + drone names; 2.9-pre-b3 is 2.9 before beta 3" },
 }
 
 -- ---------------------------------------------------------------------------

@@ -119,6 +119,16 @@ ck("describe",              api.describe({ dialect = "2.8", dialectHow = "probed
 ck("mark 2.8",              api.mark("2.8"), "MK")
 ck("mark 2.9",              api.mark("2.9"), "Mk")
 ck("mark unknown -> 2.9",   api.mark("2.7"), "Mk")
+
+-- THE MIDDLE ROW. 2.9 before beta 3 speaks the 2.9 parameter API but still
+-- names drones the 2.8 way, so version and dialect are genuinely two facts.
+-- Every assertion in this block is one the old one-string model could not state.
+ck("pre-b3 marker is 2.8's",  api.mark("2.9-pre-b3"), "MK")
+ck("pre-b3 dialect is 2.9's", api.dialect("2.9-pre-b3"), "2.9")
+ck("2.8 dialect",             api.dialect("2.8"), "2.8")
+ck("2.9 dialect",             api.dialect("2.9"), "2.9")
+ck("unknown has no dialect",  api.dialect("2.7"), nil)
+ck("three versions offered",  #api.VERSIONS, 3)
 ck("relabel to 2.9",        api.relabel("Mining Drone MK-IX (UHV)", "2.9"),
                             "Mining Drone Mk-IX (UHV)")
 ck("relabel to 2.8",        api.relabel("Mining Drone Mk-IX (UHV)", "2.8"),
@@ -136,11 +146,31 @@ local resolved, how = api.resolve(fake29(), "2.8")
 ck("resolve honours setting", resolved, "2.8")
 ck("resolve says configured", how, "configured")
 ck("resolve refuses unknown", (api.resolve(fake29(), "auto")), nil)
+-- resolve TRANSLATES version -> dialect. Handing the setting back verbatim
+-- would put "2.9-pre-b3" in mod.dialect, and configure() would refuse every job
+-- on a pre-beta-3 fleet with "unknown module API dialect".
+ck("resolve translates pre-b3", (api.resolve(fake29(), "2.9-pre-b3")), "2.9")
+ck("pre-b3 configures as 2.9",
+   api.configure({ adapter = fake29(), conf = {},
+                   dialect = (api.resolve(fake29(), "2.9-pre-b3")) }, { distance = 7 }), true)
 
 -- detect() no longer decides, but it still objects.
 ck("check agrees",          api.check(fake29(), "2.9"), nil)
 ck("check disagrees",       (api.check(fake29(), "2.8")):match("speaks 2%.9") ~= nil, true)
 ck("check ignores non-module", api.check({}, "2.9"), nil)
+-- The regression the middle row creates: a 2.9 adapter on a pre-beta-3 fleet is
+-- CORRECT and must not warn. Comparing the probe against the setting string
+-- rather than against the dialect it implies would warn on every module, every
+-- boot, for a configuration that is right.
+ck("pre-b3 does not warn",  api.check(fake29(), "2.9-pre-b3"), nil)
+ck("pre-b3 warns on 2.8 hw",
+   (api.check(fake28(), "2.9-pre-b3")):match("speaks 2%.8") ~= nil, true)
+-- and says which parameter API it expected, since "2.9-pre-b3" alone would read
+-- as nonsense next to "speaks 2.9".
+ck("pre-b3 names the API",
+   (api.check(fake28(), "2.9-pre-b3")):match("parameter API 2%.9") ~= nil, true)
+ck("2.9 needs no API gloss",
+   (api.check(fake28(), "2.9")):match("parameter API") == nil, true)
 
 -- =============================================================================
 section("config.lua / hw_telem.lua -- drone labels follow the pack version")
@@ -165,13 +195,15 @@ ck("config ships 14 drones", nShipped, 14)
 
 -- Every tier converts, in both directions. A gsub anchored slightly wrong would
 -- leave exactly one behind, and one missing tier is a silent 0-in-stock.
-local bad29, bad28 = 0, 0
+local bad29, bad28, badPre = 0, 0, 0
 for _, name in pairs(shipped) do
   if not api.relabel(name, "2.9"):match("^Mining Drone Mk%-") then bad29 = bad29 + 1 end
   if not api.relabel(name, "2.8"):match("^Mining Drone MK%-") then bad28 = bad28 + 1 end
+  if not api.relabel(name, "2.9-pre-b3"):match("^Mining Drone MK%-") then badPre = badPre + 1 end
 end
 ck("all 14 relabel to 2.9", bad29, 0)
 ck("all 14 relabel to 2.8", bad28, 0)
+ck("all 14 relabel pre-b3", badPre, 0)
 
 -- config.lua must actually run the relabel, and must do it after the overlay --
 -- gtVersion is a setting, so relabelling beside the table in section 1 would
@@ -231,8 +263,22 @@ ck("dustScanInterval is",             S.nodePayload(raw).dustScanInterval, 10)
 ck("int bounds refuse low",  (S.coerce(S.byKey.tipsPerLoad, 0)), nil)
 ck("int bounds refuse high", (S.coerce(S.byKey.tipsPerLoad, 99999)), nil)
 ck("bool from string",       S.coerce(S.byKey.fastReload, "true"), true)
-ck("choice cycles",          S.cycle(S.byKey.gtVersion, "2.9"), "2.8")
+ck("choice cycles",          S.cycle(S.byKey.gtVersion, "2.9"), "2.9-pre-b3")
+ck("choice cycles again",    S.cycle(S.byKey.gtVersion, "2.9-pre-b3"), "2.8")
 ck("choice wraps",           S.cycle(S.byKey.gtVersion, "2.8"), "2.9")
+ck("pre-b3 is settable",     S.coerce(S.byKey.gtVersion, "2.9-pre-b3"), "2.9-pre-b3")
+-- settings.lua's choice list and module_api's version list are two lists of the
+-- same thing. They have to agree, or a legal setting resolves to no dialect.
+local declared = {}
+for _, v in ipairs(S.byKey.gtVersion.choices) do declared[v] = true end
+local unmapped = 0
+for _, v in ipairs(api.VERSIONS) do if not declared[v] then unmapped = unmapped + 1 end end
+ck("every version offered",  unmapped, 0)
+local undialected = 0
+for _, v in ipairs(S.byKey.gtVersion.choices) do
+  if not api.dialect(v) then undialected = undialected + 1 end
+end
+ck("every choice resolves",  undialected, 0)
 -- "auto" is gone: an item label has nothing to probe, so the version is always
 -- an explicit answer now. A saved user_config.lua from before this change still
 -- carries it, and has to be refused rather than silently accepted.

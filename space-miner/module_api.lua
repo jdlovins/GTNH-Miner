@@ -10,17 +10,32 @@
 --   cycle mode    -- module GUI only --             setParameter("cycle", false)
 --   introspect    getParametersInfo()               getParameters()
 --
--- 2.9 also renamed the mining drone's tier marker -- "Mining Drone MK-IX (UHV)"
+-- GTNH also renamed the mining drone's tier marker -- "Mining Drone MK-IX (UHV)"
 -- became "Mining Drone Mk-IX (UHV)". That is not a call, it is an item LABEL,
 -- and it matters because labels are how the whole consumable path resolves a
 -- drone: iface.store{label} on the loader, getItemsInNetwork{label} on the hw
 -- node. An earlier version of this header claimed that path "never changed at
 -- all". It had, and the fleet sat idle with every drone counted as zero.
 --
--- The marker cannot be probed. There is no method whose presence answers "what
--- does this pack call the item", so unlike the four calls above it has to be
--- CONFIGURED -- which is why gtVersion is a stored setting rather than a probe,
--- and why detect() below no longer decides anything. See api.mark().
+-- AND THE TWO CHANGES DO NOT SHARE A BOUNDARY. The marker moved partway through
+-- 2.9, at beta 3, while the parameter API moved at 2.8 -> 2.9:
+--
+--     gtVersion      parameter API     drone marker
+--     2.8            setParameters     MK
+--     2.9-pre-b3     setParameter      MK
+--     2.9  (b3+)     setParameter      Mk
+--
+-- So "which GTNH" and "which parameter API" are two different questions with
+-- two different answers, and this file keeps them apart: VERSION is what the
+-- operator configures (three values, api.VERSIONS) and DIALECT is which of the
+-- two call styles that implies (api.DIALECT). configure(), resetDistance() and
+-- detect() all speak dialect and are unaffected by the middle row.
+--
+-- The marker cannot be probed, and the middle row is why that is now permanent
+-- rather than merely awkward: a probe answers "setParameter" for both 2.9 rows
+-- and cannot tell their labels apart. So it has to be CONFIGURED -- which is
+-- why gtVersion is a stored setting, and why detect() below no longer decides
+-- anything. See api.mark().
 --
 -- Everything else on the miner path really is unchanged: setWorkAllowed() and
 -- isMachineActive() are the same call in both, as is setInterfaceConfiguration
@@ -38,27 +53,59 @@
 
 local api = {}
 
+-- DIALECT: which parameter API a module speaks. Two values, and what detect()
+-- returns, what mod.dialect holds, and what configure() switches on.
 api.V29 = "2.9"
 api.V28 = "2.8"
+
+-- VERSION: which GTNH the operator says this world is. Three values, because
+-- the drone marker changed at 2.9 beta 3 and the parameter API did not.
+-- "2.9-pre-b3" is 2.9 BEFORE beta 3; beta 3 itself is the first "Mk" release.
+api.GT28       = "2.8"
+api.GT29_PREB3 = "2.9-pre-b3"
+api.GT29       = "2.9"
+
+-- Cycle order for the settings editor, newest first.
+api.VERSIONS = { api.GT29, api.GT29_PREB3, api.GT28 }
+
+-- version -> dialect. Note two versions mapping to one dialect: that collapse
+-- IS the middle row, and it is why resolve() cannot just hand the setting back.
+api.DIALECT = {
+  [api.GT28]       = api.V28,
+  [api.GT29_PREB3] = api.V29,
+  [api.GT29]       = api.V29,
+}
+
+function api.dialect(version)
+  return api.DIALECT[version]
+end
 
 -- ---------------------------------------------------------------------------
 -- THE DRONE TIER MARKER
 --
--- "Mining Drone MK-IX (UHV)" on 2.8, "Mining Drone Mk-IX (UHV)" on 2.9. One
--- string, and the reason gtVersion is a setting instead of a probe: config.lua
--- rewrites config.drones through this, and the broker ships it to the hw node
--- with DRILL_PAR, because that node holds no config and cannot work it out.
+-- "Mining Drone MK-IX (UHV)" before 2.9 beta 3, "Mining Drone Mk-IX (UHV)"
+-- after. One string, and the reason gtVersion is a setting instead of a probe:
+-- config.lua rewrites config.drones through this, and the broker ships it to
+-- the hw node with DRILL_PAR, because that node holds no config and cannot work
+-- it out.
 --
--- Falls back to the 2.9 spelling for an unknown version rather than returning
--- nil. A nil here would concatenate into "Mining Drone nil-IX (UHV)" three
--- layers away from the mistake; a wrong-but-plausible label fails as a clean
--- "no drones in stock", which is the symptom this whole change exists to fix
--- and is therefore the one an operator has a chance of recognising.
+-- Keyed by VERSION, not dialect -- 2.8 and 2.9-pre-b3 share a marker while
+-- speaking different parameter APIs, so a dialect key could not express this.
+--
+-- Falls back to the current spelling for an unknown version rather than
+-- returning nil. A nil here would concatenate into "Mining Drone nil-IX (UHV)"
+-- three layers away from the mistake; a wrong-but-plausible label fails as a
+-- clean "no drones in stock", which is the symptom this whole change exists to
+-- fix and is therefore the one an operator has a chance of recognising.
 -- ---------------------------------------------------------------------------
-api.MARK = { [api.V28] = "MK", [api.V29] = "Mk" }
+api.MARK = {
+  [api.GT28]       = "MK",
+  [api.GT29_PREB3] = "MK",
+  [api.GT29]       = "Mk",
+}
 
 function api.mark(version)
-  return api.MARK[version] or api.MARK[api.V29]
+  return api.MARK[version] or api.MARK[api.GT29]
 end
 
 -- Rewrite one drone label for `version`. Case-insensitive on the way in so it
@@ -104,7 +151,12 @@ end
 -- more, and the drone label is why: an item name has no method to probe for, so
 -- it has to be configured -- and a system that probes the API while configuring
 -- the label holds two sources of truth for one fact, free to disagree. There is
--- now one, chosen at the boot prompt and pushed to the nodes that need it.
+-- now one, stored in the settings and pushed to the nodes that need it.
+--
+-- TRANSLATES, rather than handing the setting straight back. It used to do the
+-- latter, which worked only while every version was its own dialect -- with
+-- 2.9-pre-b3 in the list that returns a "dialect" no caller recognises and
+-- every module fails configure() with "unknown module API dialect".
 --
 -- Returns (dialect, how). `how` is "configured" for a version we recognise, and
 -- the pair is (nil, nil) for one we do not, which callers must treat as a
@@ -112,7 +164,8 @@ end
 -- does nothing.
 -- ---------------------------------------------------------------------------
 function api.resolve(_adapter, setting)
-  if setting == api.V29 or setting == api.V28 then return setting, "configured" end
+  local dialect = api.DIALECT[setting]
+  if dialect then return dialect, "configured" end
   return nil, nil
 end
 
@@ -125,9 +178,15 @@ end
 -- site. Saying both would bury the real one.
 function api.check(adapter, setting)
   local probed = api.detect(adapter)
-  if not probed or not setting then return nil end
-  if probed == setting then return nil end
-  return "configured for GTNH " .. tostring(setting) ..
+  local want   = api.DIALECT[setting]
+  if not probed or not want then return nil end
+  if probed == want then return nil end
+  -- Names the version AND the dialect it implies. They are the same string for
+  -- 2.8 and for 2.9, and different for 2.9-pre-b3 -- so a message carrying only
+  -- one of them reads as nonsense ("configured for 2.9-pre-b3 but this module
+  -- speaks 2.9") on exactly the version that needed explaining.
+  local implied = (want == setting) and "" or (" (parameter API " .. want .. ")")
+  return "configured for GTNH " .. tostring(setting) .. implied ..
          " but this module speaks " .. probed ..
          " -- check the gtVersion setting"
 end
