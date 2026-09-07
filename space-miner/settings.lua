@@ -83,10 +83,6 @@ S.list = {
     min = 0, max = 12,
     label = "Max concurrent loads", help = "0 = no limit; raise the limit only if load times climb" },
 
-  { key = "reserveWhileMining", group = "dispatch", type = "bool", default = false,
-    label = "Reserve while mining",
-    help  = "charge a drone and a full kit load to every busy module, whatever telemetry says" },
-
   { group = "dispatch", type = "note",
     text = "fastReload and holdTimeout below change what a FINISHED module does with its drone" },
 

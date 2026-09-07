@@ -268,6 +268,19 @@ ck("merge rejects value",   (S.merge(cfg, raw, { gtVersion = "2.7" })).gtVersion
 ck("merge rejects key",     (S.merge(cfg, raw, { nosuchknob = 1 })).nosuchknob, "unknown setting")
 ck("bad value not applied", cfg.gtVersion, "2.8")
 
+-- reserveWhileMining is retired. Its off position was identical to on whenever
+-- telemetry was healthy and strictly worse whenever it was not, which is not a
+-- preference -- so the staleness guard is unconditional and the knob is gone.
+ck("reserveWhileMining undeclared", S.byKey.reserveWhileMining, nil)
+-- Anyone with it saved gets told, rather than silently losing a setting.
+ck("saved value is rejected",
+   (S.merge(cfg, raw, { reserveWhileMining = true })).reserveWhileMining,
+   "unknown setting")
+-- And it is not lurking as a dormant branch anywhere in the broker. (Read here
+-- rather than reusing `broker`, which the pool section further down defines.)
+ck("no reserveWhileMining branch",
+   slurp("broker-mk3.lua"):find("config.reserveWhileMining", 1, true), nil)
+
 ck("gtVersion is not a node setting", S.nodePayload(raw).gtVersion, nil)
 ck("dustScanInterval is",             S.nodePayload(raw).dustScanInterval, 10)
 
@@ -431,10 +444,8 @@ section("broker-mk3.lua -- the drone / kit availability pool")
 -- =============================================================================
 -- availableDrones and availableKits read only brokerState, modules and config,
 -- so they lift out the same way edDirtyCount does. These are the regression
--- guards on the reserveWhileMining double-charge: with reserveWhileMining on,
--- a busy module used to be charged even when the ME sweep had ALREADY stopped
--- counting its drone, so the pool went negative and a genuinely free drone
--- would not dispatch.
+-- guards on the pool arithmetic. Drones no longer consult telemetry at all;
+-- kits still do, because they are consumed and their figure is measured.
 -- availableDrones/availableKits stayed in the broker -- they are dispatch, not
 -- editing -- so these still come out of its source.
 local broker = slurp("broker-mk3.lua")
@@ -492,13 +503,11 @@ ck("two busy: two charged",       availableDrones(true).luv, 8)
 world({ luv = 10 }, { busy("luv", 999999) }, 0)
 ck("dispatch time is irrelevant", availableDrones(true).luv, 9)
 
--- strict was reserveWhileMining's lever over how much to trust a stale sweep.
--- With no sweep in the sum there is nothing left for it to change, and the two
--- pools must agree -- dispatch and the reachability view can no longer disagree
--- about how many drones exist.
+-- availableDrones takes no argument at all now, and that is the tell: there is
+-- no "how far do we trust the sweep" question left to ask about a declared
+-- fleet. Dispatch and the reachability view read the same table.
 world({ luv = 10 }, { busy("luv", 0) }, 0)
-ck("strict and non-strict agree",
-   availableDrones(true).luv, availableDrones(false).luv)
+ck("one drone view, not two", availableDrones().luv, 9)
 
 -- A HELD DRONE IS FREE, and needs no credit to be so: fastReload leaves the
 -- module IDLE with job = nil, so nothing charges it, and it never left the
@@ -525,13 +534,37 @@ ck("pool is floored at zero", availableDrones(true).uhv, 0)
 world({ luv = 0 }, {}, 0)
 ck("undeclared tier is unavailable", availableDrones(true).luv, 0)
 
--- Kits move the same way, in units of a full load.
+-- KITS STILL MEASURE, and that is the line this design draws. Tips and rods are
+-- consumed, so their figure genuinely comes from telemetry and the "has the
+-- sweep seen this commitment yet" question is still real for them.
+--
+-- The argument is `trustStaleFigure`, not the old `strict` -- it inverted when
+-- reserveWhileMining was retired, so read the false/true here carefully.
+-- false = the dispatch view (careful). true = the reachability view.
 world({}, { busy("uhv", 900, "naquadah") }, 990, { naquadah = { kits = 64 } })
-ck("pre-sweep kits not charged twice", availableKits(true).naquadah, 64)
+ck("pre-sweep kits not charged twice", availableKits(false).naquadah, 64)
 world({}, { busy("uhv", 995, "naquadah") }, 990, { naquadah = { kits = 64 } })
-ck("post-sweep kits charged",          availableKits(true).naquadah, 0)
+ck("post-sweep kits charged",          availableKits(false).naquadah, 0)
 world({}, { holding("uhv", "naquadah") }, 990, { naquadah = { kits = 0 } })
-ck("held kits count as free",          availableKits(true).naquadah, 64)
+ck("held kits count as free",          availableKits(false).naquadah, 64)
+
+-- THE STALENESS GUARD, WITH NO SETTING BEHIND IT. This used to require
+-- reserveWhileMining to be switched on. A sweep older than HW_STALE (30) is a
+-- node that stopped reporting, not one between sweeps, and committing against a
+-- number that will never move again is how a material gets over-promised.
+world({}, { busy("uhv", 900, "naquadah") }, 900, { naquadah = { kits = 64 } })
+ck("stale sweep charges anyway",       availableKits(false).naquadah, 0)
+
+-- ...and the reachability view still trusts it, which is the whole reason the
+-- distinction survived the setting. Its question is "can this array ever mine
+-- that", and a hw node that died five minutes ago is no reason to paint every
+-- asteroid as beyond us.
+ck("reachability trusts a stale sweep", availableKits(true).naquadah, 64)
+
+-- An unseen commitment is charged in BOTH views. trustStaleFigure relaxes the
+-- staleness bail-out only -- it is not a licence to ignore commitments.
+world({}, { busy("uhv", 995, "naquadah") }, 990, { naquadah = { kits = 64 } })
+ck("reachability still charges unseen", availableKits(true).naquadah, 0)
 
 -- =============================================================================
 section("assignOne / boot -- the sensor machinery is gone, not dormant")
@@ -566,6 +599,18 @@ ck("drill keys from declared fleet",
    uSrc:find("config.droneStock", 1, true) ~= nil, true)
 ck("drill keys drop the busy-module loop",
    uSrc:find("mod.job.drillKey", 1, true), nil)
+
+-- The two kit views must reach their call sites the right way round. The pool
+-- functions can be lifted and tested; which argument dispatchBatch passes them
+-- cannot, and getting it backwards is silent -- dispatch would trust a frozen
+-- figure while the dust panel called every asteroid unreachable.
+local dSrc = broker:match("local function dispatchBatch%(%)(.-)\nend")
+ck("dispatch takes the careful view",
+   dSrc:find("availableKits(false)", 1, true) ~= nil, true)
+ck("reachability takes the owned view",
+   dSrc:find("reachAvailKit = availableKits(true)", 1, true) ~= nil, true)
+ck("drones need no second view",
+   dSrc:find("reachAvail    = avail", 1, true) ~= nil, true)
 
 -- Kits still measure, because tips and rods are actually consumed. This is the
 -- line between the two models and it should not blur.

@@ -74,51 +74,6 @@ default is now no limit.
 **Put it back to 2 or 3 if load times climb again** — that would mean something
 has started competing for the call budget once more.
 
-### `reserveWhileMining`
-
-Stop trusting the hw node's sweep timestamp when deciding what is free.
-
-Dispatch works from a pool of what is free right now: telemetry reports what the
-staging ME holds, and commitments the last sweep could not have seen yet are
-subtracted by hand. A module that has been mining long enough for a sweep to run
-is *not* subtracted, because the ME no longer lists its drone — charging it
-again would count the same drone twice.
-
-This setting used to mean "charge every working module regardless", and that was
-the double-count it exists to describe. With one UHV drone and one UHV module
-mining, the reported stock was already 0 and the extra charge took the pool to
-−1, so the tier stopped dispatching. Worse, the deficit survived a restock: two
-LuV busy and a third arriving from crafting read as 1 − 2 = −1, and a genuinely
-free drone would not go out.
-
-**It no longer does that.** A commitment is charged only while the sweep has yet
-to see it, in both modes — that arithmetic is simply correct, and promising one
-drone to two modules is prevented by the per-sweep decrements in the assignment
-loop, not by over-charging. What this setting now changes is the *fallback*: if
-the hw node has been quiet for more than 30 s, its figure is stale rather than
-merely between sweeps, so nothing counts as seen and every commitment is charged
-again. That is the conservative direction, and it is the case the option is for.
-
-Turn it on if you do not trust the hw node's figures, or if you have watched two
-modules argue over one physical drone. A module blocked this way does not idle:
-dispatch moves on to the next need, so it takes a different asteroid it *can*
-reach rather than waiting.
-
-**Reading the hardware panel.** `DRONES IN STOCK` shows what the ME held at the
-last sweep and, when the two differ, what dispatch can actually use:
-
-```
-  MK-VI (LuV)         x2  (1 free)
-  MK-IX (UHV)         x1  (0 free)
-```
-
-The columns disagreeing is normal and informative. Stock lags by up to a scan
-interval (~10 s), so a drone pulled a moment ago still shows in stock — the free
-column is right immediately. `x0 (1 free)` is a drone held by a finished module
-under `fastReload`: physically in that module's bus so the ME cannot see it, but
-owned and dispatchable. Amber means the tier is owned with none free, which is a
-different state from owning none at all.
-
 ### `fastReload` and `holdTimeout`
 
 **Fast reload skips the unload when the next job wants the same hardware.**
@@ -152,6 +107,32 @@ One consequence worth recognising on the hardware panel: a held drone is
 physically in a module's bus, so the ME cannot see it. The tier reads
 `x0 (1 free)` — zero in the network, one owned by the fleet. That gap is fast
 reload working, not a miscount.
+
+---
+
+## Kit accounting, and why there is no switch for it
+
+Dispatch works from a pool of what is free right now. **Drones are declared**
+(see `droneStock` above) and the broker keeps that ledger itself. **Kits are
+measured**, because tips and rods are consumed — so for them the question "has
+the hw node's last sweep seen this commitment yet" is real, and a commitment the
+sweep could not have seen is subtracted by hand.
+
+If that sweep is more than 30 s old the node has stopped reporting rather than
+being between sweeps, and every commitment is charged again. **That is
+unconditional.** It used to sit behind a `reserveWhileMining` option, which has
+been removed: with healthy telemetry both settings behaved identically, and with
+stale telemetry "off" meant continuing to dispatch against a figure that would
+never update again — the same failure that froze drone counts before they became
+declared. An option whose off position is only ever a slower way to be wrong is
+not a preference.
+
+The dust panel's reachability check still reads the permissive view, so a hw node
+that died five minutes ago does not paint every asteroid as unmineable. That is
+an internal distinction now, not a setting.
+
+If you have `reserveWhileMining` in `user_config.lua`, the broker reports it as
+an unknown setting at boot and carries on.
 
 ---
 

@@ -1199,27 +1199,36 @@ end
 -- genuinely free. It also imposed a standing tax of one spare drone per busy
 -- module just to keep dispatching.
 --
--- If the hw node goes quiet, lastHWSyncTime stops advancing and every
--- commitment counts again -- which is the conservative direction to fail in.
+-- KITS ONLY, now. Drones stopped asking this the moment the pool became
+-- "declared minus committed" -- there is no sweep in that sum to be ahead of.
+-- Tips and rods are consumed, so their figure really is measured and this
+-- question really does have to be answered.
 --
--- config.reserveWhileMining skips this question entirely: with it set, a busy
--- module is charged for its drone and kits however long ago telemetry saw them.
--- That reintroduces the standing tax described above on purpose, for setups
--- where the hw node's figures cannot be trusted to be current.
 -- hw_telem scans and broadcasts once per loop around a 10s event.pull, so a
 -- figure older than this means the node has genuinely stopped reporting rather
 -- than merely being between sweeps.
 local HW_STALE = 30
 
-local function telemetryHasSeen(mod, strict)
+-- `trustStaleFigure` only relaxes the staleness bail-out below; an unseen
+-- commitment is charged either way. Default (no argument) is the careful answer,
+-- so a new call site has to opt IN to trusting a figure that stopped moving.
+local function telemetryHasSeen(mod, trustStaleFigure)
   local at = mod.job and mod.job.dispatchedAt
   if not at then return true end   -- pre-existing job from before this field
   local sync = brokerState.lastHWSyncTime or 0
-  -- What reserveWhileMining still buys, now that it no longer double-charges.
-  -- If the hw node has gone quiet the FIGURE is old, so no commitment counts as
-  -- seen however long ago it was made, and every one is charged again. That is
-  -- the conservative direction and it is the case the setting exists for.
-  if strict and (computer.uptime() - sync) > HW_STALE then return false end
+  -- A STALE FIGURE IS NOT EVIDENCE, whatever its timestamp says about the past.
+  -- If the node has gone quiet, sync stops advancing and every commitment older
+  -- than it would otherwise count as "already excluded from the stock figure" --
+  -- so the broker would keep dispatching against a number that will never move
+  -- again. Charging everything instead stops dispatch and self-corrects the
+  -- moment the node reports.
+  --
+  -- This used to be behind a reserveWhileMining setting. That is gone,
+  -- because its off position was identical to on whenever telemetry was healthy
+  -- and strictly worse whenever it was not -- which is not a preference.
+  if not trustStaleFigure and (computer.uptime() - sync) > HW_STALE then
+    return false
+  end
   return at <= sync
 end
 
@@ -1239,11 +1248,10 @@ end
 -- config.droneStock is the fleet, stated by the operator. Everything else here
 -- is bookkeeping the broker does itself and therefore knows exactly.
 --
--- `strict` is now meaningless for drones and is accepted only so the two pool
--- functions keep the same shape: there is no "has telemetry seen this yet"
--- question left to answer conservatively. availableKits still takes it and still
--- means it -- tips and rods ARE consumed and do have to be measured.
-local function availableDrones(_strict)
+-- Takes no arguments, and that is the tell: there is no "how much do we trust
+-- the sweep" question left to answer for drones. availableKits still has one,
+-- because tips and rods ARE consumed and their figure really is measured.
+local function availableDrones()
   local avail = {}
   for key, count in pairs(config.droneStock or {}) do
     avail[key] = tonumber(count) or 0
@@ -1280,13 +1288,18 @@ end
 -- Same three changes as availableDrones, for the same reasons: charge only what
 -- the sweep has not seen, credit what a module is holding, and never return a
 -- negative.
-local function availableKits(strict)
+-- `trustStaleFigure` picks the view, and the two callers want opposite answers.
+-- Dispatch passes false: committing against a figure that stopped updating is
+-- how you over-promise a material. The dust panel's reachability check passes
+-- true, because its question is "can this array ever mine that" -- and a hw node
+-- that died five minutes ago is no reason to report every asteroid as beyond us.
+local function availableKits(trustStaleFigure)
   local perLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
   local avail = {}
   for key, d in pairs(brokerState.drills) do avail[key] = (d and d.kits) or 0 end
   for _, mod in ipairs(modules) do
     if mod.status ~= "IDLE" and mod.job and mod.job.drillKey
-       and not telemetryHasSeen(mod, strict) then
+       and not telemetryHasSeen(mod, trustStaleFigure) then
       local k = mod.job.drillKey
       avail[k] = (avail[k] or 0) - perLoad
     end
@@ -1326,8 +1339,10 @@ function POOL.refresh()
   local stamp = table.concat(parts, "|")
   if stamp ~= POOL.stamp then
     POOL.stamp  = stamp
-    POOL.drones = availableDrones(config.reserveWhileMining or false)
-    POOL.kits   = availableKits(config.reserveWhileMining or false)
+    -- The panels report what dispatch will actually do, so they take the same
+    -- conservative kit view it does.
+    POOL.drones = availableDrones()
+    POOL.kits   = availableKits(false)
   end
 end
 
@@ -1478,23 +1493,22 @@ local function dispatchBatch()
   while #idleModules > slots do table.remove(idleModules) end
 
   -- Working pools we can still hand out this batch: drones and drill kits.
-  local strict         = config.reserveWhileMining or false
-  local avail          = availableDrones(strict)
-  local availKit       = availableKits(strict)
+  local avail          = availableDrones()
+  local availKit       = availableKits(false)
   local minKitsForLoad = math.max(config.tipsPerLoad or 64, config.rodsPerLoad or 64)
 
   -- A SECOND view, for reachability only.
   --
-  -- Reachability asks whether this array can ever serve a need at all -- a
-  -- question about which drone tiers we own, not which are free this instant.
-  -- Under reserveWhileMining the dispatch pool deliberately hides every busy
-  -- module's drone, and answering from it would report a merely busy fleet as
-  -- permanently unable to mine anything, filling the dust panel with "NO DRONE"
-  -- for asteroids we have perfectly good drones for.
+  -- Reachability asks whether this array can ever serve a need at all -- not
+  -- what is free this instant. Answering it from the dispatch pool would fill
+  -- the dust panel with "NO KITS" for materials we hold plenty of, whenever the
+  -- hw node happened to be quiet.
   --
-  -- With the option off these are the same tables, so nothing changes.
-  local reachAvail    = strict and availableDrones(false) or avail
-  local reachAvailKit = strict and availableKits(false)   or availKit
+  -- Drones need no second view: the declared fleet is what we own, and dispatch
+  -- reads the same table. This used to build a duplicate of it under
+  -- reserveWhileMining, which is a table per batch for no difference.
+  local reachAvail    = avail
+  local reachAvailKit = availableKits(true)
 
   -- Held drones and kits used to be credited back here, over this function's
   -- own copies. availableDrones/availableKits do it now, which fixes two things
