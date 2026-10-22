@@ -434,7 +434,15 @@ local dispatchPaused = false
 local BTN_Y        = 3
 local BTN_SETTINGS = { x = 2,  w = 12 }
 local BTN_PAUSE    = { x = 16, w = 12 }
-local BTN_STATUS_X = 30
+-- QUIT stops the broker the clean way: every module gated off and its slots and
+-- bus filters cleared (see shutdown). Without it the only ways out were a hard
+-- interrupt or switching the computer off, neither of which runs any cleanup,
+-- so the modules carried on with their last configuration.
+--
+-- Two clicks: the first arms it (armedAt) and the label asks for a confirm; a
+-- second within confirmSecs stops. One stray click must not stop the array.
+local BTN_QUIT     = { x = 30, w = 12, armedAt = nil, confirmSecs = 5 }
+local BTN_STATUS_X = 44
 -- Clamped to the screen: a tier 1 display is 50 columns, and a status strip
 -- sized for a tier 3 one would be asking gpu.fill to write past the edge.
 local BTN_STATUS_W = math.max(0, math.min(40, W - BTN_STATUS_X))
@@ -2168,7 +2176,7 @@ local SLOT_SYNC, SLOT_DTAG   = 9001, 9002
 -- The header buttons. Outside the three panel bands on purpose: they sit above
 -- the panels, so dashInvalidateRows -- which only drops the panel slots for the
 -- rows the quiesce box covers -- must not touch them.
-local SLOT_BTN_E, SLOT_BTN_P, SLOT_BTN_S = 9003, 9004, 9005
+local SLOT_BTN_E, SLOT_BTN_P, SLOT_BTN_S, SLOT_BTN_Q = 9003, 9004, 9005, 9006
 
 -- Counts rows actually repainted. The quiesce box needs to know whether the
 -- panels have drawn over it, and "did anything paint" is cheaper to answer than
@@ -2776,6 +2784,14 @@ local function drawButtons()
   dashRow(SLOT_BTN_P, BTN_PAUSE.x, BTN_PAUSE.w, BTN_Y,
           btnLabel(BTN_PAUSE, dispatchPaused and "RESUME" or "PAUSE"),
           dispatchPaused and 0x00FF00 or 0xFFAA00)
+  -- An armed QUIT that was not confirmed in time quietly disarms here, so the
+  -- label never says CONFIRM? for a click that would no longer count.
+  if BTN_QUIT.armedAt and computer.uptime() - BTN_QUIT.armedAt > BTN_QUIT.confirmSecs then
+    BTN_QUIT.armedAt = nil
+  end
+  dashRow(SLOT_BTN_Q, BTN_QUIT.x, BTN_QUIT.w, BTN_Y,
+          btnLabel(BTN_QUIT, BTN_QUIT.armedAt and "CONFIRM?" or "QUIT"),
+          BTN_QUIT.armedAt and 0xFF0000 or 0xAA5555)
   if dispatchPaused then
     dashRow(SLOT_BTN_S, BTN_STATUS_X, BTN_STATUS_W, BTN_Y,
             "DISPATCH PAUSED -- running jobs finish", 0xFFAA00)
@@ -3357,6 +3373,16 @@ while true do
       end
     elseif btnHit(BTN_PAUSE, e3, e4) then
       togglePause("click")
+    elseif btnHit(BTN_QUIT, e3, e4) then
+      local up = computer.uptime()
+      if BTN_QUIT.armedAt and up - BTN_QUIT.armedAt <= BTN_QUIT.confirmSecs then
+        -- Returning ends mainLoop normally; the code after the xpcall runs
+        -- shutdown(), which gates every module off and clears its slots.
+        logger:info("quit from the dashboard")
+        return
+      end
+      BTN_QUIT.armedAt = up
+      lastUIDraw = 0   -- show CONFIRM? now, not on the next tick
     end
 
   elseif e1 == "key_down" and e3 == 101 and config.hotkeyEditor
@@ -3533,6 +3559,9 @@ if gpu then pcall(function() gpu.setForeground(0xFFFFFF) end) end
 -- Back to the shell's normal cursor; the dashboard turned it off.
 pcall(term.setCursorBlink, true)
 if ok then
+  -- A clean exit leaves a clean screen, rather than the message printed over
+  -- the bottom of the last dashboard frame.
+  pcall(term.clear)
   logger:info("clean shutdown")
   print("Broker stopped. All modules gated off.")
 else
