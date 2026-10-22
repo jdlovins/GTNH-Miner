@@ -2745,6 +2745,15 @@ local function drawStaticFrame()
   -- (edAction("close") calls it), which is what keeps the dashboard from
   -- skipping rows that still hold editor content.
   dashInvalidate()
+  -- BLACKOUT FIRST. term.clear() only clears what the terminal believes the
+  -- screen to be, and this program changes the resolution after the terminal
+  -- sized itself (gpu.setResolution near the top), so a border of the real
+  -- screen could survive it. Fill the GPU's actual resolution with black on a
+  -- known background, then let the terminal reset its own state.
+  gpu.setBackground(0x000000)
+  gpu.setForeground(0xFFFFFF)
+  local rw, rh = gpu.getResolution()
+  gpu.fill(1, 1, rw, rh, " ")
   term.clear()
   -- The terminal cursor blinks by saving the character under it and writing it
   -- back. The dashboard draws with gpu.set, which the terminal never sees, so
@@ -2884,6 +2893,11 @@ end
 -- is really about checking the hardware agrees, and about the interface clear.
 local function initModules()
   logger:info("[STARTUP] Initializing " .. #modules .. " modules...")
+  -- Boot warnings go to the console, on top of the loading frame. Note whether
+  -- any were shown, so the caller can leave them up long enough to read before
+  -- the screen is blacked out for the dashboard. They are in the log as well.
+  local warned = false
+  local function say(s) warned = true; print(s) end
   local anyLegacy = false
   local anyMismatch = nil
   for i, mod in ipairs(modules) do
@@ -2960,7 +2974,7 @@ local function initModules()
                  "in each module's GUI. Dispatch assumes maxParallels for the tier, so " ..
                  "computation and ETA figures are wrong if the GUI holds less."
     logger:warn("[STARTUP] " .. line)
-    print(line)
+    say(line)
   end
 
   -- An undeclared fleet dispatches nothing at all, and the dashboard panel is
@@ -2974,7 +2988,7 @@ local function initModules()
                  "configured now rather than read from the hw node, which can only see " ..
                  "the ME network."
     logger:warn("[STARTUP] " .. line)
-    print(line)
+    say(line)
   end
 
   -- The editor key is switchable, and switching it off on a screen that cannot
@@ -2987,17 +3001,18 @@ local function initModules()
                  "way in. If this screen does not respond to clicks, set hotkeyEditor " ..
                  "back to true in /home/user_config.lua."
     logger:warn("[STARTUP] " .. line)
-    print(line)
+    say(line)
   end
 
   -- Loud, because the drone labels are wrong too when this fires and the only
   -- other symptom is every tier reading zero in stock -- which looks like an
   -- empty network, not a misconfiguration.
   if anyMismatch then
-    print("WARNING: " .. anyMismatch)
-    print("         Drone item names are picked from the same setting, so stock")
-    print("         will read 0 for every tier until it matches the world.")
+    say("WARNING: " .. anyMismatch)
+    say("         Drone item names are picked from the same setting, so stock")
+    say("         will read 0 for every tier until it matches the world.")
   end
+  return warned
 end
 
 -- =============================================================================
@@ -3036,7 +3051,12 @@ editor.init{
 runBootPrompt()   -- ask priority mode (runs while you're at the console)
 logger:info("Waiting for telemetry...")
 drawStaticFrame() -- frame appears immediately
-initModules()     -- then clear modules with visible progress
+-- Then clear modules with visible progress. That stage writes through the
+-- terminal -- progress rows, and any boot warnings -- which can land anywhere on
+-- the frame and scroll it, so the dashboard proper starts from a blackout and a
+-- fresh frame. Warnings are left up for a few seconds first so they can be read.
+if initModules() then os.sleep(5) end
+drawStaticFrame()
 
 if modem.isOpen(config.ports.telemetry) then
   logger:info("Modem open on port " .. config.ports.telemetry)
