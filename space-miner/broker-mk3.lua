@@ -2897,7 +2897,18 @@ local function initModules()
   -- any were shown, so the caller can leave them up long enough to read before
   -- the screen is blacked out for the dashboard. They are in the log as well.
   local warned = false
-  local function say(s) warned = true; print(s) end
+  -- Each warning starts on its own line under the module rows. Printed from
+  -- wherever the cursor was, it ran straight on from the last "clearing..." and
+  -- wrapped across all three panels.
+  local sayRow = 6 + #modules + 1
+  local function say(s)
+    warned = true
+    if gpu then
+      term.setCursor(1, math.min(sayRow, H))
+      sayRow = sayRow + math.max(1, math.ceil(#s / W))
+    end
+    print(s)
+  end
   local anyLegacy = false
   local anyMismatch = nil
   for i, mod in ipairs(modules) do
