@@ -39,7 +39,7 @@ Export Bus into each module's input hatch. MEDINA does not handle plasma.
 On each computer (needs an Internet Card), grab the installer and run it:
 
 ```
-wget https://raw.githubusercontent.com/novashep/GTNH/main/space-miner/install-medina.lua /home/install-medina.lua
+wget https://raw.githubusercontent.com/jdlovins/GTNH-Miner/main/space-miner/install-medina.lua /home/install-medina.lua
 install-medina
 ```
 
@@ -49,8 +49,8 @@ it once per computer, picking the matching role each time.
 
 ### Manual way
 
-If you'd rather pull files by hand, download them into `/home/`. Replace
-`RAW_BASE` with this repo's raw path.
+If you'd rather pull files by hand, download them into `/home/`. `RAW_BASE`
+below is `https://raw.githubusercontent.com/jdlovins/GTNH-Miner/main/space-miner`.
 
 **On the broker computer:**
 
@@ -61,8 +61,13 @@ wget RAW_BASE/loader.lua                /home/loader.lua
 wget RAW_BASE/config.lua                /home/config.lua
 wget RAW_BASE/settings.lua              /home/settings.lua
 wget RAW_BASE/logger.lua                /home/logger.lua
+wget RAW_BASE/module_api.lua            /home/module_api.lua
+wget RAW_BASE/editor.lua                /home/editor.lua
 wget RAW_BASE/list_components.lua       /home/list_components.lua
 wget RAW_BASE/detect_module.lua         /home/detect_module.lua
+wget RAW_BASE/detect_sides.lua          /home/detect_sides.lua
+wget RAW_BASE/find_item.lua             /home/find_item.lua
+wget RAW_BASE/migrate_drill.lua         /home/migrate_drill.lua
 wget RAW_BASE/job_node_config.example.lua /home/job_node_config.lua
 ```
 

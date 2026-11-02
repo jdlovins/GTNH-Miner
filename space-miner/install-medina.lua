@@ -8,13 +8,8 @@
 -- into /home/.
 --
 -- To get this script onto a fresh computer in the first place:
---   wget https://raw.githubusercontent.com/jdlovins/GTNH-Miner/rewrite/space-miner/install-medina.lua /home/install-medina.lua
+--   wget https://raw.githubusercontent.com/jdlovins/GTNH-Miner/main/space-miner/install-medina.lua /home/install-medina.lua
 --   install-medina
---
--- >>> TEMPORARY: POINTED AT THE `rewrite` BRANCH, NOT `main`. <<<
--- Both the bootstrap wget above and RAW below fetch from rewrite so the branch
--- can be tested in-world before it merges. REVERT BOTH TO `main` AS PART OF THE
--- MERGE -- left in place, every install silently pulls an unmerged branch.
 --
 -- Roles:
 --   1) Broker        — the main computer (dispatch + module loading + UI)
@@ -26,8 +21,7 @@
 -- =============================================================================
 
 local component = require("component")
--- TEMPORARY: `rewrite`, not `main` -- see the banner above. Revert on merge.
-local RAW = "https://raw.githubusercontent.com/jdlovins/GTNH-Miner/rewrite/space-miner"
+local RAW = "https://raw.githubusercontent.com/jdlovins/GTNH-Miner/main/space-miner"
 
 -- There is no COMMON list any more, and that is the point.
 --
