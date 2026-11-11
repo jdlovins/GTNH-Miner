@@ -513,7 +513,76 @@ ck("and enables it",                 ed.enabled["Iron Dust"], true)
 E.action("activate")
 ck("off without a prompt",           ed.input, nil)
 ck("off keeps the mapping",          ed.targets["Iron Dust"].asteroid, "Copper")
-edcfg.asteroidOutputs = nil
+
+-- GENERATED SOURCES. An item in config.itemSources needs no mapping: the broker
+-- picks the best reachable source at dispatch. So switching one on writes
+-- nothing to dustTargets and asks nothing -- on the items page or on an
+-- asteroid's page, where tracking used to pin the item to that asteroid.
+reset()
+edcfg.asteroidOutputs = {
+  Iron   = { main = { { item = "Iron Dust" } } },
+  Copper = { main = { { item = "Iron Dust" } } },
+}
+edcfg.itemSources = { ["Iron Dust"] = { "Iron", "Copper" }, ["Redstone Dust"] = { "Copper" } }
+ck("generated-only item listed",     itemRow("Redstone Dust") ~= nil, true)
+
+ed.mode, ed.asteroid, ed.added, ed.input = "items", nil, {}, nil
+ed.rows = { { kind = "item", item = "Iron Dust" } }; ed.sel = 1
+E.action("activate")
+ck("auto item: no prompt",           ed.input, nil)
+ck("auto item: enabled",             ed.enabled["Iron Dust"], true)
+ck("auto item: not mapped",          ed.targets["Iron Dust"], nil)
+
+ed.mode, ed.asteroid = "detail", "Copper"
+ed.rows = { { kind = "item", item = "Redstone Dust" } }; ed.sel = 1
+E.action("activate")
+ck("auto on a detail page: not pinned", ed.targets["Redstone Dust"], nil)
+ck("auto on a detail page: enabled",    ed.enabled["Redstone Dust"], true)
+
+-- A mapping still wins: an already-mapped item stays on its asteroid.
+ck("mapped item keeps its mapping",  ed.targets.Infinity.asteroid, "Infinity Catalyst")
+edcfg.asteroidOutputs, edcfg.itemSources = nil, nil
+ed.mode, ed.asteroid = "asteroids", nil
+
+-- =============================================================================
+section("broker-mk3.lua -- an item's sources, best first")
+-- =============================================================================
+-- sourcesOf decides which asteroids a need may be served from. A dustTargets
+-- entry is a decision and is the only source; without one, the generated
+-- ranking is used, minus anything config.asteroids does not know.
+do
+  local bsrc = slurp("broker-mk3.lua")
+  local sSrc = bsrc:match("(local function sourcesOf%(itemName%).-\nend)")
+  ck("sourcesOf extracted", sSrc ~= nil, true)
+  local senv = { ipairs = ipairs, pairs = pairs }
+  local sourcesOf = assert(load(sSrc .. "\nreturn sourcesOf", "sourcesOf", "t", senv))()
+  senv.config = {
+    asteroids   = { Iron = {}, Copper = {}, Nickel = {} },
+    dustTargets = { ["Nickel Dust"] = { asteroid = "Nickel", priority = 3 },
+                    ["Lost Dust"]   = { asteroid = "Gone" } },
+    itemSources = { ["Nickel Dust"] = { "Iron" },
+                    ["Iron Dust"]   = { "Gone", "Iron", "Copper" },
+                    ["Void Dust"]   = { "Gone" } },
+  }
+  local s, p = sourcesOf("Nickel Dust")
+  ck("mapping is the only source",   table.concat(s, ","), "Nickel")
+  ck("mapping keeps its priority",   p, 3)
+  s, p = sourcesOf("Iron Dust")
+  ck("generated ranking, unknown dropped", table.concat(s, ","), "Iron,Copper")
+  ck("generated sources sort last",  p, 99)
+  ck("mapped to unknown: no need",   sourcesOf("Lost Dust"), nil)
+  ck("only unknown sources: no need", sourcesOf("Void Dust"), nil)
+  ck("neither: no need",             sourcesOf("Nothing"), nil)
+  senv.config.itemSources = nil
+  ck("no generated table is fine",   sourcesOf("Iron Dust"), nil)
+
+  -- Dispatch walks the ranking: a need is served from the first source that
+  -- takes a module, and reachability reports the first reachable one.
+  local one = bsrc:match("local function assignOne%(need%)(.-)\n  end\n")
+  ck("assignOne walks need.sources", one and one:find("ipairs(need.sources)", 1, true) ~= nil, true)
+  local reach = bsrc:match("local function reachability%(need%)(.-)\n  end\n")
+  ck("reachability walks need.sources", reach and reach:find("ipairs(need.sources)", 1, true) ~= nil, true)
+end
 
 -- =============================================================================
 section("broker-mk3.lua -- the drone / kit availability pool")
@@ -649,8 +718,10 @@ section("assignOne / boot -- the sensor machinery is gone, not dormant")
 -- sensor that can only see the ME network. The fix was to stop: config.droneStock
 -- is the fleet, and everything that existed to paper over the sensor's blind
 -- spots had to be REMOVED rather than left behind to rot.
-local aSrc = broker:match("local function assignOne%(need%)(.-)\n  end\n")
-ck("assignOne extracted", aSrc ~= nil, true)
+-- The per-asteroid half of assignOne: assignOne walks a need's ranked sources
+-- and hands each to assignTo, which is where drones are tried.
+local aSrc = broker:match("local function assignTo%(asteroidName%)(.-)\n  end\n")
+ck("assignTo extracted", aSrc ~= nil, true)
 
 ck("no in-flight guard left",   aSrc:find("inFlight", 1, true), nil)
 ck("no return stamping left",   broker:find("mod.returned =", 1, true), nil)

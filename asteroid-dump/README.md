@@ -18,6 +18,29 @@ In-game all of it is a method call on a live registry. `getDisplayName()`
 replaces every label-derivation rule; the recipe maps replace the guesswork
 about what an ore becomes.
 
+## What 1.4 adds
+
+1.3 said *which* items an asteroid leads to, but not *how many*, and not which
+of several asteroids is the better source. 1.4 records the inputs to that
+arithmetic, straight from the game:
+
+- `spaceMining`: every recipe in the space mining map. That is one per asteroid
+  **per drone tier**, with the size, duration, EU/t and computation the game
+  registered for that drone, plus its distance range, weight, module tier, and
+  the drone, drill and rod it consumes.
+- On every breakdown product: the input and output amounts, the output chance,
+  any fluids the step needs, the step's EU/t and duration, the item it was made
+  from, and `yield`, the expected count from **one** dropped item along that
+  path.
+- `miner`: the mining module's own constants (bonus stack cap, plasma usage),
+  the formulas they feed (transcribed from its bytecode), and the drone, drill
+  and rod for each tier.
+- On each asteroid: `label` (the name the game shows), `size`, `computation`,
+  `duration`.
+
+All 1.3 fields are kept with the same names, so anything that read a 1.3 dump
+still works.
+
 ## Use
 
 Drop the jar in `mods/` and start the server, or load any world in singleplayer.
@@ -26,6 +49,48 @@ directory. Read-only: it registers no recipes and changes no world state. Remove
 the jar afterwards.
 
 Depth defaults to 3 hops. Override with `-Dasteroiddump.depth=2`.
+
+Copy the file over `asteroid-dump/asteroid_dump.json` in this repo, then run the
+merge.
+
+## Merging with the Space Elevator Calculator
+
+`merge.py` combines the dump with the community calculator spreadsheet. It needs
+Python 3 and nothing else:
+
+    python merge.py --calc "GTNH Space Elevator Calculator.xlsx"
+
+Options: `--plasma 1..5` and `--overdrive` set the assumptions used for rates,
+`--out` sets the output folder (default `out/`), and `--apply` also writes the
+generated blocks into `space-miner/config.lua`, leaving the rest of the file
+alone. It writes:
+
+- `out/perfected.json`: every asteroid with each field tagged by where it came
+  from; the recipe the module really runs for each drone tier; the best
+  distance per module tier and drone, by pick chance and by draws per hour; and
+  for each item, which asteroid and setting gives the most of it.
+- `out/report.md`: every disagreement between the game, the calculator and
+  `config.lua`.
+- `out/generated.lua`: `config.asteroids`, `config.optimizationMatrix` and
+  `config.itemSources` in `config.lua`'s format, ready to paste over those
+  blocks.
+
+`config.itemSources` lists, for every item an asteroid leads to, the asteroids
+that are the best source for at least one drone tier, best first. It is the
+fallback for `config.dustTargets`: an item with no entry there is mined from the
+first source in this list that the broker can reach when the job goes out, so
+the choice follows the drones you own. A `dustTargets` entry always wins.
+
+When the two sources disagree, the game wins. The calculator is a hand-made
+copy of the same recipes and is missing two of the game's scalings: per drone
+tier the game divides duration by sqrt(k) and multiplies EU/t by sqrt(k), and
+the calculator applies only the size bonus. With a 1.3 dump the calculator
+supplies size, computation, duration and EU/t, and the per-drone values are
+derived; with a 1.4 dump they come from the game and the calculator is only a
+cross-check.
+
+The model was checked against the calculator: from the same inputs, merge.py
+reproduces every entry in the calculator's three "module best" sheets.
 
 There is deliberately no command. See below.
 

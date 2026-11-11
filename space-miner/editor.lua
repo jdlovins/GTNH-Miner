@@ -546,6 +546,21 @@ local function sourcesFor(item)
   return sourcesIndex[item]
 end
 
+-- The generated, ranked sources for an item (config.itemSources), or nil. An
+-- item with these needs no mapping: the broker picks the best one it can reach
+-- at dispatch. A dustTargets entry still overrides it, so mapping stays the way
+-- to pin an item to one asteroid.
+local function autoSources(item)
+  local s = config.itemSources and config.itemSources[item]
+  if s and #s > 0 then return s end
+  return nil
+end
+
+-- "auto: Iron" or "auto: Iron +2".
+local function autoLabel(src)
+  return "auto: " .. src[1] .. (#src > 1 and (" +" .. (#src - 1)) or "")
+end
+
 -- Every item the editor knows of: mapped, tracked, or derived from some
 -- asteroid's outputs. The last group is why this page used to be shorter than
 -- the asteroid pages added together -- an output nobody had mapped was visible
@@ -556,6 +571,9 @@ local function buildItems()
   for item in pairs(ed.enabled)  do if not seen[item] then seen[item] = true; list[#list+1] = item end end
   sourcesFor("")   -- make sure the index is current
   for item in pairs(sourcesIndex) do
+    if not seen[item] then seen[item] = true; list[#list+1] = item end
+  end
+  for item in pairs(config.itemSources or {}) do
     if not seen[item] then seen[item] = true; list[#list+1] = item end
   end
   table.sort(list)
@@ -718,6 +736,9 @@ local function edToggle(item, asteroid)
   if mapIfNew(item, asteroid) then
     edSay("tracking " .. item .. " at " .. formatQty(ed.threshold[item]) ..
           "  (mapped to " .. asteroid .. ")", 0x00FF00)
+  elseif not ed.targets[item] and autoSources(item) then
+    edSay("tracking " .. item .. " at " .. formatQty(ed.threshold[item]) ..
+          "  (" .. autoLabel(autoSources(item)) .. ")", 0x00FF00)
   elseif not ed.targets[item] then
     edSay("tracking " .. item .. " -- but it has no asteroid, so it cannot mine", 0xFF4444)
   else
@@ -746,18 +767,25 @@ end
 -- Work out which asteroid an item should be mapped to if it is switched on
 -- from here, then call fn(asteroid) -- possibly later, from a prompt.
 --
---   detail page      the asteroid you are looking at
 --   already mapped   that mapping; this never remaps
+--   auto-sourced     fn(nil): nothing to map, the broker picks the best
+--                    source it can reach at dispatch (config.itemSources).
+--                    Even on an asteroid's page -- tracking an item there
+--                    used to pin it to that asteroid, which would quietly
+--                    override the ranking for good.
+--   detail page      the asteroid you are looking at
 --   one source       that source, without asking
 --   several          ask, by number or by name
 --   none             fn(nil): a hand-typed item with no mapping, as before
 --
 -- Only the several-sources case defers. Cancelling that prompt leaves the item
--- off and unmapped, which is where it started.
+-- off and unmapped, which is where it started. With config.itemSources in
+-- place the last three only arise for items the generator does not cover.
 local function withAsteroid(item, fn)
-  if ed.mode == "detail" and ed.asteroid then return fn(ed.asteroid) end
   local t = ed.targets[item]
   if t then return fn(t.asteroid) end
+  if autoSources(item) then return fn(nil) end
+  if ed.mode == "detail" and ed.asteroid then return fn(ed.asteroid) end
   local src = sourcesFor(item)
   if not src or #src == 0 then return fn(nil) end
   if #src == 1 then return fn(src[1]) end
@@ -1171,9 +1199,12 @@ local function edSave()
   for _, item in ipairs(conds) do
     local t = ed.targets[item]
     local ast = t and t.asteroid or nil
+    local auto = not ast and autoSources(item)
     out[#out + 1] = string.format("    { itemName = %-38s amountToMaintain = %-10d },%s",
       QUOTE .. item .. QUOTE .. ",", ed.threshold[item] or DEFAULT_TARGET,
-      ast and ("   -- " .. ast) or "   -- NO ASTEROID: cannot dispatch")
+      ast and ("   -- " .. ast)
+          or (auto and ("   -- " .. autoLabel(auto)))
+          or "   -- NO ASTEROID: cannot dispatch")
   end
   out[#out + 1] = "  },"
 
@@ -1622,9 +1653,14 @@ local function edDraw()
                               0x666666 }
         else
           local t = ed.targets[item]
+          local auto = not t and autoSources(item)
           local src = not t and sourcesFor(item)
           if t then
             cells[#cells+1] = { X_C, tostring(t.asteroid):sub(1, W - X_C), 0x888888 }
+          elseif auto then
+            -- Ranked sources: the broker takes the first it can reach. Shown
+            -- by the best one, which is what you get with the drones for it.
+            cells[#cells+1] = { X_C, autoLabel(auto):sub(1, W - X_C), 0x888888 }
           elseif src and #src == 1 then
             -- Not mapped yet, but there is only one place it could come from,
             -- so switching it on maps it there without asking.
@@ -1685,9 +1721,10 @@ local function edOpenSelected()
   elseif row.kind == "item" and ed.mode == "items" then
     -- Open the mapped asteroid, or the only one it can come from. Several
     -- sources and no mapping is a choice nobody has made yet; name them.
-    local t   = ed.targets[row.item]
-    local src = sourcesFor(row.item)
-    local go  = t and t.asteroid or (src and #src == 1 and src[1])
+    local t    = ed.targets[row.item]
+    local src  = sourcesFor(row.item)
+    local auto = autoSources(row.item)
+    local go   = t and t.asteroid or (auto and auto[1]) or (src and #src == 1 and src[1])
     if go then
       ed.mode, ed.asteroid = "detail", go
       ed.sel, ed.scroll = 1, 0
