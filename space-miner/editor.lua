@@ -518,10 +518,46 @@ local function buildDetail(name)
   return rows
 end
 
+-- item -> sorted list of asteroids whose derived main/processed outputs name it.
+--
+-- dustTargets maps an item to ONE asteroid, but the generated outputs can name
+-- the same item under several (iron dust comes off half the belt). The items
+-- page needs the reverse view to list outputs nobody has mapped yet, and to
+-- know whether mapping one is a choice or a foregone conclusion.
+--
+-- asteroidOutputs is shipped data and never changes while the program runs, so
+-- the index is built once per table rather than per rebuild.
+local sourcesIndex, sourcesOf
+local function sourcesFor(item)
+  local outs = config.asteroidOutputs or {}
+  if sourcesOf ~= outs then
+    sourcesIndex, sourcesOf = {}, outs
+    for name, o in pairs(outs) do
+      for _, list in ipairs({ o.main or {}, o.processed or {} }) do
+        for _, e in ipairs(list) do
+          local s = sourcesIndex[e.item]
+          if not s then s = {}; sourcesIndex[e.item] = s end
+          if s[#s] ~= name then s[#s + 1] = name end
+        end
+      end
+    end
+    for _, s in pairs(sourcesIndex) do table.sort(s) end
+  end
+  return sourcesIndex[item]
+end
+
+-- Every item the editor knows of: mapped, tracked, or derived from some
+-- asteroid's outputs. The last group is why this page used to be shorter than
+-- the asteroid pages added together -- an output nobody had mapped was visible
+-- under its asteroid and nowhere else.
 local function buildItems()
   local seen, list = {}, {}
   for item in pairs(ed.targets)  do if not seen[item] then seen[item] = true; list[#list+1] = item end end
   for item in pairs(ed.enabled)  do if not seen[item] then seen[item] = true; list[#list+1] = item end end
+  sourcesFor("")   -- make sure the index is current
+  for item in pairs(sourcesIndex) do
+    if not seen[item] then seen[item] = true; list[#list+1] = item end
+  end
   table.sort(list)
   local rows = {}
   for _, item in ipairs(list) do
@@ -658,6 +694,18 @@ end
 -- MUTATIONS
 -- ---------------------------------------------------------------------------
 
+-- Write the mapping a newly enabled item needs, if it has none yet. Turning
+-- something on is the moment the mapping has to exist, or the condition can
+-- never dispatch. Returns true when it wrote one.
+local function mapIfNew(item, asteroid)
+  if asteroid and not ed.targets[item] then
+    ed.targets[item] = { asteroid = asteroid, priority = nextPriority(asteroid) }
+    ed.added[item] = true
+    return true
+  end
+  return false
+end
+
 local function edToggle(item, asteroid)
   edTouch()
   if ed.enabled[item] then
@@ -667,12 +715,7 @@ local function edToggle(item, asteroid)
   end
   ed.enabled[item]   = true
   ed.threshold[item] = ed.threshold[item] or DEFAULT_TARGET
-  -- Turning something on is the moment the mapping has to exist, and here the
-  -- asteroid is known, so write it rather than leaving a condition that can
-  -- never dispatch.
-  if asteroid and not ed.targets[item] then
-    ed.targets[item] = { asteroid = asteroid, priority = nextPriority(asteroid) }
-    ed.added[item] = true
+  if mapIfNew(item, asteroid) then
     edSay("tracking " .. item .. " at " .. formatQty(ed.threshold[item]) ..
           "  (mapped to " .. asteroid .. ")", 0x00FF00)
   elseif not ed.targets[item] then
@@ -682,8 +725,9 @@ local function edToggle(item, asteroid)
   end
 end
 
-local function edCycleTarget(item)
+local function edCycleTarget(item, asteroid)
   edTouch()
+  mapIfNew(item, asteroid)
   local cur = ed.threshold[item] or 0
   local nxt = TARGET_LADDER[1]
   for _, v in ipairs(TARGET_LADDER) do
@@ -697,6 +741,67 @@ end
 -- Incremental text entry. Never blocks: each keystroke is just another event.
 local function edPrompt(label, onCommit, initial)
   ed.input = { label = label, buffer = initial or "", onCommit = onCommit }
+end
+
+-- Work out which asteroid an item should be mapped to if it is switched on
+-- from here, then call fn(asteroid) -- possibly later, from a prompt.
+--
+--   detail page      the asteroid you are looking at
+--   already mapped   that mapping; this never remaps
+--   one source       that source, without asking
+--   several          ask, by number or by name
+--   none             fn(nil): a hand-typed item with no mapping, as before
+--
+-- Only the several-sources case defers. Cancelling that prompt leaves the item
+-- off and unmapped, which is where it started.
+local function withAsteroid(item, fn)
+  if ed.mode == "detail" and ed.asteroid then return fn(ed.asteroid) end
+  local t = ed.targets[item]
+  if t then return fn(t.asteroid) end
+  local src = sourcesFor(item)
+  if not src or #src == 0 then return fn(nil) end
+  if #src == 1 then return fn(src[1]) end
+
+  -- The prompt is one screen line. List as many choices as fit; any source,
+  -- listed or not, can still be typed by name.
+  local label = "mine " .. item .. " from? "
+  local room  = (W or 80) - 30
+  for i, name in ipairs(src) do
+    local part = i .. "=" .. name .. " "
+    if #label + #part > room then label = label .. "... (or type a name)" break end
+    label = label .. part
+  end
+  edPrompt(label, function(txt)
+    txt = (txt or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+    local pick = src[tonumber(txt) or 0]
+    if not pick and txt ~= "" then
+      -- Exact name first, then a unique prefix, so "iron" does not have to
+      -- be spelled out when nothing else starts with it.
+      local hits = {}
+      for _, n in ipairs(src) do
+        if n:lower() == txt then pick = n break end
+        if n:lower():sub(1, #txt) == txt then hits[#hits + 1] = n end
+      end
+      if not pick and #hits == 1 then pick = hits[1] end
+    end
+    if not pick then
+      edSay("no such source -- " .. item .. " left as it was", 0xFFAA00)
+      return
+    end
+    fn(pick)
+    edRebuild()
+  end)
+end
+
+-- Space or a click on an item row. Switching off never needs an asteroid;
+-- switching on goes through withAsteroid so an unmapped item gets mapped.
+local function edToggleItem(item)
+  if ed.enabled[item] then
+    edToggle(item)
+  else
+    withAsteroid(item, function(a) edToggle(item, a) end)
+  end
+  edRebuild()
 end
 
 -- "50m" / "2.5m" / "500k" / "1b" / "250000". g is accepted as a synonym for b,
@@ -756,7 +861,7 @@ end
 --
 -- Entry is incremental, like every other prompt here -- the main loop keeps
 -- running while you type, so a load in flight is not stalled by a text field.
-local function edTypeTarget(item)
+local function edTypeTarget(item, asteroid)
   local cur = ed.threshold[item]
   -- The current value goes in the LABEL, not the buffer. Pre-filling the buffer
   -- would mean backspacing it away before typing, which is the opposite of the
@@ -772,6 +877,9 @@ local function edTypeTarget(item)
         return
       end
       edTouch()
+      -- Mapped only once the amount is committed, so cancelling here leaves
+      -- an unmapped item exactly as unmapped as it was.
+      mapIfNew(item, asteroid)
       ed.threshold[item] = n
       ed.enabled[item]   = true
       edSay(item .. " -> " .. formatQty(n), 0x00FF00)
@@ -1514,8 +1622,15 @@ local function edDraw()
                               0x666666 }
         else
           local t = ed.targets[item]
+          local src = not t and sourcesFor(item)
           if t then
             cells[#cells+1] = { X_C, tostring(t.asteroid):sub(1, W - X_C), 0x888888 }
+          elseif src and #src == 1 then
+            -- Not mapped yet, but there is only one place it could come from,
+            -- so switching it on maps it there without asking.
+            cells[#cells+1] = { X_C, ("unmapped: " .. src[1]):sub(1, W - X_C), 0x555555 }
+          elseif src then
+            cells[#cells+1] = { X_C, ("unmapped: " .. #src .. " sources"):sub(1, W - X_C), 0x555555 }
           else
             cells[#cells+1] = { X_C, "NOT MINEABLE", 0xFF4444 }
           end
@@ -1568,11 +1683,17 @@ local function edOpenSelected()
   elseif row.kind == "par" then
     DRILL.editAll(row.key)
   elseif row.kind == "item" and ed.mode == "items" then
-    local t = ed.targets[row.item]
-    if t then
-      ed.mode, ed.asteroid = "detail", t.asteroid
+    -- Open the mapped asteroid, or the only one it can come from. Several
+    -- sources and no mapping is a choice nobody has made yet; name them.
+    local t   = ed.targets[row.item]
+    local src = sourcesFor(row.item)
+    local go  = t and t.asteroid or (src and #src == 1 and src[1])
+    if go then
+      ed.mode, ed.asteroid = "detail", go
       ed.sel, ed.scroll = 1, 0
       edRebuild(); edMoveSel(1)
+    elseif src then
+      edSay(row.item .. " comes from " .. table.concat(src, ", "), 0xFFAA00)
     else
       edSay(row.item .. " has no asteroid mapping", 0xFFAA00)
     end
@@ -1631,9 +1752,7 @@ local function edAction(a)
     -- dispatch -- the dispatch table only needs to know the name.
     local row = selectedRow()
     if row and row.kind == "item" then
-      edToggle(row.item, ed.mode == "detail" and ed.asteroid or
-                         (ed.targets[row.item] and ed.targets[row.item].asteroid))
-      edRebuild()
+      edToggleItem(row.item)
     elseif row and row.kind == "asteroid" then
       edOpenSelected()
     elseif row and row.kind == "par" then
@@ -1643,12 +1762,15 @@ local function edAction(a)
     end
   elseif a == "type" then
     local row = selectedRow()
-    if row and row.kind == "item" then edTypeTarget(row.item)
+    if row and row.kind == "item" then
+      withAsteroid(row.item, function(ast) edTypeTarget(row.item, ast) end)
     elseif row and row.kind == "par" then DRILL.editAll(row.key)
     elseif row and row.kind == "opt" then SET.prompt(row.spec) end
   elseif a == "step" then
     local row = selectedRow()
-    if row and row.kind == "item" then edCycleTarget(row.item) end
+    if row and row.kind == "item" then
+      withAsteroid(row.item, function(ast) edCycleTarget(row.item, ast) end)
+    end
   elseif a == "changed" then
     if ed.mode ~= "settings" then
       edSay("changed-only applies to the settings page", 0xFFAA00)
@@ -1737,11 +1859,9 @@ local function edHandle(ev)
           elseif x >= X_C and x < DRILL.xStock then DRILL.editField(row.key, "batch")
           else DRILL.toggle(row.key) end
         elseif x >= X_A and x < X_B then
-          edTypeTarget(row.item)
+          withAsteroid(row.item, function(ast) edTypeTarget(row.item, ast) end)
         else
-          edToggle(row.item, ed.mode == "detail" and ed.asteroid or
-                             (ed.targets[row.item] and ed.targets[row.item].asteroid))
-          edRebuild()
+          edToggleItem(row.item)
         end
       end
     end
@@ -1905,6 +2025,8 @@ editor._internal = {
   bindingFor  = edBindingFor,
   legend      = edLegend,
   action      = edAction,
+  buildItems  = buildItems,
+  sourcesFor  = sourcesFor,
 }
 
 return editor

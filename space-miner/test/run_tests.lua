@@ -470,6 +470,51 @@ reset() ed.par.titanium = { tips = 64, rods = 64, batch = 64 }
 reset() ed.settings.tipsPerLoad = 256; ed.threshold.Infinity = 1
         ck("changes add up",               count(), 2)
 
+-- The items page lists derived outputs nobody has mapped, not only what is in
+-- dustTargets or the watchlist. It used to be shorter than the asteroid pages
+-- added together, which read as the page missing data.
+reset()
+edcfg.asteroidOutputs = {
+  Iron   = { main = { { item = "Iron Dust" }, { item = "Nickel Dust" } },
+             processed = { { item = "Iron Dust" } } },   -- same item twice in one asteroid
+  Copper = { main = { { item = "Copper Dust" }, { item = "Iron Dust" } } },
+}
+local function itemRow(name)
+  for _, r in ipairs(E.buildItems()) do if r.item == name then return r end end
+end
+ck("unmapped output listed",        itemRow("Nickel Dust") ~= nil, true)
+ck("mapped item still listed",      itemRow("Infinity") ~= nil, true)
+ck("watchlist-only still listed",   itemRow("Naquadah") ~= nil, true)
+ck("one source",                    table.concat(E.sourcesFor("Nickel Dust"), ","), "Iron")
+ck("several sources, deduped",      table.concat(E.sourcesFor("Iron Dust"), ","), "Copper,Iron")
+ck("not derived anywhere",          E.sourcesFor("Naquadah"), nil)
+local listed = 0
+for _ in ipairs(E.buildItems()) do listed = listed + 1 end
+ck("no duplicate rows",             listed, 5)
+
+-- Switching on a single-source item maps it there without asking.
+ed.mode, ed.asteroid, ed.added, ed.input = "items", nil, {}, nil
+ed.rows = { { kind = "item", item = "Nickel Dust" } }; ed.sel = 1
+E.action("activate")
+ck("single source mapped on enable", ed.targets["Nickel Dust"] and ed.targets["Nickel Dust"].asteroid, "Iron")
+ck("and enabled",                    ed.enabled["Nickel Dust"], true)
+
+-- Several sources asks first; nothing changes until it is answered.
+ed.rows = { { kind = "item", item = "Iron Dust" } }; ed.sel = 1
+E.action("activate")
+ck("several sources prompts",        ed.input ~= nil, true)
+ck("not enabled before answering",   ed.enabled["Iron Dust"], nil)
+ck("not mapped before answering",    ed.targets["Iron Dust"], nil)
+ed.input.buffer = "cop"; E.action("input_ok")
+ck("prefix picks the source",        ed.targets["Iron Dust"] and ed.targets["Iron Dust"].asteroid, "Copper")
+ck("and enables it",                 ed.enabled["Iron Dust"], true)
+
+-- Switching it off again never prompts and keeps the mapping.
+E.action("activate")
+ck("off without a prompt",           ed.input, nil)
+ck("off keeps the mapping",          ed.targets["Iron Dust"].asteroid, "Copper")
+edcfg.asteroidOutputs = nil
+
 -- =============================================================================
 section("broker-mk3.lua -- the drone / kit availability pool")
 -- =============================================================================
